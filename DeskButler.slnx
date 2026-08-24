@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DeskButler.Application/DeskButler.Application.csproj" />
+    <Project Path="src/DeskButler.Core/DeskButler.Core.csproj" />
+    <Project Path="src/DeskButler.Desktop/DeskButler.Desktop.csproj" />
+    <Project Path="src/DeskButler.Infrastructure.Windows/DeskButler.Infrastructure.Windows.csproj" />
+    <Project Path="src/DeskButler.Modules.WorkspaceRecovery/DeskButler.Modules.WorkspaceRecovery.csproj" />
+    <Project Path="src/DeskButler.Persistence/DeskButler.Persistence.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DeskButler.Application.Tests/DeskButler.Application.Tests.csproj" />
+    <Project Path="tests/DeskButler.Core.Tests/DeskButler.Core.Tests.csproj" />
+    <Project Path="tests/DeskButler.Desktop.Tests/DeskButler.Desktop.Tests.csproj" />
+    <Project Path="tests/DeskButler.Infrastructure.Windows.Tests/DeskButler.Infrastructure.Windows.Tests.csproj" />
+    <Project Path="tests/DeskButler.Modules.WorkspaceRecovery.Tests/DeskButler.Modules.WorkspaceRecovery.Tests.csproj" />
+    <Project Path="tests/DeskButler.Persistence.Tests/DeskButler.Persistence.Tests.csproj" />
+  </Folder>
+</Solution>

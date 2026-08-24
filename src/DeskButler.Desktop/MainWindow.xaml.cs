@@ -1,0 +1,24 @@
+﻿using System.Text;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
+using System.Windows.Shapes;
+
+namespace DeskButler.Desktop;
+
+/// <summary>
+/// Interaction logic for MainWindow.xaml
+/// </summary>
+public partial class MainWindow : Window
+{
+    /// <summary>初始化主窗口及其 XAML 定义的组件。</summary>
+    public MainWindow()
+    {
+        InitializeComponent();
+    }
+}

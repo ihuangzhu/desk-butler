@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\DeskButler.Core\DeskButler.Core.csproj" />
+    <ProjectReference Include="..\DeskButler.Application\DeskButler.Application.csproj" />
+    <ProjectReference Include="..\DeskButler.Persistence\DeskButler.Persistence.csproj" />
+    <ProjectReference Include="..\DeskButler.Infrastructure.Windows\DeskButler.Infrastructure.Windows.csproj" />
+    <ProjectReference Include="..\DeskButler.Modules.WorkspaceRecovery\DeskButler.Modules.WorkspaceRecovery.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+</Project>
