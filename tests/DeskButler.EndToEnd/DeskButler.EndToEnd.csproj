@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows10.0.17763.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="TestApps\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3.mtp-v2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DeskButler.Core\DeskButler.Core.csproj" />
+    <ProjectReference Include="..\..\src\DeskButler.Persistence\DeskButler.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\DeskButler.Infrastructure.Windows\DeskButler.Infrastructure.Windows.csproj" />
+    <ProjectReference Include="..\..\src\DeskButler.Modules.WorkspaceRecovery\DeskButler.Modules.WorkspaceRecovery.csproj" />
+    <ProjectReference Include="..\DeskButler.Infrastructure.Windows.Tests\TestApps\DeskButler.TestWindow\DeskButler.TestWindow.csproj"
+                      ReferenceOutputAssembly="false"
+                      AdditionalProperties="Configuration=$(Configuration)" />
+    <ProjectReference Include="TestApps\DeskButler.ResourceHarness\DeskButler.ResourceHarness.csproj"
+                      ReferenceOutputAssembly="false"
+                      AdditionalProperties="Configuration=$(Configuration)" />
+  </ItemGroup>
+
+</Project>
