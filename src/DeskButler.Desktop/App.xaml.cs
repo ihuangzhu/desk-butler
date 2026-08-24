@@ -6,6 +6,7 @@ using System.IO;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
+using DeskButler.Infrastructure.Windows.Startup;
 
 namespace DeskButler.Desktop;
 
@@ -16,6 +17,7 @@ public partial class App : System.Windows.Application, IDisposable
     private CrashSentinel? crashSentinel;
     private CompositionRoot? composition;
     private SafeFileHandle? smokeRootHandle;
+    private UninstallRequestServer? uninstallRequestServer;
     private int exitRequested;
 
     /// <summary>取得单实例后创建对象图；默认不显示主窗口。</summary>
@@ -30,6 +32,25 @@ public partial class App : System.Windows.Application, IDisposable
 #endif
         try
         {
+            var isPrepareUninstall = IsPrepareUninstallRequest(e.Args);
+            var isPrepareUpgrade = IsPrepareUpgradeRequest(e.Args);
+            if (isPrepareUninstall || isPrepareUpgrade)
+            {
+                var executablePath = Environment.ProcessPath
+                    ?? throw new InvalidOperationException("无法解析 DeskButler 当前可执行文件路径。");
+                var uninstallPipeName = Hosting.UninstallPipeName.ForCurrentSession();
+                var coordinator = new PrepareUninstallCoordinator(
+                    () => SingleInstanceGuard.TryAcquire(out var guard) ? guard : null,
+                    new NamedPipeUninstallRequestClient(uninstallPipeName, executablePath),
+                    new ProcessExitWaiter(),
+                    new RegistryStartupRegistration(executablePath),
+                    TimeSpan.FromSeconds(20),
+                    removeStartupRegistration: isPrepareUninstall);
+                await coordinator.ExecuteAsync(CancellationToken.None);
+                Shutdown(0);
+                return;
+            }
+
             var paths = ResolveAppDataPaths(e.Args, out var createFixture, out var runSmoke);
 #if DEBUG
             var smokeSuccessMarker = runSmoke
@@ -51,6 +72,10 @@ public partial class App : System.Windows.Application, IDisposable
                 paths, () => _ = RequestExitAsync(), CancellationToken.None);
 #endif
             await composition.StartAsync(CancellationToken.None);
+            uninstallRequestServer = new UninstallRequestServer(
+                Hosting.UninstallPipeName.ForCurrentSession(),
+                () => Dispatcher.BeginInvoke(() => _ = RequestExitAsync()));
+            uninstallRequestServer.Start();
 #if DEBUG
             if (runSmoke)
             {
@@ -75,7 +100,7 @@ public partial class App : System.Windows.Application, IDisposable
         }
         catch (Exception exception)
         {
-            if (!isSmokeRequest)
+            if (ShouldShowStartupFailure(e.Args, isSmokeRequest))
             {
                 System.Windows.MessageBox.Show(
                     $"DeskButler 启动失败：{exception.Message}", "DeskButler",
@@ -102,10 +127,21 @@ public partial class App : System.Windows.Application, IDisposable
     private async Task<Exception?> CleanupAfterControlledExitAsync(bool preserveSmokeRootLease = false)
     {
         var currentComposition = composition;
+        var currentUninstallRequestServer = uninstallRequestServer;
         var currentSentinel = crashSentinel;
         var currentSingleInstance = singleInstance;
         var failure = await ExitCleanupCoordinator.RunAsync(
-            () => currentComposition?.DisposeAsync() ?? ValueTask.CompletedTask,
+            async () =>
+            {
+                if (currentUninstallRequestServer is not null)
+                {
+                    await currentUninstallRequestServer.DisposeAsync();
+                }
+                if (currentComposition is not null)
+                {
+                    await currentComposition.DisposeAsync();
+                }
+            },
             clean =>
             {
                 if (clean)
@@ -119,6 +155,7 @@ public partial class App : System.Windows.Application, IDisposable
             },
             () => currentSingleInstance?.Dispose());
         composition = null;
+        uninstallRequestServer = null;
         crashSentinel = null;
         singleInstance = null;
         if (!preserveSmokeRootLease)
@@ -128,6 +165,20 @@ public partial class App : System.Windows.Application, IDisposable
         }
         return failure;
     }
+
+    /// <summary>仅接受不带任何额外参数的固定卸载准备命令。</summary>
+    internal static bool IsPrepareUninstallRequest(string[] args) =>
+        args.Length == 1 &&
+        StringComparer.OrdinalIgnoreCase.Equals(args[0], "--prepare-uninstall");
+
+    /// <summary>仅接受不带任何额外参数的固定升级准备命令。</summary>
+    internal static bool IsPrepareUpgradeRequest(string[] args) =>
+        args.Length == 1 &&
+        StringComparer.OrdinalIgnoreCase.Equals(args[0], "--prepare-upgrade");
+
+    /// <summary>维护命令与 smoke 失败仅用退出码报告，避免隐藏安装流程被对话框阻塞。</summary>
+    internal static bool ShouldShowStartupFailure(string[] args, bool isSmokeRequest) =>
+        !isSmokeRequest && !IsPrepareUninstallRequest(args) && !IsPrepareUpgradeRequest(args);
 
     /// <summary>解析数据根；Release 构建始终使用正式 LocalAppData 目录。</summary>
     internal static AppDataPaths ResolveAppDataPaths(
