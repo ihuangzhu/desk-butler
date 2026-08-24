@@ -10,8 +10,16 @@ internal static class NativeMethods
     internal const uint GwOwner = 4;
     internal const uint DwmwaCloaked = 14;
     internal const uint MonitorDefaultToNearest = 2;
+    internal const uint MonitorInfoPrimary = 1;
+    internal const int MonitorDpiTypeEffective = 0;
+    internal const uint SwShowNormal = 1;
+    internal const uint SwShowMinimized = 2;
+    internal const uint SwShowMaximized = 3;
+    internal const uint SwpNoZOrder = 0x0004;
+    internal const uint SwpNoActivate = 0x0010;
 
     internal delegate bool EnumWindowsProc(nint windowHandle, nint parameter);
+    internal delegate bool MonitorEnumProc(nint monitorHandle, nint deviceContext, nint rectangle, nint parameter);
 
     /// <summary>枚举当前桌面的所有顶层窗口。</summary>
     [DllImport("user32.dll", SetLastError = true)]
@@ -37,6 +45,23 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetWindowPlacement(nint windowHandle, ref WindowPlacement placement);
 
+    /// <summary>设置窗口普通边界和显示状态。</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetWindowPlacement(nint windowHandle, [In] ref WindowPlacement placement);
+
+    /// <summary>在虚拟桌面屏幕坐标中设置窗口边界且不改变 Z 序或激活状态。</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetWindowPos(
+        nint windowHandle,
+        nint insertAfter,
+        int left,
+        int top,
+        int width,
+        int height,
+        uint flags);
+
     /// <summary>读取窗口类名，不跨进程读取窗口内存。</summary>
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     internal static extern int GetClassName(nint windowHandle, [Out] char[] className, int maximumCount);
@@ -54,9 +79,26 @@ internal static class NativeMethods
     internal static extern nint MonitorFromWindow(nint windowHandle, uint flags);
 
     /// <summary>读取显示器设备名与工作区。</summary>
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetMonitorInfo(nint monitorHandle, ref MonitorInfo monitorInfo);
+
+    /// <summary>枚举当前桌面的活动显示器。</summary>
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool EnumDisplayMonitors(
+        nint deviceContext,
+        nint clippingRectangle,
+        MonitorEnumProc callback,
+        nint parameter);
+
+    /// <summary>读取指定显示器的有效 DPI。</summary>
+    [DllImport("shcore.dll")]
+    internal static extern int GetDpiForMonitor(
+        nint monitorHandle,
+        int dpiType,
+        out uint dpiX,
+        out uint dpiY);
 
     /// <summary>读取窗口当前有效 DPI；旧系统缺少入口点时由调用方回退。</summary>
     [DllImport("user32.dll")]
