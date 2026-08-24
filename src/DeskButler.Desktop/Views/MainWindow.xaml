@@ -1,0 +1,80 @@
+<Window x:Class="DeskButler.Desktop.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DeskButler 本地管家" Width="840" Height="560"
+        MinWidth="700" MinHeight="460" WindowStartupLocation="CenterScreen"
+        Background="#FFF7F7F8">
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="16" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <DockPanel>
+            <StackPanel DockPanel.Dock="Left">
+                <TextBlock Text="DeskButler" FontSize="26" FontWeight="SemiBold" />
+                <TextBlock Text="本地工作现场管家" Foreground="#FF66666F" Margin="0,4,0,0" />
+            </StackPanel>
+            <TextBlock Text="{Binding StatusText}" Foreground="#FF276749" VerticalAlignment="Bottom"
+                       HorizontalAlignment="Right" />
+        </DockPanel>
+
+        <TabControl Grid.Row="2" Background="White" Padding="8">
+            <TabItem Header="首页">
+                <StackPanel Margin="18">
+                    <TextBlock Text="你的现场由本机保存，重启后可由你手动恢复。" FontSize="16" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Margin="0,18,0,0">
+                        <Button Content="立即保存现场" Command="{Binding SaveNowCommand}" Padding="16,8" Margin="0,0,10,0" />
+                        <Button Content="{Binding CaptureToggleText}" Command="{Binding ToggleCaptureCommand}" Padding="16,8" />
+                    </StackPanel>
+                </StackPanel>
+            </TabItem>
+            <TabItem Header="现场">
+                <Grid Margin="18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="12" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <DockPanel>
+                        <TextBlock Text="最近 3 次现场" FontSize="18" FontWeight="SemiBold" />
+                        <Button DockPanel.Dock="Right" Content="刷新" Command="{Binding RefreshCommand}" Padding="12,4" />
+                    </DockPanel>
+                    <ListBox Grid.Row="2" ItemsSource="{Binding RecentScenes}" BorderThickness="0">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Border BorderBrush="#FFE4E4E7" BorderThickness="1" CornerRadius="8" Padding="12" Margin="0,0,0,8">
+                                    <DockPanel>
+                                        <Button DockPanel.Dock="Right" Content="恢复" Padding="14,6"
+                                                Command="{Binding DataContext.RestoreSceneCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}" />
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding CapturedAtText}" FontWeight="SemiBold" />
+                                            <TextBlock Text="{Binding ItemCountText}" Foreground="#FF71717A" Margin="0,4,0,0" />
+                                        </StackPanel>
+                                    </DockPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </TabItem>
+            <TabItem Header="模块">
+                <TextBlock Margin="18" Text="工作现场恢复  ·  已启用" FontSize="16" />
+            </TabItem>
+            <TabItem Header="设置">
+                <StackPanel Margin="18">
+                    <TextBlock Text="捕获与排除设置会保存在当前 Windows 用户目录。" TextWrapping="Wrap" />
+                    <TextBlock Text="随系统启动：安装版按当前设置自动维护" Margin="0,8,0,0" Foreground="#FF66666F" />
+                    <TextBlock Text="永久排除列表" FontWeight="SemiBold" Margin="0,18,0,8" />
+                    <ListBox ItemsSource="{Binding ExcludedExecutablePaths}" MinHeight="80" MaxHeight="220"
+                             BorderBrush="#FFE4E4E7" Padding="8" />
+                    <TextBlock Text="新的排除项可在恢复卡片中逐项设置。" Margin="0,8,0,0" Foreground="#FF66666F" />
+                </StackPanel>
+            </TabItem>
+            <TabItem Header="诊断">
+                <TextBlock Margin="18" Text="详细诊断与日志将在后续版本继续完善。" TextWrapping="Wrap" />
+            </TabItem>
+        </TabControl>
+    </Grid>
+</Window>
