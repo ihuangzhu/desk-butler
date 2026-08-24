@@ -14,5 +14,5 @@ TestResults/
 *.db-shm
 *.db-wal
 *.log
-diagnostics/
+/diagnostics/
 user-data/
