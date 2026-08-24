@@ -4,6 +4,7 @@ using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.Tests.ViewModels;
 using DeskButler.Modules.WorkspaceRecovery;
 using DeskButler.Modules.WorkspaceRecovery.Capture;
+using DeskButler.Core.Diagnostics;
 
 namespace DeskButler.Desktop.Tests.Hosting;
 
@@ -106,6 +107,47 @@ public sealed class InventoryFingerprintChangeSourceTests
         Assert.Contains(failures, failure => failure.Message.Contains("订阅者失败", StringComparison.Ordinal));
     }
 
+    /// <summary>后台写入的最近故障必须能被另一线程立即观察，不能依赖偶然缓存刷新。</summary>
+    [Fact]
+    public async Task LastFailureIsVisibleFromAnotherThread()
+    {
+        var clock = new FakeClock();
+        var expected = new InvalidOperationException("跨线程故障");
+        var inventory = new FaultingSequenceInventory(
+            new WindowCandidate[] { Candidate(1, "A") }, expected);
+        await using var source = new InventoryFingerprintChangeSource(inventory, clock, TimeSpan.FromSeconds(2));
+        await source.StartAsync(CancellationToken.None);
+
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(2));
+        var observed = await Task.Run(() => source.LastFailure, TestContext.Current.CancellationToken);
+
+        Assert.Same(expected, observed);
+    }
+
+    /// <summary>诊断日志自身异常不得终止变化循环，后续真实变化仍应通知健康订阅者。</summary>
+    [Fact]
+    public async Task DiagnosticLogFailureDoesNotKillChangeLoop()
+    {
+        var clock = new FakeClock();
+        var inventory = new FaultingSequenceInventory(
+            new WindowCandidate[] { Candidate(1, "A") },
+            new InvalidOperationException("枚举失败"),
+            new WindowCandidate[] { Candidate(1, "B") });
+        var log = new ThrowingDiagnosticLog();
+        await using var source = new InventoryFingerprintChangeSource(
+            inventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, log);
+        var changes = 0;
+        source.DesktopChanged += (_, _) => changes++;
+        await source.StartAsync(CancellationToken.None);
+
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(2));
+        await log.Attempted.Task.WaitAsync(TestContext.Current.CancellationToken);
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(1, changes);
+        Assert.IsType<AggregateException>(source.LastFailure);
+    }
+
     /// <summary>暂停设置必须在捕获边界短路，自动调度无法取得任何可保存窗口。</summary>
     [Fact]
     public async Task PausedCaptureReturnsEmptyInventoryWithoutReadingDesktop()
@@ -191,6 +233,18 @@ public sealed class InventoryFingerprintChangeSourceTests
             return result is Exception exception
                 ? Task.FromException<IReadOnlyList<WindowCandidate>>(exception)
                 : Task.FromResult((IReadOnlyList<WindowCandidate>)result);
+        }
+    }
+
+    private sealed class ThrowingDiagnosticLog : IDiagnosticLog
+    {
+        internal TaskCompletionSource Attempted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <inheritdoc />
+        public Task WriteAsync(DiagnosticEvent diagnosticEvent, CancellationToken cancellationToken)
+        {
+            Attempted.TrySetResult();
+            throw new IOException("日志失败");
         }
     }
 }

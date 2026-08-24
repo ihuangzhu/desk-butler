@@ -77,4 +77,27 @@ public sealed class MainViewModelTests
 
         Assert.Equal([@"C:\Apps\Browser.exe", @"C:\Apps\Editor.exe"], vm.ExcludedExecutablePaths);
     }
+
+    /// <summary>诊断页必须显示数据库健康警告，并由用户操作加载写 ZIP 前的脱敏预览。</summary>
+    [Fact]
+    public async Task DiagnosticsEntryLoadsHealthWarningAndPreviewOnDemand()
+    {
+        var calls = 0;
+        var vm = new MainViewModel(
+            new InMemorySceneRepository(), new RecordingCommandBus(),
+            new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default),
+            new InlineUiDispatcher(), "数据库已从故障现场回退。",
+            _ =>
+            {
+                calls++;
+                return Task.FromResult("[deskbutler.jsonl] 已脱敏预览");
+            });
+
+        Assert.Equal("数据库已从故障现场回退。", vm.HealthStatusText);
+        Assert.Equal(0, calls);
+        await vm.LoadDiagnosticsAsync();
+
+        Assert.Equal(1, calls);
+        Assert.Equal("[deskbutler.jsonl] 已脱敏预览", vm.DiagnosticPreviewText);
+    }
 }

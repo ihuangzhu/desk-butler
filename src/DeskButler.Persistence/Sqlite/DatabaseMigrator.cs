@@ -4,7 +4,7 @@ using Microsoft.Data.Sqlite;
 namespace DeskButler.Persistence.Sqlite;
 
 /// <summary>负责以显式版本号创建和升级 SQLite 数据库模式。</summary>
-public sealed class DatabaseMigrator
+public sealed class DatabaseMigrator : IDatabaseInitializer
 {
     private const int CurrentSchemaVersion = 2;
     private const int VersionOne = 1;
@@ -24,7 +24,25 @@ public sealed class DatabaseMigrator
     /// <returns>初始化完成的任务。</returns>
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
+        try
+        {
+            await InitializeCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (FormatException exception)
+        {
+            throw new MigrationFailureException("DeskButler 数据库内容无法迁移到当前模式。", exception);
+        }
+    }
+
+    /// <summary>执行实际 SQLite 创建和版本迁移，存储类异常保持原始分类。</summary>
+    private async Task InitializeCoreAsync(CancellationToken cancellationToken)
+    {
         paths.EnsureRootDirectoryExists();
+
+        if (File.Exists(paths.DatabasePath))
+        {
+            await RejectFutureSchemaWithoutTouchingSourceAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         await using var connection = new SqliteConnection($"Data Source={paths.DatabasePath}");
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -50,10 +68,78 @@ public sealed class DatabaseMigrator
 
         if (version != CurrentSchemaVersion)
         {
-            throw new NotSupportedException($"不支持的 DeskButler 数据库模式版本：{version}。");
+            throw new FutureSchemaVersionException(version.Value, CurrentSchemaVersion);
         }
 
         transaction.Commit();
+    }
+
+    /// <summary>在临时副本上读取 DB/WAL/SHM，避免只读 SQLite 连接改变原 SHM 的读标记。</summary>
+    private async Task RejectFutureSchemaWithoutTouchingSourceAsync(CancellationToken cancellationToken)
+    {
+        var inspectionRoot = Path.Combine(Path.GetTempPath(), "DeskButler.SchemaInspection", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(inspectionRoot);
+        var inspectionDatabase = Path.Combine(inspectionRoot, Path.GetFileName(paths.DatabasePath));
+        try
+        {
+            foreach (var suffix in new[] { string.Empty, "-wal", "-shm" })
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var source = paths.DatabasePath + suffix;
+                if (File.Exists(source))
+                {
+                    await using var input = new FileStream(
+                        source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                        81920, FileOptions.Asynchronous);
+                    await using var output = new FileStream(
+                        inspectionDatabase + suffix, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        81920, FileOptions.Asynchronous);
+                    await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            var builder = new SqliteConnectionStringBuilder
+            {
+                DataSource = inspectionDatabase,
+                Mode = SqliteOpenMode.ReadOnly,
+                Pooling = false,
+                Cache = SqliteCacheMode.Private
+            };
+            await using var connection = new SqliteConnection(builder.ToString());
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await RejectFutureSchemaBeforeWritesAsync(connection, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Directory.Delete(inspectionRoot, recursive: true);
+        }
+    }
+
+    /// <summary>在任何 PRAGMA 或事务写入前只读识别未来版本，确保拒绝路径不改动数据库。</summary>
+    private static async Task RejectFutureSchemaBeforeWritesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var tableCommand = connection.CreateCommand();
+        tableCommand.CommandText =
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info');";
+        var exists = Convert.ToInt32(
+            await tableCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+            System.Globalization.CultureInfo.InvariantCulture) != 0;
+        if (!exists)
+        {
+            return;
+        }
+
+        await using var versionCommand = connection.CreateCommand();
+        versionCommand.CommandText = "SELECT version FROM schema_info LIMIT 1;";
+        var value = await versionCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (value is not null and not DBNull &&
+            Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture) > CurrentSchemaVersion)
+        {
+            throw new FutureSchemaVersionException(
+                Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture), CurrentSchemaVersion);
+        }
     }
 
     /// <summary>在新连接上设置数据库持久化和完整性相关的 PRAGMA。</summary>

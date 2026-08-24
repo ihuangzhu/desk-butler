@@ -1,6 +1,7 @@
 using DeskButler.Core.Capture;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Time;
+using DeskButler.Core.Diagnostics;
 using DeskButler.Modules.WorkspaceRecovery;
 
 namespace DeskButler.Desktop.Hosting;
@@ -12,27 +13,31 @@ internal sealed class InventoryFingerprintChangeSource : IDesktopChangeSource, I
     private readonly IClock clock;
     private readonly TimeSpan interval;
     private readonly Action<Exception>? reportFailure;
+    private readonly IDiagnosticLog? diagnosticLog;
     private readonly CancellationTokenSource stopSource = new();
     private WindowFingerprint[] baseline = [];
     private Task? loop;
     private bool disposed;
+    private Exception? lastFailure;
 
     /// <summary>创建具有固定有界检测延迟的变化源。</summary>
     internal InventoryFingerprintChangeSource(
         IWindowInventory inventory,
         IClock clock,
         TimeSpan interval,
-        Action<Exception>? reportFailure = null)
+        Action<Exception>? reportFailure = null,
+        IDiagnosticLog? diagnosticLog = null)
     {
         this.inventory = inventory ?? throw new ArgumentNullException(nameof(inventory));
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero);
         this.interval = interval;
         this.reportFailure = reportFailure;
+        this.diagnosticLog = diagnosticLog;
     }
 
     /// <summary>获取最近一次轮询或订阅者故障，供诊断界面观察。</summary>
-    internal Exception? LastFailure { get; private set; }
+    internal Exception? LastFailure => Volatile.Read(ref lastFailure);
 
     /// <inheritdoc />
     public event EventHandler? DesktopChanged;
@@ -114,19 +119,48 @@ internal sealed class InventoryFingerprintChangeSource : IDesktopChangeSource, I
     /// <summary>保存可观察故障并尽力通知诊断回调；回调自身故障也不会杀死循环。</summary>
     private void ReportFailure(Exception exception)
     {
-        LastFailure = exception;
-        if (reportFailure is null)
+        Volatile.Write(ref lastFailure, exception);
+        if (reportFailure is not null)
         {
-            return;
+            try
+            {
+                reportFailure(exception);
+            }
+            catch (Exception reportingException)
+            {
+                Volatile.Write(
+                    ref lastFailure,
+                    new AggregateException("桌面变化故障回调失败。", exception, reportingException));
+            }
         }
 
+        if (diagnosticLog is not null)
+        {
+            _ = WriteDiagnosticFailureAsync(exception);
+        }
+    }
+
+    /// <summary>异步记录变化源故障，并把日志自身异常合并为线程安全健康状态。</summary>
+    private async Task WriteDiagnosticFailureAsync(Exception sourceFailure)
+    {
         try
         {
-            reportFailure(exception);
+            await diagnosticLog!.WriteAsync(
+                new DiagnosticEvent(
+                    DateTimeOffset.UtcNow, DiagnosticLevel.Warning, "desktop-inventory",
+                    "桌面变化检测失败。",
+                    new Dictionary<string, object?> { ["exceptionType"] = sourceFailure.GetType().FullName }),
+                stopSource.Token).ConfigureAwait(false);
         }
-        catch (Exception reportingException)
+        catch (OperationCanceledException) when (stopSource.IsCancellationRequested)
         {
-            LastFailure = new AggregateException("桌面变化故障回调失败。", exception, reportingException);
+            // 应用退出取消诊断写入，不把正常生命周期伪装为健康故障。
+        }
+        catch (Exception loggingFailure)
+        {
+            Volatile.Write(
+                ref lastFailure,
+                new AggregateException("桌面变化故障的诊断日志写入失败。", sourceFailure, loggingFailure));
         }
     }
 

@@ -29,12 +29,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ISettingsStore settingsStore;
     private readonly IUiDispatcher dispatcher;
     private readonly NotifyingSceneRepository? notifyingRepository;
+    private readonly Func<CancellationToken, Task<string>> diagnosticPreviewLoader;
     private bool isCapturePaused;
     private string statusText = "就绪";
+    private string healthStatusText;
+    private string diagnosticPreviewText = "点击“预览诊断内容”查看即将导出的脱敏类别。";
 
     /// <summary>使用实际仓库、命令总线和设置存储创建主界面模型。</summary>
     public MainViewModel(ISceneRepository repository, ICommandBus commands, ISettingsStore settingsStore)
-        : this(repository, commands, settingsStore, new InlineUiDispatcher())
+        : this(repository, commands, settingsStore, new InlineUiDispatcher(), null, null)
     {
     }
 
@@ -43,12 +46,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ISceneRepository repository,
         ICommandBus commands,
         ISettingsStore settingsStore,
-        IUiDispatcher dispatcher)
+        IUiDispatcher dispatcher,
+        string? healthWarning = null,
+        Func<CancellationToken, Task<string>>? diagnosticPreviewLoader = null)
     {
         this.repository = repository ?? throw new ArgumentNullException(nameof(repository));
         this.commands = commands ?? throw new ArgumentNullException(nameof(commands));
         this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         this.dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        this.diagnosticPreviewLoader = diagnosticPreviewLoader ?? (_ => Task.FromResult("当前没有可预览的诊断文件。"));
+        healthStatusText = healthWarning ?? "数据库与本地服务运行正常";
         notifyingRepository = repository as NotifyingSceneRepository;
         if (notifyingRepository is not null)
         {
@@ -61,6 +68,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? RestoreSceneAsync(scene)
                 : Task.CompletedTask);
         RefreshCommand = new AsyncCommand(LoadAsync);
+        LoadDiagnosticsCommand = new AsyncCommand(LoadDiagnosticsAsync);
     }
 
     /// <summary>获取最新优先且最多三份的现场历史。</summary>
@@ -92,6 +100,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref statusText, value);
     }
 
+    /// <summary>获取数据库回退或正常运行的用户可见健康状态。</summary>
+    public string HealthStatusText
+    {
+        get => healthStatusText;
+        private set => SetProperty(ref healthStatusText, value);
+    }
+
+    /// <summary>获取写入 ZIP 前的脱敏诊断预览。</summary>
+    public string DiagnosticPreviewText
+    {
+        get => diagnosticPreviewText;
+        private set => SetProperty(ref diagnosticPreviewText, value);
+    }
+
     /// <summary>获取立即保存命令。</summary>
     public AsyncCommand SaveNowCommand { get; }
 
@@ -103,6 +125,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>获取刷新历史命令。</summary>
     public AsyncCommand RefreshCommand { get; }
+
+    /// <summary>获取加载诊断包脱敏预览的命令。</summary>
+    public AsyncCommand LoadDiagnosticsCommand { get; }
 
     /// <summary>加载设置与最近三份有效现场。</summary>
     public async Task LoadAsync()
@@ -148,6 +173,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await commands.SendAsync(new SetCaptureEnabledCommand(enable), CancellationToken.None);
         IsCapturePaused = !enable;
         StatusText = enable ? "已继续捕获" : "已暂停捕获";
+    }
+
+    /// <summary>加载白名单诊断文件的脱敏预览，不在此步骤创建或上传 ZIP。</summary>
+    public async Task LoadDiagnosticsAsync()
+    {
+        try
+        {
+            DiagnosticPreviewText = await diagnosticPreviewLoader(CancellationToken.None);
+        }
+        catch (Exception exception)
+        {
+            DiagnosticPreviewText = $"诊断预览失败：{exception.Message}";
+            HealthStatusText = "诊断服务需要关注";
+        }
     }
 
     /// <summary>解除自动保存通知，退出后不再排队 UI 工作。</summary>

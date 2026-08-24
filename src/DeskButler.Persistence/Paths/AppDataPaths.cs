@@ -26,6 +26,12 @@ public sealed class AppDataPaths
     /// <summary>获取 JSON 用户设置文件的完整路径。</summary>
     public string SettingsFilePath => Path.Combine(RootDirectory, "settings.json");
 
+    /// <summary>获取日志和数据库故障证据所在的诊断目录。</summary>
+    public string DiagnosticsDirectory => Path.Combine(RootDirectory, "diagnostics");
+
+    /// <summary>获取有界 JSONL 日志专属目录。</summary>
+    public string LogDirectory => Path.Combine(DiagnosticsDirectory, "logs");
+
     /// <summary>确保应用数据根目录存在。</summary>
     public void EnsureRootDirectoryExists()
     {

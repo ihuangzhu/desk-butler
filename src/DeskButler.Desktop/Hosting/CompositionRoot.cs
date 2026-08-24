@@ -5,6 +5,7 @@ using DeskButler.Core.Persistence;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
 using DeskButler.Core.Time;
+using DeskButler.Core.Diagnostics;
 using DeskButler.Desktop.Tray;
 using DeskButler.Desktop.ViewModels;
 using DeskButler.Desktop.Views;
@@ -18,6 +19,7 @@ using DeskButler.Modules.WorkspaceRecovery.Restore;
 using DeskButler.Persistence.Json;
 using DeskButler.Persistence.Paths;
 using DeskButler.Persistence.Sqlite;
+using DeskButler.Persistence.Diagnostics;
 using System.IO;
 
 namespace DeskButler.Desktop.Hosting;
@@ -49,7 +51,8 @@ public sealed class CompositionRoot : IAsyncDisposable
         RecoveryCardViewModel recoveryCardViewModel,
         MainWindow mainWindow,
         RecoveryCardWindow recoveryCardWindow,
-        TrayIconService trayIcon)
+        TrayIconService trayIcon,
+        RollingJsonLog diagnosticLog)
     {
         this.moduleHost = moduleHost;
         this.scheduler = scheduler;
@@ -77,7 +80,8 @@ public sealed class CompositionRoot : IAsyncDisposable
             new("scheduler", async () => await scheduler.DisposeAsync()),
             new("capture coordinator", () => { captureCoordinator.Dispose(); return ValueTask.CompletedTask; }),
             new("repository", () => { repository.Dispose(); return ValueTask.CompletedTask; }),
-            new("settings", () => { settingsCoordinator.Dispose(); return ValueTask.CompletedTask; })
+            new("settings", () => { settingsCoordinator.Dispose(); return ValueTask.CompletedTask; }),
+            new("diagnostic log", async () => await diagnosticLog.DisposeAsync())
         ]);
     }
 
@@ -168,6 +172,13 @@ public sealed class CompositionRoot : IAsyncDisposable
     public async Task RunDebugSmokeAsync()
     {
         ShowMainWindow();
+        await MainViewModel.LoadDiagnosticsAsync();
+        if (string.IsNullOrWhiteSpace(MainViewModel.HealthStatusText) ||
+            string.IsNullOrWhiteSpace(MainViewModel.DiagnosticPreviewText))
+        {
+            throw new InvalidOperationException("Debug UI 冒烟未能加载诊断页健康状态或预览入口。");
+        }
+
         var emptyFocused = await FocusRecoveryCardAsync();
         if (emptyFocused || RecoveryCardViewModel.IsVisible || RecoveryCardWindow.IsVisible)
         {
@@ -213,84 +224,131 @@ public sealed class CompositionRoot : IAsyncDisposable
         paths.EnsureRootDirectoryExists();
 
         var clock = new SystemClock();
-        var settingsStore = new JsonSettingsStore(paths);
-        var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
-        ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
-        var settingsCoordinator = new SettingsCoordinator(settingsStore);
-        var repository = new SqliteSceneRepository(paths);
-        var notifyingRepository = new NotifyingSceneRepository(repository);
-        var rawInventory = new Win32WindowInventory();
-        var captureInventory = new SettingsAwareWindowInventory(rawInventory, settingsStore);
-        // 动态装饰器负责捕获开关与排除；协调器保持启用，因而暂停后仍可在本次进程中继续。
-        var captureSettings = persistedSettings with
+        var diagnosticLog = new RollingJsonLog(paths.LogDirectory);
+        try
         {
-            CaptureEnabled = true,
-            ExcludedExecutablePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        };
-        var captureCoordinator = new CaptureCoordinator(
-            captureSettings,
-            captureInventory,
-            new SceneFilter(captureSettings),
-            notifyingRepository,
-            clock);
-        var scheduler = new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync);
-        // 两秒检测上限加既有十秒静止防抖，近似用户所见十秒静止语义。
-        var desktopChanges = new InventoryFingerprintChangeSource(rawInventory, clock, TimeSpan.FromSeconds(2));
-        var module = new WorkspaceRecoveryModule(desktopChanges, scheduler, captureCoordinator, clock);
-        var moduleHost = new ModuleHost([module]);
-        var sessionEvents = new WindowsSessionEvents(
-            token => captureCoordinator.SaveNowAsync("session-ending", token));
+            var databaseRecovery = new DatabaseRecovery(
+                paths, new SqliteConnectionLifecycle(), new DatabaseMigrator(paths));
+            var databaseHealth = await databaseRecovery.InitializeAsync(cancellationToken);
+            if (databaseHealth.HealthWarning is not null)
+            {
+                await diagnosticLog.WriteAsync(
+                    new DiagnosticEvent(
+                        clock.UtcNow, DiagnosticLevel.Warning, "database-recovery",
+                        databaseHealth.HealthWarning,
+                        new Dictionary<string, object?>
+                        {
+                            ["backupName"] = Path.GetFileName(databaseHealth.BackupDirectory)
+                        }),
+                    cancellationToken);
+            }
 
-        var commandBus = new InProcessCommandBus();
-        commandBus.Register(new SaveSceneNowCommandHandler(captureCoordinator));
-        commandBus.Register(new RestoreSceneCommandHandler(
-            rawInventory,
-            new RestorePlanner(),
-            new RestoreExecutor(
-                new WindowsAppLauncher(), rawInventory, new WindowsWindowPositioner(), clock),
-            settingsStore));
-        commandBus.Register(new SetCaptureEnabledCommandHandler(settingsCoordinator));
-        commandBus.Register(new PersistExclusionCommandHandler(settingsCoordinator));
+            var diagnosticExporter = new DiagnosticBundleExporter(
+                paths.LogDirectory,
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ["deskbutler.jsonl", "deskbutler.1.jsonl", "deskbutler.2.jsonl"]);
+            var settingsStore = new JsonSettingsStore(paths);
+            var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
+            ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
+            var settingsCoordinator = new SettingsCoordinator(settingsStore);
+            var repository = new SqliteSceneRepository(paths);
+            var failureHistoryStore = new SqliteFailureHistoryStore(paths);
+            var notifyingRepository = new NotifyingSceneRepository(repository);
+            var rawInventory = new Win32WindowInventory();
+            var captureInventory = new SettingsAwareWindowInventory(rawInventory, settingsStore);
+            // 动态装饰器负责捕获开关与排除；协调器保持启用，因而暂停后仍可在本次进程中继续。
+            var captureSettings = persistedSettings with
+            {
+                CaptureEnabled = true,
+                ExcludedExecutablePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            };
+            var captureCoordinator = new CaptureCoordinator(
+                captureSettings,
+                captureInventory,
+                new SceneFilter(captureSettings),
+                notifyingRepository,
+                clock);
+            var scheduler = new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync);
+            // 两秒检测上限加既有十秒静止防抖，近似用户所见十秒静止语义。
+            var desktopChanges = new InventoryFingerprintChangeSource(
+                rawInventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, diagnosticLog);
+            var module = new WorkspaceRecoveryModule(desktopChanges, scheduler, captureCoordinator, clock);
+            var moduleHost = new ModuleHost([module]);
+            var sessionEvents = new WindowsSessionEvents(
+                token => captureCoordinator.SaveNowAsync("session-ending", token));
+
+            var commandBus = new InProcessCommandBus();
+            commandBus.Register(new SaveSceneNowCommandHandler(captureCoordinator));
+            commandBus.Register(new RestoreSceneCommandHandler(
+                rawInventory,
+                new RestorePlanner(),
+                new RestoreExecutor(
+                    new WindowsAppLauncher(), rawInventory, new WindowsWindowPositioner(), clock),
+                    settingsStore,
+                    failureHistoryStore,
+                    diagnosticLog));
+            commandBus.Register(new SetCaptureEnabledCommandHandler(settingsCoordinator));
+            commandBus.Register(new PersistExclusionCommandHandler(settingsCoordinator));
 
 #if DEBUG
-        if (createFixture)
-        {
-            await CreateFixtureIfEmptyAsync(repository, clock, cancellationToken);
-        }
+            if (createFixture)
+            {
+                await CreateFixtureIfEmptyAsync(repository, clock, cancellationToken);
+            }
 #endif
 
-        var mainViewModel = new MainViewModel(
-            notifyingRepository, commandBus, settingsStore,
-            new WpfUiDispatcher(System.Windows.Application.Current.Dispatcher));
-        await mainViewModel.LoadAsync();
-        var recoveryCardViewModel = new RecoveryCardViewModel(
-            commandBus, clock, persistedSettings.RecoveryCardDismissSeconds);
-        var mainWindow = new MainWindow(mainViewModel);
-        var recoveryCardWindow = new RecoveryCardWindow(recoveryCardViewModel);
-        CompositionRoot? root = null;
-        var recoveryCardFocus = new RecoveryCardFocusCoordinator(
-            () => root?.ShowRecoveryCardForLatestSceneAsync() ?? Task.FromResult(false),
-            recoveryCardWindow.FocusForKeyboard);
-        var trayIcon = new TrayIconService(
-            mainViewModel,
-            () => root?.ShowMainWindow(),
-            recoveryCardFocus.FocusAsync,
-            requestExit);
-        root = new CompositionRoot(
-            moduleHost,
-            scheduler,
-            captureCoordinator,
-            repository,
-            settingsCoordinator,
-            desktopChanges,
-            sessionEvents,
-            recoveryCardFocus,
-            mainViewModel,
-            recoveryCardViewModel,
-            mainWindow,
-            recoveryCardWindow,
-            trayIcon);
-        return root;
+            var mainViewModel = new MainViewModel(
+                notifyingRepository, commandBus, settingsStore,
+                new WpfUiDispatcher(System.Windows.Application.Current.Dispatcher),
+                databaseHealth.HealthWarning,
+                async token =>
+                {
+                    var manifest = await diagnosticExporter.CreateManifestAsync(token);
+                    return manifest.Files.Count == 0
+                        ? "当前没有可预览的诊断文件。"
+                        : string.Join(
+                            Environment.NewLine + Environment.NewLine,
+                            manifest.Files.Select(file =>
+                                $"[{file.ArchiveName}] {file.ByteCount} 字节{Environment.NewLine}" +
+                                file.Preview[..Math.Min(file.Preview.Length, 4000)]));
+                });
+            await mainViewModel.LoadAsync();
+            var recoveryCardViewModel = new RecoveryCardViewModel(
+                commandBus, clock, persistedSettings.RecoveryCardDismissSeconds);
+            var mainWindow = new MainWindow(mainViewModel);
+            var recoveryCardWindow = new RecoveryCardWindow(recoveryCardViewModel);
+            CompositionRoot? root = null;
+            var recoveryCardFocus = new RecoveryCardFocusCoordinator(
+                () => root?.ShowRecoveryCardForLatestSceneAsync() ?? Task.FromResult(false),
+                recoveryCardWindow.FocusForKeyboard);
+            var trayIcon = new TrayIconService(
+                mainViewModel,
+                () => root?.ShowMainWindow(),
+                recoveryCardFocus.FocusAsync,
+                requestExit);
+            root = new CompositionRoot(
+                moduleHost,
+                scheduler,
+                captureCoordinator,
+                repository,
+                settingsCoordinator,
+                desktopChanges,
+                sessionEvents,
+                recoveryCardFocus,
+                mainViewModel,
+                recoveryCardViewModel,
+                mainWindow,
+                recoveryCardWindow,
+                trayIcon,
+                diagnosticLog);
+            return root;
+        }
+        catch
+        {
+            // 对象图尚未交给 CompositionRoot 时，由工厂释放独占日志写者锁。
+            await diagnosticLog.DisposeAsync();
+            throw;
+        }
     }
 
     /// <summary>仅为正式宿主同步当前用户 HKCU 登录启动设置；Debug 注入路径不触碰注册表。</summary>

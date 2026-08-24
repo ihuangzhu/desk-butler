@@ -78,12 +78,56 @@ public sealed class SaveSceneNowCommandHandler(CaptureCoordinator coordinator)
 }
 
 /// <summary>把显式场景恢复命令连接到既有规划器和执行器。</summary>
-public sealed class RestoreSceneCommandHandler(
-    IWindowInventory inventory,
-    IRestorePlanner planner,
-    RestoreExecutor executor,
-    ISettingsStore settingsStore) : ICommandHandler<RestoreSceneCommand, RestoreResult>
+public sealed class RestoreSceneCommandHandler : ICommandHandler<RestoreSceneCommand, RestoreResult>
 {
+    private readonly IWindowInventory inventory;
+    private readonly IRestorePlanner planner;
+    private readonly RestoreExecutor executor;
+    private readonly ISettingsStore settingsStore;
+    private readonly IFailureHistoryStore failureHistoryStore;
+    private readonly IDiagnosticLog? diagnosticLog;
+    private readonly TimeSpan persistenceTimeout;
+
+    /// <summary>为兼容隔离宿主创建不持久化失败历史的恢复处理器。</summary>
+    public RestoreSceneCommandHandler(
+        IWindowInventory inventory,
+        IRestorePlanner planner,
+        RestoreExecutor executor,
+        ISettingsStore settingsStore)
+        : this(inventory, planner, executor, settingsStore, TransientFailureHistoryStore.Instance)
+    {
+    }
+
+    /// <summary>使用真实失败历史读写边界创建生产恢复处理器。</summary>
+    public RestoreSceneCommandHandler(
+        IWindowInventory inventory,
+        IRestorePlanner planner,
+        RestoreExecutor executor,
+        ISettingsStore settingsStore,
+        IFailureHistoryStore failureHistoryStore)
+        : this(inventory, planner, executor, settingsStore, failureHistoryStore, null)
+    {
+    }
+
+    /// <summary>使用失败历史与诊断日志创建生产恢复处理器。</summary>
+    public RestoreSceneCommandHandler(
+        IWindowInventory inventory,
+        IRestorePlanner planner,
+        RestoreExecutor executor,
+        ISettingsStore settingsStore,
+        IFailureHistoryStore failureHistoryStore,
+        IDiagnosticLog? diagnosticLog,
+        TimeSpan? persistenceTimeout = null)
+    {
+        this.inventory = inventory ?? throw new ArgumentNullException(nameof(inventory));
+        this.planner = planner ?? throw new ArgumentNullException(nameof(planner));
+        this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
+        this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
+        this.failureHistoryStore = failureHistoryStore ?? throw new ArgumentNullException(nameof(failureHistoryStore));
+        this.diagnosticLog = diagnosticLog;
+        this.persistenceTimeout = persistenceTimeout ?? TimeSpan.FromSeconds(2);
+    }
+
     /// <inheritdoc />
     public async Task<RestoreResult> HandleAsync(RestoreSceneCommand command, CancellationToken cancellationToken)
     {
@@ -99,10 +143,85 @@ public sealed class RestoreSceneCommandHandler(
                 .ToArray()
         };
         var currentWindows = await inventory.CaptureAsync(cancellationToken).ConfigureAwait(false);
-        var plan = planner.Build(selectedScene, currentWindows, FailureHistory.Empty, command.SafeMode);
-        return await executor.ExecuteAsync(plan, cancellationToken).ConfigureAwait(false);
+        var failureHistory = await failureHistoryStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var plan = planner.Build(selectedScene, currentWindows, failureHistory, command.SafeMode);
+        var result = await executor.ExecuteAsync(plan, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // 恢复结果已经产生后不再受用户取消影响，否则成功/失败历史会永久丢失。
+            using var persistenceCancellation = new CancellationTokenSource(persistenceTimeout);
+            // 调用接口本身也可能在返回 Task 前阻塞，因此把调用置于线程池调度边界。
+            var recordTask = Task.Run(
+                () => failureHistoryStore.RecordAsync(result, persistenceCancellation.Token),
+                CancellationToken.None);
+            ObserveLateFailure(recordTask);
+            await recordTask.WaitAsync(persistenceTimeout, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (!IsFatalPersistenceFailure(exception))
+        {
+            await ReportHistoryFailureAsync(exception).ConfigureAwait(false);
+        }
+
+        return result;
     }
 
+    /// <summary>尽力记录历史落库失败但不覆盖已经完成的恢复结果。</summary>
+    private async Task ReportHistoryFailureAsync(Exception failure)
+    {
+        if (diagnosticLog is null)
+        {
+            return;
+        }
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(persistenceTimeout);
+            var diagnosticEvent = new DiagnosticEvent(
+                    DateTimeOffset.UtcNow, DiagnosticLevel.Warning, "failure-history",
+                    "恢复已经完成，但失败历史未能持久化。",
+                    new Dictionary<string, object?> { ["exceptionType"] = failure.GetType().FullName });
+            var logTask = Task.Run(
+                () => diagnosticLog.WriteAsync(diagnosticEvent, timeout.Token),
+                CancellationToken.None);
+            ObserveLateFailure(logTask);
+            await logTask.WaitAsync(persistenceTimeout, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (!IsFatalPersistenceFailure(exception))
+        {
+            // 诊断日志自身失败不能把已完成恢复改写成命令失败。
+        }
+    }
+
+    /// <summary>观察超时后迟到任务的异常，避免后台持久化故障成为未观察异常。</summary>
+    private static void ObserveLateFailure(Task task)
+    {
+        _ = task.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    /// <summary>识别不得由持久化降级边界吞掉的进程级致命故障。</summary>
+    private static bool IsFatalPersistenceFailure(Exception exception) =>
+        exception is OutOfMemoryException
+            or AccessViolationException
+            or StackOverflowException
+            or ThreadAbortException
+            or System.Runtime.InteropServices.SEHException;
+
+    /// <summary>为旧构造入口提供仅进程内空历史，不影响生产组合的兼容实现。</summary>
+    private sealed class TransientFailureHistoryStore : IFailureHistoryStore
+    {
+        internal static TransientFailureHistoryStore Instance { get; } = new();
+
+        /// <inheritdoc />
+        public Task<FailureHistory> LoadAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(FailureHistory.Empty);
+
+        /// <inheritdoc />
+        public Task RecordAsync(RestoreResult result, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
 }
 
 /// <summary>集中正规化捕获与恢复共用的永久排除路径语义。</summary>
