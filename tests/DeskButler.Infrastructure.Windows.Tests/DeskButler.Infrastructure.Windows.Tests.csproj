@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="TestApps\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -21,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DeskButler.Infrastructure.Windows\DeskButler.Infrastructure.Windows.csproj" />
+    <ProjectReference Include="TestApps\DeskButler.TestWindow\DeskButler.TestWindow.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>
