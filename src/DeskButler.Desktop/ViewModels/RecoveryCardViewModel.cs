@@ -45,9 +45,15 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     private readonly IFailureHistoryStore? failureHistoryStore;
     // 所有卡片动作共享此门，避免独立 ICommand 防重入边界互相穿透。
     private readonly SemaphoreSlim actionGate = new(1, 1);
+    // 若同时需要两个边界，只允许先取得 actionGate，再短暂取得此同步锁；锁内绝不 await 或发命令。
+    private readonly object lifecycleSync = new();
+    // 显示请求只允许最后发起者发布，避免较慢历史读取让界面倒退。
+    private long latestShowRequest;
     // 每次显示拥有独立代次；旧倒计时不得隐藏后来显示的新现场。
     private CancellationTokenSource? dismissSource;
     private SceneSnapshot? scene;
+    // 释放是不可逆的生命周期边界；异步延续只能读取，不能复活卡片状态。
+    private int disposed;
     private bool isVisible;
     private string? errorMessage;
     private string lastRestoreSummary = "尚未执行恢复";
@@ -118,20 +124,66 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     /// <summary>展示指定现场并启动只负责隐藏的倒计时。</summary>
     public async Task ShowAsync(SceneSnapshot snapshot)
     {
-        scene = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        var request = Interlocked.Increment(ref latestShowRequest);
         var failureHistory = failureHistoryStore is null
             ? FailureHistory.Empty
             : await failureHistoryStore.LoadAsync(CancellationToken.None);
-        ErrorMessage = null;
-        CancelDismissTimer();
-        Items.Clear();
-        foreach (var item in snapshot.Items)
-        {
-            Items.Add(new RecoveryItemViewModel(item, failureHistory.CountFor(item.Id) >= 3));
-        }
+        var candidateItems = snapshot.Items
+            .Select(item => new RecoveryItemViewModel(item, failureHistory.CountFor(item.Id) >= 3))
+            .ToArray();
 
-        IsVisible = true;
-        StartDismissTimer();
+        await actionGate.WaitAsync();
+        try
+        {
+            var startTimer = false;
+            lock (lifecycleSync)
+            {
+                if (IsDisposed || request != Volatile.Read(ref latestShowRequest))
+                {
+                    return;
+                }
+
+                scene = snapshot;
+                Items.Clear();
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                foreach (var item in candidateItems)
+                {
+                    Items.Add(item);
+                    if (IsDisposed)
+                    {
+                        return;
+                    }
+                }
+
+                ErrorMessage = null;
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                IsVisible = true;
+                startTimer = !IsDisposed;
+            }
+
+            if (startTimer)
+            {
+                StartDismissTimer();
+            }
+        }
+        finally
+        {
+            actionGate.Release();
+        }
     }
 
     /// <summary>显式请求普通恢复当前选中项目。</summary>
@@ -158,17 +210,45 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     public async Task ExcludePermanentlyAsync(RecoveryItemViewModel item)
     {
         ArgumentNullException.ThrowIfNull(item);
-        // 先兑现用户意图；并发恢复读取选择时已无法带入此项。
-        item.IsSelected = false;
         await actionGate.WaitAsync();
         try
         {
-            await commands.SendAsync(new PersistExclusionCommand(item.Item.ExecutablePath), CancellationToken.None);
-            ErrorMessage = null;
+            string executablePath;
+            lock (lifecycleSync)
+            {
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                // 在共享状态门内兑现用户意图，并发恢复读取选择时已无法带入此项。
+                item.IsSelected = false;
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                executablePath = item.Item.ExecutablePath;
+            }
+
+            await commands.SendAsync(new PersistExclusionCommand(executablePath), CancellationToken.None);
+            lock (lifecycleSync)
+            {
+                if (!IsDisposed)
+                {
+                    ErrorMessage = null;
+                }
+            }
         }
         catch (Exception exception)
         {
-            ErrorMessage = $"永久排除失败：{exception.Message}";
+            lock (lifecycleSync)
+            {
+                if (!IsDisposed)
+                {
+                    ErrorMessage = $"永久排除失败：{exception.Message}";
+                }
+            }
         }
         finally
         {
@@ -176,17 +256,29 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>取消任何未到期倒计时并释放资源。</summary>
+    /// <summary>原子终止生命周期、隐藏卡片并取消任何未到期倒计时。</summary>
     public void Dispose()
     {
-        CancelDismissTimer();
+        lock (lifecycleSync)
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0)
+            {
+                return;
+            }
+
+            // 让尚在历史读取或等待状态门的显示请求全部过期；Dispose 绝不等待 actionGate。
+            Interlocked.Increment(ref latestShowRequest);
+            CancelDismissTimerLocked();
+            IsVisible = false;
+        }
+
         GC.SuppressFinalize(this);
     }
 
     /// <summary>在共享串行边界内发送恢复命令，仅成功后隐藏卡片。</summary>
     private async Task RestoreAsync(bool safeMode)
     {
-        if (scene is null)
+        if (IsDisposed)
         {
             return;
         }
@@ -196,37 +288,90 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
         await actionGate.WaitAsync();
         try
         {
-            var currentScene = scene;
-            var selectedIds = Items.Where(item => item.IsSelected).Select(item => item.Item.Id).ToArray();
-            ErrorMessage = null;
-            var explicitRetries = Items
-                .Where(item => item.WasFailureProtected && item.IsSelected)
-                .Select(item => item.Item.Id)
-                .ToHashSet(StringComparer.Ordinal);
-            var result = await commands.SendAsync(
-                new RestoreSceneCommand(currentScene, selectedIds, safeMode)
+            RestoreSceneCommand restoreCommand;
+            lock (lifecycleSync)
+            {
+                if (IsDisposed || scene is null)
+                {
+                    return;
+                }
+
+                var currentScene = scene;
+                var selectedIds = Items.Where(item => item.IsSelected).Select(item => item.Item.Id).ToArray();
+                ErrorMessage = null;
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                var explicitRetries = Items
+                    .Where(item => item.WasFailureProtected && item.IsSelected)
+                    .Select(item => item.Item.Id)
+                    .ToHashSet(StringComparer.Ordinal);
+                restoreCommand = new RestoreSceneCommand(currentScene, selectedIds, safeMode)
                 {
                     ExplicitFailureRetryItemIds = explicitRetries
-                }, CancellationToken.None);
+                };
+            }
+
+            var result = await commands.SendAsync(restoreCommand, CancellationToken.None);
             result ??= new RestoreResult([]);
-            LastRestoreSummary = RestoreResultSummary.Format(result);
+            var summary = RestoreResultSummary.Format(result);
             var needsRetry = result.Items.Any(
                 item => item.Status is RestoreItemStatus.Failed or RestoreItemStatus.Cancelled);
-            if (needsRetry)
+            lock (lifecycleSync)
             {
-                ErrorMessage = LastRestoreSummary;
-                IsVisible = true;
-            }
-            else
-            {
-                Hide();
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                LastRestoreSummary = summary;
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                if (needsRetry)
+                {
+                    ErrorMessage = summary;
+                    if (IsDisposed)
+                    {
+                        return;
+                    }
+
+                    IsVisible = true;
+                }
+                else
+                {
+                    HideLocked();
+                }
             }
         }
         catch (Exception exception)
         {
-            ErrorMessage = $"恢复失败：{exception.Message}";
-            IsVisible = true;
-            StartDismissTimer();
+            var startTimer = false;
+            lock (lifecycleSync)
+            {
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                ErrorMessage = $"恢复失败：{exception.Message}";
+                if (IsDisposed)
+                {
+                    return;
+                }
+
+                IsVisible = true;
+                startTimer = !IsDisposed;
+            }
+
+            if (startTimer)
+            {
+                StartDismissTimer();
+            }
         }
         finally
         {
@@ -237,39 +382,87 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     /// <summary>为当前可见状态创建新的完整隐藏期限。</summary>
     private void StartDismissTimer()
     {
-        CancelDismissTimer();
-        dismissSource = new CancellationTokenSource();
-        _ = DismissAfterDelayAsync(dismissSource);
+        CancellationTokenSource source;
+        CancellationToken cancellationToken;
+        lock (lifecycleSync)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            CancelDismissTimerLocked();
+            source = new CancellationTokenSource();
+            cancellationToken = source.Token;
+            dismissSource = source;
+        }
+
+        // 时钟边界可能同步执行用户代码，必须在释放生命周期锁后调用。
+        _ = DismissAfterDelayAsync(source, cancellationToken);
     }
 
     /// <summary>等待固定时长后仅改变可见性；取消属于正常的代次切换或用户操作。</summary>
-    private async Task DismissAfterDelayAsync(CancellationTokenSource source)
+    private async Task DismissAfterDelayAsync(
+        CancellationTokenSource source,
+        CancellationToken cancellationToken)
     {
         try
         {
-            await clock.DelayAsync(dismissDelay, source.Token);
-            if (ReferenceEquals(dismissSource, source))
+            await clock.DelayAsync(dismissDelay, cancellationToken);
+            lock (lifecycleSync)
             {
-                IsVisible = false;
-                dismissSource = null;
-                source.Dispose();
+                if (!IsDisposed && ReferenceEquals(dismissSource, source))
+                {
+                    dismissSource = null;
+                    IsVisible = false;
+                }
             }
         }
-        catch (OperationCanceledException) when (source.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // 用户操作或新卡片替换旧卡片时，旧计时器静默退出。
+        }
+        finally
+        {
+            lock (lifecycleSync)
+            {
+                if (ReferenceEquals(dismissSource, source))
+                {
+                    dismissSource = null;
+                }
+
+                source.Dispose();
+            }
         }
     }
 
     /// <summary>隐藏卡片并终止当前倒计时。</summary>
     private void Hide()
     {
-        IsVisible = false;
-        CancelDismissTimer();
+        lock (lifecycleSync)
+        {
+            HideLocked();
+        }
     }
 
-    /// <summary>安全取消并释放当前隐藏倒计时。</summary>
+    /// <summary>安全摘除并取消当前隐藏倒计时。</summary>
     private void CancelDismissTimer()
+    {
+        lock (lifecycleSync)
+        {
+            CancelDismissTimerLocked();
+        }
+    }
+
+    /// <summary>在生命周期锁内隐藏卡片并取消当前倒计时。</summary>
+    private void HideLocked()
+    {
+        CancelDismissTimerLocked();
+        IsVisible = false;
+    }
+
+    /// <summary>在生命周期锁内摘除并取消当前倒计时，最终释放由异步等待负责。</summary>
+    private void CancelDismissTimerLocked()
     {
         var source = dismissSource;
         dismissSource = null;
@@ -279,6 +472,7 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
         }
 
         source.Cancel();
-        source.Dispose();
     }
+
+    private bool IsDisposed => Volatile.Read(ref disposed) != 0;
 }

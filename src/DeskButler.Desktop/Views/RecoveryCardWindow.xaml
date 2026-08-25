@@ -17,8 +17,25 @@
                                 <Button DockPanel.Dock="Right" Content="永久排除" Padding="8,3" Margin="8,0,0,0"
                                         Command="{Binding DataContext.ExcludePermanentlyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                         CommandParameter="{Binding}" />
-                                <CheckBox IsChecked="{Binding IsSelected}" Content="{Binding DisplayName}"
-                                          VerticalAlignment="Center" Focusable="True" />
+                                <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center" Focusable="True"
+                                          AutomationProperties.Name="{Binding DisplayName}"
+                                          AutomationProperties.HelpText="{Binding ProtectionReason}">
+                                    <StackPanel>
+                                        <TextBlock Text="{Binding DisplayName}" />
+                                        <TextBlock Text="{Binding ProtectionReason}" Foreground="#FFB54708" TextWrapping="Wrap">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding ProtectionReason}" Value="{x:Null}">
+                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </CheckBox>
                             </DockPanel>
                         </DataTemplate>
                     </ItemsControl.ItemTemplate>

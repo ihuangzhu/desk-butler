@@ -4,7 +4,7 @@ namespace DeskButler.Desktop.Tests;
 
 public sealed class InstallerContractTests
 {
-    private static readonly string RepositoryRoot = FindRepositoryRoot();
+    private static readonly string RepositoryRoot = TestRepository.Root;
 
     /// <summary>验证 Release 发布是完整的 win-x64 自包含非单文件布局。</summary>
     [Fact]
@@ -131,16 +131,4 @@ public sealed class InstallerContractTests
     private static string ReadInstallerScript() =>
         File.ReadAllText(Path.Combine(RepositoryRoot, "installer", "DeskButler.iss"));
 
-    /// <summary>从测试输出目录向上定位包含独立 Git 的 DeskButler 根目录。</summary>
-    private static string FindRepositoryRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return current?.FullName
-            ?? throw new DirectoryNotFoundException("无法定位 DeskButler 独立仓库根目录。");
-    }
 }

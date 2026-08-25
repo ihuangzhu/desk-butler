@@ -47,10 +47,14 @@ internal sealed class FakeClock : IClock
     /// <inheritdoc />
     public DateTimeOffset UtcNow { get; private set; }
 
-    /// <inheritdoc />
+    /// <summary>获取测试期间启动的延时总数，用于验证没有创建新的计时器。</summary>
+    internal int DelayCallCount { get; private set; }
+
+    /// <summary>记录并挂起一个可由测试同步推进的延时。</summary>
     public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        DelayCallCount++;
         // 同步完成让 AdvanceAsync 成为确定性的“时间已推进且延续已观察”边界。
         var completion = new TaskCompletionSource();
         var scheduled = new Delay(UtcNow + delay, completion);

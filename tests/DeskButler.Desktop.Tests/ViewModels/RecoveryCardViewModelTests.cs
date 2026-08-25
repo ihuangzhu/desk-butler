@@ -8,6 +8,207 @@ namespace DeskButler.Desktop.Tests.ViewModels;
 
 public sealed class RecoveryCardViewModelTests
 {
+    /// <summary>较慢的旧历史加载不得在较新的显示请求完成后覆盖恢复项目。</summary>
+    [Fact]
+    public async Task LatestShowRequestWinsWhenOlderHistoryLoadCompletesLast()
+    {
+        var history = new SequencedFailureHistoryStore();
+        var vm = new RecoveryCardViewModel(new RecordingCommandBus(), new FakeClock(), 15, history);
+        var older = SceneFactory.Create("00000000-0000-0000-0000-000000000051", DateTimeOffset.UtcNow,
+            @"C:\Apps\Old.exe");
+        var newer = SceneFactory.Create("00000000-0000-0000-0000-000000000052", DateTimeOffset.UtcNow,
+            @"C:\Apps\New.exe");
+
+        var oldShow = vm.ShowAsync(older);
+        await history.FirstLoadStarted.Task;
+        await vm.ShowAsync(newer);
+        history.ReleaseFirstLoad.TrySetResult();
+        await oldShow;
+
+        Assert.Equal([newer.Items[0].Id], vm.Items.Select(item => item.Item.Id));
+    }
+
+    /// <summary>恢复命令完成前新的显示请求必须等待，命令与最终界面各自使用完整单一现场。</summary>
+    [Fact]
+    public async Task RestoreUsesOnePublishedSceneWhileNewShowWaits()
+    {
+        var restoreStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRestore = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commands = new ControlledCommandBus(async command =>
+        {
+            if (command is RestoreSceneCommand)
+            {
+                restoreStarted.TrySetResult();
+                await releaseRestore.Task;
+            }
+        });
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(commands, clock, 15);
+        var older = SceneFactory.Create("00000000-0000-0000-0000-000000000053", clock.UtcNow,
+            @"C:\Apps\Old.exe");
+        var newer = SceneFactory.Create("00000000-0000-0000-0000-000000000054", clock.UtcNow,
+            @"C:\Apps\New.exe");
+        await vm.ShowAsync(older);
+
+        var restore = vm.RestoreImmediatelyAsync();
+        await restoreStarted.Task;
+        var newShow = vm.ShowAsync(newer);
+        try
+        {
+            Assert.False(newShow.IsCompleted);
+            Assert.Equal([older.Items[0].Id], vm.Items.Select(item => item.Item.Id));
+        }
+        finally
+        {
+            releaseRestore.TrySetResult();
+            await Task.WhenAll(restore, newShow);
+        }
+
+        var sent = Assert.IsType<RestoreSceneCommand>(Assert.Single(commands.SentCommands));
+        Assert.Equal(older.Id, sent.Scene.Id);
+        Assert.All(sent.SelectedItemIds, id => Assert.Contains(id, older.Items.Select(item => item.Id)));
+        Assert.Equal([newer.Items[0].Id], vm.Items.Select(item => item.Item.Id));
+        Assert.True(vm.IsVisible);
+    }
+
+    /// <summary>释放资源后才完成的历史读取不得再发布现场、项目或显示计时器。</summary>
+    [Fact]
+    public async Task DisposePreventsBlockedShowFromPublishing()
+    {
+        var history = new SequencedFailureHistoryStore();
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(new RecordingCommandBus(), clock, 15, history);
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000055", clock.UtcNow,
+            @"C:\Apps\DisposedShow.exe");
+
+        var show = vm.ShowAsync(scene);
+        await history.FirstLoadStarted.Task;
+        vm.Dispose();
+        history.ReleaseFirstLoad.TrySetResult();
+        await show;
+
+        Assert.False(vm.IsVisible);
+        Assert.Empty(vm.Items);
+        Assert.Equal(0, clock.DelayCallCount);
+    }
+
+    /// <summary>释放资源后才失败的恢复不得产生任何错误重显或新计时器副作用。</summary>
+    [Fact]
+    public async Task DisposedRestoreFailureHasNoUiSideEffects()
+    {
+        var restoreStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFailure = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commands = new ControlledCommandBus(async command =>
+        {
+            if (command is RestoreSceneCommand)
+            {
+                restoreStarted.TrySetResult();
+                await releaseFailure.Task;
+                throw new InvalidOperationException("释放后的恢复失败");
+            }
+        });
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(commands, clock, 15);
+        await vm.ShowAsync(SceneFactory.Create("00000000-0000-0000-0000-000000000056", clock.UtcNow,
+            @"C:\Apps\DisposedRestore.exe"));
+        var timerStartsBeforeFailure = clock.DelayCallCount;
+
+        var restore = vm.RestoreImmediatelyAsync();
+        await restoreStarted.Task;
+        vm.Dispose();
+        releaseFailure.TrySetResult();
+        await restore;
+
+        Assert.Equal(timerStartsBeforeFailure, clock.DelayCallCount);
+        Assert.False(vm.IsVisible);
+        Assert.Null(vm.ErrorMessage);
+    }
+
+    /// <summary>Show 发布通知中重入 Dispose 后不得继续重显或创建计时器。</summary>
+    [Fact]
+    public async Task DisposeDuringShowPublicationPreventsLaterVisibilityAndTimer()
+    {
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(new RecordingCommandBus(), clock, 15);
+        var disposedDuringPublication = false;
+        vm.Items.CollectionChanged += (_, _) =>
+        {
+            if (disposedDuringPublication)
+            {
+                return;
+            }
+
+            disposedDuringPublication = true;
+            vm.Dispose();
+        };
+
+        await vm.ShowAsync(SceneFactory.Create("00000000-0000-0000-0000-000000000057", clock.UtcNow,
+            @"C:\Apps\ReentrantShow.exe"));
+
+        Assert.True(disposedDuringPublication);
+        Assert.False(vm.IsVisible);
+        Assert.Equal(0, clock.DelayCallCount);
+    }
+
+    /// <summary>成功结果摘要通知中重入 Dispose 后不得继续发布错误或重显。</summary>
+    [Fact]
+    public async Task DisposeDuringRestoreResultPublicationPreventsLaterUiWrites()
+    {
+        var clock = new FakeClock();
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000058", clock.UtcNow,
+            @"C:\Apps\ReentrantResult.exe");
+        var vm = new RecoveryCardViewModel(
+            new ResultBus(new RestoreResult([
+                new(scene.Items[0].Id, RestoreItemStatus.Failed, "结果发布失败")
+            ])), clock, 15);
+        await vm.ShowAsync(scene);
+        var disposedDuringPublication = false;
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(RecoveryCardViewModel.LastRestoreSummary))
+            {
+                disposedDuringPublication = true;
+                vm.Dispose();
+            }
+        };
+
+        await vm.RestoreImmediatelyAsync();
+
+        Assert.True(disposedDuringPublication);
+        Assert.False(vm.IsVisible);
+        Assert.Null(vm.ErrorMessage);
+    }
+
+    /// <summary>恢复异常通知中重入 Dispose 后不得继续重显或创建新计时器。</summary>
+    [Fact]
+    public async Task DisposeDuringRestoreFailurePublicationPreventsLaterVisibilityAndTimer()
+    {
+        var clock = new FakeClock();
+        var commands = new ControlledCommandBus(command =>
+            command is RestoreSceneCommand
+                ? Task.FromException(new InvalidOperationException("重入释放失败"))
+                : Task.CompletedTask);
+        var vm = new RecoveryCardViewModel(commands, clock, 15);
+        await vm.ShowAsync(SceneFactory.Create("00000000-0000-0000-0000-000000000059", clock.UtcNow,
+            @"C:\Apps\ReentrantFailure.exe"));
+        var timerStartsBeforeFailure = clock.DelayCallCount;
+        var disposedDuringPublication = false;
+        vm.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(RecoveryCardViewModel.ErrorMessage))
+            {
+                disposedDuringPublication = true;
+                vm.Dispose();
+            }
+        };
+
+        await vm.RestoreImmediatelyAsync();
+
+        Assert.True(disposedDuringPublication);
+        Assert.False(vm.IsVisible);
+        Assert.Equal(timerStartsBeforeFailure, clock.DelayCallCount);
+    }
+
     /// <summary>卡片加载时连续失败三次的项目必须默认不选并解释保护原因。</summary>
     [Fact]
     public async Task ShowDefaultsThreeFailureItemToUnselectedWithReason()
@@ -29,6 +230,33 @@ public sealed class RecoveryCardViewModelTests
     {
         /// <inheritdoc />
         public Task<FailureHistory> LoadAsync(CancellationToken cancellationToken) => Task.FromResult(history);
+
+        /// <inheritdoc />
+        public Task RecordAsync(RestoreResult result, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    /// <summary>让首次历史读取精确晚于第二次读取完成，暴露异步显示的乱序完成。</summary>
+    private sealed class SequencedFailureHistoryStore : IFailureHistoryStore
+    {
+        private int loadCount;
+
+        internal TaskCompletionSource FirstLoadStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource ReleaseFirstLoad { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <inheritdoc />
+        public async Task<FailureHistory> LoadAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref loadCount) == 1)
+            {
+                FirstLoadStarted.TrySetResult();
+                await ReleaseFirstLoad.Task.WaitAsync(cancellationToken);
+            }
+
+            return FailureHistory.Empty;
+        }
 
         /// <inheritdoc />
         public Task RecordAsync(RestoreResult result, CancellationToken cancellationToken) => Task.CompletedTask;

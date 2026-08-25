@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using DeskButler.Desktop.Hosting;
+using DeskButler.Desktop.Tests;
 
 namespace DeskButler.Desktop.Tests.Hosting;
 
@@ -148,19 +149,9 @@ public sealed class SingleInstanceGuardTests
     {
         var output = new DirectoryInfo(AppContext.BaseDirectory);
         var configuration = FindTestConfiguration(output);
-        var repository = output;
-        while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "DeskButler.slnx")))
-        {
-            repository = repository.Parent;
-        }
-
-        if (repository is null)
-        {
-            throw new DirectoryNotFoundException("无法从测试输出目录定位 DeskButler 仓库根目录。");
-        }
 
         return Path.Combine(
-            repository.FullName,
+            TestRepository.Root,
             "tests",
             "DeskButler.Desktop.Tests",
             "TestApps",

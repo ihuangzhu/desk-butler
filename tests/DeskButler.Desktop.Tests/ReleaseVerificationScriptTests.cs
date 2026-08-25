@@ -4,7 +4,7 @@ namespace DeskButler.Desktop.Tests;
 
 public sealed class ReleaseVerificationScriptTests
 {
-    private static readonly string RepositoryRoot = FindRepositoryRoot();
+    private static readonly string RepositoryRoot = TestRepository.Root;
 
     /// <summary>发布验证必须按既定次序调用工具，并对最终安装器计算 SHA-256。</summary>
     [Fact]
@@ -44,19 +44,6 @@ public sealed class ReleaseVerificationScriptTests
             ],
             fixture.ReadTrace());
         Assert.False(File.Exists(Path.Combine(fixture.Root, "artifacts", "installer", "DeskButler-Setup-0.1.0.exe")));
-    }
-
-    /// <summary>从测试输出目录向上定位独立 DeskButler 仓库。</summary>
-    private static string FindRepositoryRoot()
-    {
-        var current = new DirectoryInfo(AppContext.BaseDirectory);
-        while (current is not null && !Directory.Exists(Path.Combine(current.FullName, ".git")))
-        {
-            current = current.Parent;
-        }
-
-        return current?.FullName
-            ?? throw new DirectoryNotFoundException("无法定位 DeskButler 独立仓库根目录。");
     }
 
     private sealed class ReleaseScriptFixture : IDisposable
