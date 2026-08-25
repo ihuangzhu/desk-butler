@@ -10,6 +10,7 @@ using DeskButler.Modules.WorkspaceRecovery.Restore;
 using DeskButler.Modules.WorkspaceRecovery;
 using DeskButler.Infrastructure.Windows.Startup;
 using System.IO;
+using System.Runtime.ExceptionServices;
 
 namespace DeskButler.Desktop.Hosting;
 
@@ -64,6 +65,74 @@ public sealed class SettingsCoordinator : IDisposable
         finally
         {
             mutationGate.Release();
+        }
+    }
+
+    /// <summary>在设置串行门内同步提交登录启动注册与设置，并独立尝试全部补偿。</summary>
+    public async Task<bool> SetStartupEnabledAsync(
+        IStartupRegistration registration,
+        bool enabled,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(registration);
+        await mutationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var originalSettings = await store.LoadAsync(cancellationToken).ConfigureAwait(false);
+            var originalRegistration = registration.IsEnabled;
+            try
+            {
+                SetRegistration(registration, enabled);
+                await store.SaveAsync(
+                    originalSettings with { StartupEnabled = enabled }, cancellationToken).ConfigureAwait(false);
+                return registration.IsEnabled;
+            }
+            catch (Exception originalFailure)
+            {
+                var failures = new List<Exception> { originalFailure };
+                try
+                {
+                    SetRegistration(registration, originalRegistration);
+                }
+                catch (Exception rollbackFailure)
+                {
+                    failures.Add(rollbackFailure);
+                }
+
+                try
+                {
+                    await store.SaveAsync(originalSettings, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception rollbackFailure)
+                {
+                    failures.Add(rollbackFailure);
+                }
+
+                if (failures.Count > 1)
+                {
+                    throw new AggregateException("登录启动设置失败且补偿未全部完成。", failures);
+                }
+
+                ExceptionDispatchInfo.Capture(originalFailure).Throw();
+                throw new InvalidOperationException("无法重新抛出登录启动设置异常。");
+            }
+        }
+        finally
+        {
+            mutationGate.Release();
+        }
+    }
+
+    /// <summary>只调用指定的登录启动注册边界，不接触其他 Run 值。</summary>
+    private static void SetRegistration(IStartupRegistration registration, bool enabled)
+    {
+        if (enabled)
+        {
+            registration.Enable();
+        }
+        else
+        {
+            registration.Disable();
         }
     }
 
@@ -315,50 +384,21 @@ public sealed class SetCaptureEnabledCommandHandler : ICommandHandler<SetCapture
 /// <summary>同时维护 JSON 设置与唯一 HKCU Run 值，失败时恢复原状态。</summary>
 public sealed class SetStartupEnabledCommandHandler : ICommandHandler<SetStartupEnabledCommand, bool>
 {
-    private readonly ISettingsStore settingsStore;
+    private readonly SettingsCoordinator settings;
     private readonly IStartupRegistration startupRegistration;
 
-    /// <summary>使用设置存储和当前用户启动注册边界创建处理器。</summary>
+    /// <summary>使用共享设置协调器和当前用户启动注册边界创建处理器。</summary>
     public SetStartupEnabledCommandHandler(
-        ISettingsStore settingsStore,
+        SettingsCoordinator settings,
         IStartupRegistration startupRegistration)
     {
-        this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
+        this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
         this.startupRegistration = startupRegistration ?? throw new ArgumentNullException(nameof(startupRegistration));
     }
 
     /// <inheritdoc />
-    public async Task<bool> HandleAsync(SetStartupEnabledCommand command, CancellationToken cancellationToken)
-    {
-        var originalSettings = await settingsStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-        var originalRegistration = startupRegistration.IsEnabled;
-        try
-        {
-            await settingsStore.SaveAsync(
-                originalSettings with { StartupEnabled = command.IsEnabled }, cancellationToken).ConfigureAwait(false);
-            SetRegistration(command.IsEnabled);
-            return startupRegistration.IsEnabled;
-        }
-        catch
-        {
-            await settingsStore.SaveAsync(originalSettings, CancellationToken.None).ConfigureAwait(false);
-            SetRegistration(originalRegistration);
-            throw;
-        }
-    }
-
-    /// <summary>只调用 DeskButler 启动注册边界，不接触其他 Run 值。</summary>
-    private void SetRegistration(bool enabled)
-    {
-        if (enabled)
-        {
-            startupRegistration.Enable();
-        }
-        else
-        {
-            startupRegistration.Disable();
-        }
-    }
+    public Task<bool> HandleAsync(SetStartupEnabledCommand command, CancellationToken cancellationToken) =>
+        settings.SetStartupEnabledAsync(startupRegistration, command.IsEnabled, cancellationToken);
 }
 
 /// <summary>把用户选择的可执行路径并入永久排除集合。</summary>

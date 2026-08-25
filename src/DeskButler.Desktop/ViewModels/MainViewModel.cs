@@ -43,6 +43,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string healthStatusText;
     private string diagnosticPreviewText = "点击“预览诊断内容”查看即将导出的脱敏类别。";
     private bool isStartupEnabled;
+    private bool isStartupToggleEnabled = true;
     private string? startupErrorMessage;
     private string moduleStatusText = "模块状态正在初始化";
 
@@ -92,7 +93,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 : Task.CompletedTask);
         RefreshCommand = new AsyncCommand(LoadAsync);
         LoadDiagnosticsCommand = new AsyncCommand(LoadDiagnosticsAsync);
-        ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync);
+        ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync, () => IsStartupToggleEnabled);
     }
 
     /// <summary>获取最新优先且最多三份的现场历史。</summary>
@@ -143,6 +144,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         get => isStartupEnabled;
         private set => SetProperty(ref isStartupEnabled, value);
+    }
+
+    /// <summary>获取登录启动开关的实际状态是否仍可核实并允许再次操作。</summary>
+    public bool IsStartupToggleEnabled
+    {
+        get => isStartupToggleEnabled;
+        private set
+        {
+            if (SetProperty(ref isStartupToggleEnabled, value))
+            {
+                ToggleStartupCommand.RaiseCanExecuteChanged();
+            }
+        }
     }
 
     /// <summary>获取最近一次登录启动切换错误。</summary>
@@ -235,14 +249,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             IsStartupEnabled = await commands.SendAsync(
                 new SetStartupEnabledCommand(!IsStartupEnabled), CancellationToken.None);
+            IsStartupToggleEnabled = true;
             StartupErrorMessage = null;
             StatusText = IsStartupEnabled ? "已启用登录启动" : "已禁用登录启动";
         }
         catch (Exception exception)
         {
-            var settings = await settingsStore.LoadAsync(CancellationToken.None);
-            IsStartupEnabled = startupRegistration?.IsEnabled ?? settings.StartupEnabled;
-            StartupErrorMessage = $"登录启动设置失败：{exception.Message}";
+            try
+            {
+                var settings = await settingsStore.LoadAsync(CancellationToken.None);
+                var actualRegistration = startupRegistration?.IsEnabled;
+                IsStartupEnabled = actualRegistration ?? settings.StartupEnabled;
+                IsStartupToggleEnabled = actualRegistration is not null && actualRegistration == settings.StartupEnabled;
+                StartupErrorMessage = IsStartupToggleEnabled
+                    ? $"登录启动设置失败：{exception.Message}"
+                    : $"登录启动设置失败且无法核实实际状态：{exception.Message}";
+            }
+            catch (Exception)
+            {
+                IsStartupToggleEnabled = false;
+                StartupErrorMessage = $"登录启动设置失败且无法核实实际状态：{exception.Message}";
+            }
+
             StatusText = StartupErrorMessage;
         }
     }

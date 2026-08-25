@@ -303,7 +303,7 @@ public sealed class CompositionRoot : IAsyncDisposable
             commandBus.Register(new SetCaptureEnabledCommandHandler(settingsCoordinator, automaticCaptureGate));
             if (startupRegistration is not null)
             {
-                commandBus.Register(new SetStartupEnabledCommandHandler(settingsStore, startupRegistration));
+                commandBus.Register(new SetStartupEnabledCommandHandler(settingsCoordinator, startupRegistration));
             }
             commandBus.Register(new PersistExclusionCommandHandler(settingsCoordinator));
 
