@@ -1,22 +1,63 @@
 # DeskButler
 
-DeskButler 是一个面向 Windows 的本地桌面工作空间助手。
+DeskButler 是一个完全在本机运行的 Windows 工作现场管家。当前首个模块会保存普通可见窗口、资源管理器目录和窗口布局，并让你在重启或重新登录后手动恢复；它不会自动恢复，也不会关闭现有程序。
 
-## 解决方案结构
+## 当前状态
 
-- `src/`：应用程序与各层实现。
-- `tests/`：与源项目对应的自动化测试。
-- `docs/`：已批准的设计与实施计划副本。
+这是 **0.1.0 本地 release candidate（自动化候选）**，尚未正式发布，也没有配置远程 Git。当前 Release 自动套件为 360 项：357 通过、3 项按显式交互/长时门禁跳过、0 失败；Windows 10 19045 的受控短交互测试和 30 分钟资源测试也已有通过证据。Windows 11、干净测试账户的完整安装/删除链、真实重启和诊断 ZIP 的用户界面导出仍未过门禁。不要把当前状态理解为“全面兼容”或“已正式发布”。
 
-## 先决条件
+详细状态见 [兼容性与发布门槛](docs/compatibility.md)。
 
-- .NET SDK 10.0.400 或更高版本
-- Windows x64
+## 安装与启动
 
-## 本地验证
+1. 先运行 `scripts\verify-release.cmd` 生成并验证安装器。
+2. 双击 `artifacts\installer\DeskButler-Setup-0.1.0.exe`。
+3. 安装器按当前用户安装到 `%LOCALAPPDATA%\Programs\DeskButler`，不要求管理员权限。
+4. 从开始菜单打开“DeskButler”。应用通常只显示在任务栏通知区域；双击托盘图标可打开主窗口。
+
+当前安装器未做产品代码签名。若 Windows 显示来源提示，请先核对本次验证脚本输出的 SHA-256，不要从未知来源获取安装包。
+
+## 第一次使用：文字截图流程
 
 ```text
-dotnet restore DeskButler.slnx
-dotnet build DeskButler.slnx -c Debug --no-restore
-dotnet test DeskButler.slnx -c Debug --no-build
+[任务栏右下角 DeskButler 图标]
+  ├─ 保存当前现场
+  ├─ 最近现场 > 2026-08-25 09:30:00 · 3 个窗口
+  ├─ 暂停捕获 / 继续捕获
+  ├─ 聚焦恢复卡
+  ├─ 打开管家
+  └─ 退出
 ```
+
+```text
+[主窗口] 首页 | 现场 | 模块 | 设置 | 诊断
+  首页：立即保存现场、暂停/继续捕获
+  现场：最近 3 次现场、刷新、恢复
+  设置：查看永久排除路径
+  诊断：查看健康状态、预览脱敏日志
+```
+
+```text
+[恢复卡]
+  ☑ 窗口 A        [永久排除]
+  ☑ 窗口 B        [永久排除]
+  [立即恢复] [安全恢复] [跳过]
+```
+
+恢复卡等待 15 秒只会隐藏，绝不会自行恢复。错过后可从托盘“最近现场”或主窗口“现场”页手动恢复。
+
+完整操作与限制见 [用户指南](docs/user-guide.md)，本地数据说明见 [隐私说明](docs/privacy.md)，问题处理见 [故障排除](docs/troubleshooting.md)。
+
+## 开发与发布验证
+
+先决条件：Windows x64、.NET SDK 10.0.400 或更高版本、官方 Inno Setup 7.1.0。
+
+```bat
+scripts\verify-release.cmd
+```
+
+脚本依次 restore、Release build、Release test、自包含 win-x64 publish、编译安装器并输出安装器 SHA-256，任一步失败都会立即退出。`artifacts\` 是本机生成目录，不进入 Git。
+
+## 首版明确不做
+
+不恢复未保存内容，不保证浏览器标签页、IDE 项目或终端会话，不记录完整命令行、屏幕、键盘、鼠标轨迹、剪贴板或文档内容；也不提供远程控制、云同步、AI、语音、动画角色、服务、驱动或 ARM64 支持。

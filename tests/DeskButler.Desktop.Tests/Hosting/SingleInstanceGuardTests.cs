@@ -38,38 +38,69 @@ public sealed class SingleInstanceGuardTests
         second!.Dispose();
     }
 
-    /// <summary>前一线程异常结束遗留的 abandoned mutex 必须被安全接管。</summary>
+    /// <summary>owner 线程明确终止后，仍存活 helper 中的 abandoned mutex 必须在压力循环中立即接管。</summary>
     [Fact]
-    public async Task AbandonedMutexIsAcquiredSafely()
+    public async Task SynchronizedOwnerThreadExitIsAcquiredSafelyUnderStress()
     {
-        var mutexName = UniqueMutexName();
-        using var observerHandle = new Mutex(initiallyOwned: false, mutexName);
-        var startInfo = new ProcessStartInfo(FindMutexOwnerExecutable())
+        for (var iteration = 0; iteration < 20; iteration++)
         {
-            UseShellExecute = false,
-            RedirectStandardOutput = true
-        };
-        startInfo.ArgumentList.Add(mutexName);
-        using var ownerProcess = Process.Start(startInfo)
-            ?? throw new InvalidOperationException("无法启动 abandoned mutex 测试进程。");
+            await VerifySynchronizedAbandonAsync(iteration, TestContext.Current.CancellationToken);
+        }
+    }
+
+    /// <summary>执行一轮父子握手，分别证明 owner 存活和 owner 已终止两个互斥量状态。</summary>
+    private static async Task VerifySynchronizedAbandonAsync(int iteration, CancellationToken cancellationToken)
+    {
+        var mutexName = $@"Local\DeskButler.Tests.Abandon.{iteration}.{Guid.NewGuid():N}";
+        using var observerHandle = new Mutex(initiallyOwned: false, mutexName);
+        using var ownerProcess = StartSynchronizedMutexOwner(mutexName);
 
         try
         {
-            Assert.Equal("acquired", await ownerProcess.StandardOutput.ReadLineAsync(TestContext.Current.CancellationToken));
-            await ownerProcess.WaitForExitAsync(TestContext.Current.CancellationToken);
-            Assert.Equal(0, ownerProcess.ExitCode);
+            Assert.Equal("acquired", await ownerProcess.StandardOutput.ReadLineAsync(cancellationToken));
+            Assert.False(ownerProcess.HasExited);
+            Assert.False(SingleInstanceGuard.TryAcquire(mutexName, out var prematureGuard));
+            Assert.Null(prematureGuard);
+
+            await ownerProcess.StandardInput.WriteLineAsync("abandon");
+            Assert.Equal("owner-exited", await ownerProcess.StandardOutput.ReadLineAsync(cancellationToken));
+            Assert.False(ownerProcess.HasExited);
 
             Assert.True(SingleInstanceGuard.TryAcquire(mutexName, out var guard));
             guard!.Dispose();
+
+            await ownerProcess.StandardInput.WriteLineAsync("exit");
+            await ownerProcess.WaitForExitAsync(cancellationToken);
+            Assert.Equal(0, ownerProcess.ExitCode);
         }
         finally
         {
             if (!ownerProcess.HasExited)
             {
-                ownerProcess.Kill(entireProcessTree: true);
-                await ownerProcess.WaitForExitAsync(CancellationToken.None);
+                await ownerProcess.StandardInput.WriteLineAsync("abandon");
+                await ownerProcess.StandardInput.WriteLineAsync("exit");
+                if (!ownerProcess.WaitForExit(1000))
+                {
+                    ownerProcess.Kill(entireProcessTree: true);
+                    await ownerProcess.WaitForExitAsync(CancellationToken.None);
+                }
             }
         }
+    }
+
+    /// <summary>启动支持 owner 线程终止握手的真实 MutexOwner helper。</summary>
+    private static Process StartSynchronizedMutexOwner(string mutexName)
+    {
+        var startInfo = new ProcessStartInfo(FindMutexOwnerExecutable())
+        {
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true
+        };
+        startInfo.ArgumentList.Add("--synchronized-abandon");
+        startInfo.ArgumentList.Add(mutexName);
+        return Process.Start(startInfo)
+            ?? throw new InvalidOperationException("无法启动 synchronized abandoned mutex 测试进程。");
     }
 
     /// <summary>跨线程 Dispose 必须明确失败，且不破坏拥有者随后正确释放。</summary>
@@ -116,7 +147,7 @@ public sealed class SingleInstanceGuardTests
     private static string FindMutexOwnerExecutable()
     {
         var output = new DirectoryInfo(AppContext.BaseDirectory);
-        var configuration = output.Parent?.Name ?? "Debug";
+        var configuration = FindTestConfiguration(output);
         var repository = output;
         while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "DeskButler.slnx")))
         {
@@ -138,5 +169,20 @@ public sealed class SingleInstanceGuardTests
             configuration,
             "net10.0-windows10.0.17763.0",
             "DeskButler.MutexOwner.exe");
+    }
+
+    /// <summary>从 bin 下的首级目录读取当前测试配置，兼容其后的 TFM 与 RID 层级。</summary>
+    private static string FindTestConfiguration(DirectoryInfo output)
+    {
+        var current = output;
+        while (current.Parent is not null &&
+               !StringComparer.OrdinalIgnoreCase.Equals(current.Parent.Name, "bin"))
+        {
+            current = current.Parent;
+        }
+
+        return current.Parent is not null
+            ? current.Name
+            : throw new DirectoryNotFoundException("无法从测试输出目录定位构建配置。");
     }
 }

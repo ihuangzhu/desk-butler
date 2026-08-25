@@ -17,6 +17,9 @@
     <Project Path="tests/DeskButler.Persistence.Tests/DeskButler.Persistence.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/DeskButler.EndToEnd/" />
+  <Folder Name="/tests/DeskButler.Desktop.Tests/TestApps/">
+    <Project Path="tests/DeskButler.Desktop.Tests/TestApps/DeskButler.MutexOwner/DeskButler.MutexOwner.csproj" />
+  </Folder>
   <Folder Name="/tests/DeskButler.EndToEnd/TestApps/">
     <Project Path="tests/DeskButler.EndToEnd/TestApps/DeskButler.ResourceHarness/DeskButler.ResourceHarness.csproj" />
   </Folder>
