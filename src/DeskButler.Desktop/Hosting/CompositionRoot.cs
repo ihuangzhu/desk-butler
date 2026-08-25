@@ -367,19 +367,15 @@ public sealed class CompositionRoot : IAsyncDisposable
             var mainWindow = ownership.Own(
                 "main window",
                 new MainWindow(mainViewModel),
-                static window =>
-                {
-                    window.CloseForExit();
-                    return ValueTask.CompletedTask;
-                });
+                static window => DispatcherCleanup.RunAsync(
+                    window.Dispatcher,
+                    window.CloseForExit));
             var recoveryCardWindow = ownership.Own(
                 "recovery window",
                 new RecoveryCardWindow(recoveryCardViewModel),
-                static window =>
-                {
-                    window.CloseForExit();
-                    return ValueTask.CompletedTask;
-                });
+                static window => DispatcherCleanup.RunAsync(
+                    window.Dispatcher,
+                    window.CloseForExit));
             CompositionRoot? root = null;
             var recoveryCardFocus = new RecoveryCardFocusCoordinator(
                 () => root?.ShowRecoveryCardForLatestSceneAsync() ?? Task.FromResult(false),

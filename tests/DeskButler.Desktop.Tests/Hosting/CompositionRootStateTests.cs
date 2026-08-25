@@ -8,6 +8,8 @@ using DeskButler.Desktop.ViewModels;
 using DeskButler.Desktop.Tests.ViewModels;
 using DeskButler.Infrastructure.Windows.Startup;
 using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Threading;
 
 namespace DeskButler.Desktop.Tests.Hosting;
 
@@ -31,6 +33,125 @@ public sealed class CompositionRootStateTests
 
         Assert.Same(constructionFailure, thrown);
         Assert.Equal(["view-model", "repository", "diagnostic"], calls);
+    }
+
+    /// <summary>异步构造失败的回滚必须回到发起构造的 WPF Dispatcher，并且仅清理一次。</summary>
+    [Fact]
+    public Task ConstructionFailureAfterAsyncBoundaryRollsBackOnOriginatingDispatcherOnce() =>
+        RunOnStaDispatcherAsync(async dispatcher =>
+        {
+            var constructionFailure = new InvalidOperationException("window construction failed");
+            var boundary = new TaskCompletionSource<object>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var cleanupCount = 0;
+            var cleanupThreadId = 0;
+            var originatingThreadId = Environment.CurrentManagedThreadId;
+
+            var build = CompositionResourceOwner.BuildAsync<object>(owner =>
+            {
+                owner.Own(
+                    "dispatcher resource",
+                    new object(),
+                    _ =>
+                    {
+                        Interlocked.Increment(ref cleanupCount);
+                        cleanupThreadId = Environment.CurrentManagedThreadId;
+                        dispatcher.VerifyAccess();
+                        return ValueTask.CompletedTask;
+                    });
+                return boundary.Task;
+            });
+            Assert.False(build.IsCompleted);
+
+            ThreadPool.QueueUserWorkItem(_ => boundary.TrySetException(constructionFailure));
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => build);
+
+            Assert.Same(constructionFailure, thrown);
+            Assert.Equal(1, Volatile.Read(ref cleanupCount));
+            Assert.Equal(originatingThreadId, cleanupThreadId);
+        });
+
+    /// <summary>异步启动阶段失败的回滚必须回到发起启动的 WPF Dispatcher，并且仅清理一次。</summary>
+    [Fact]
+    public Task StartupFailureAfterAsyncBoundaryRollsBackOnOriginatingDispatcherOnce() =>
+        RunOnStaDispatcherAsync(async dispatcher =>
+        {
+            var startupFailure = new IOException("desktop start failed");
+            var moduleBoundary = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var cleanupCount = 0;
+            var cleanupThreadId = 0;
+            var originatingThreadId = Environment.CurrentManagedThreadId;
+            var cleanup = new BestEffortAsyncCleanup(
+            [
+                new CleanupStep(
+                    "dispatcher resource",
+                    () =>
+                    {
+                        Interlocked.Increment(ref cleanupCount);
+                        cleanupThreadId = Environment.CurrentManagedThreadId;
+                        dispatcher.VerifyAccess();
+                        return ValueTask.CompletedTask;
+                    })
+            ]);
+            var startup = new CompositionStartupCoordinator(
+                _ => moduleBoundary.Task,
+                _ => Task.CompletedTask,
+                () => { },
+                () => { },
+                _ => Task.FromException(startupFailure),
+                () => ValueTask.CompletedTask);
+
+            var start = startup.StartAsync(cleanup, CancellationToken.None);
+            Assert.False(start.IsCompleted);
+
+            ThreadPool.QueueUserWorkItem(_ => moduleBoundary.TrySetResult());
+            var thrown = await Assert.ThrowsAsync<IOException>(() => start);
+            await cleanup.RunAsync();
+
+            Assert.Same(startupFailure, thrown);
+            Assert.Equal(1, Volatile.Read(ref cleanupCount));
+            Assert.Equal(originatingThreadId, cleanupThreadId);
+        });
+
+    /// <summary>窗口清理从后台线程发起时必须异步投递到所属 Dispatcher 并真实关闭一次。</summary>
+    [Fact]
+    public Task WindowCleanupFromWorkerMarshalsCloseToOwningDispatcherOnce() =>
+        RunOnStaDispatcherAsync(async dispatcher =>
+        {
+            var window = new Window();
+            var closeCount = 0;
+            var closeThreadId = 0;
+            var originatingThreadId = Environment.CurrentManagedThreadId;
+
+            await Task.Run(async () =>
+                await DispatcherCleanup.RunAsync(
+                    window.Dispatcher,
+                    () =>
+                    {
+                        Interlocked.Increment(ref closeCount);
+                        closeThreadId = Environment.CurrentManagedThreadId;
+                        window.Close();
+                    }));
+
+            Assert.Same(dispatcher, window.Dispatcher);
+            Assert.Equal(1, Volatile.Read(ref closeCount));
+            Assert.Equal(originatingThreadId, closeThreadId);
+        });
+
+    /// <summary>所属 Dispatcher 已停止时窗口清理必须作为 best-effort 跳过且不执行委托。</summary>
+    [Fact]
+    public async Task WindowCleanupAfterDispatcherShutdownDoesNotMaskFailure()
+    {
+        var dispatcher = CreateShutdownDispatcher();
+        var closeCount = 0;
+
+        await DispatcherCleanup.RunAsync(
+            dispatcher,
+            () => Interlocked.Increment(ref closeCount));
+
+        Assert.True(dispatcher.HasShutdownFinished);
+        Assert.Equal(0, Volatile.Read(ref closeCount));
     }
 
     /// <summary>成功构造只转移一次所有权，原 owner 与重复根清理都不得重复释放。</summary>
@@ -748,6 +869,63 @@ public sealed class CompositionRootStateTests
     {
         calls.Add(resource);
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>在专用 STA 线程上运行真实 WPF Dispatcher，完成后确定性停止消息循环。</summary>
+    private static async Task RunOnStaDispatcherAsync(Func<Dispatcher, Task> test)
+    {
+        var completion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            var dispatcher = Dispatcher.CurrentDispatcher;
+            SynchronizationContext.SetSynchronizationContext(
+                new DispatcherSynchronizationContext(dispatcher));
+            dispatcher.BeginInvoke(async () =>
+            {
+                try
+                {
+                    await test(dispatcher);
+                    completion.TrySetResult();
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
+                finally
+                {
+                    dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
+                }
+            });
+            Dispatcher.Run();
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        try
+        {
+            await completion.Task;
+        }
+        finally
+        {
+            thread.Join();
+        }
+    }
+
+    /// <summary>创建并确定性停止一个专用 STA Dispatcher，供关闭竞态测试使用。</summary>
+    private static Dispatcher CreateShutdownDispatcher()
+    {
+        Dispatcher? dispatcher = null;
+        var thread = new Thread(() =>
+        {
+            dispatcher = Dispatcher.CurrentDispatcher;
+            dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
+            Dispatcher.Run();
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+        return dispatcher ?? throw new InvalidOperationException("未能创建测试 Dispatcher。");
     }
 
     private sealed class BlockingDiagnosticLog : IDiagnosticLog

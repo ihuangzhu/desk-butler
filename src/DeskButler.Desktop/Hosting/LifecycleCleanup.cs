@@ -1,4 +1,5 @@
 using System.Runtime.ExceptionServices;
+using System.Windows.Threading;
 
 namespace DeskButler.Desktop.Hosting;
 
@@ -44,6 +45,42 @@ internal sealed class BestEffortAsyncCleanup(IEnumerable<CleanupStep> steps)
     }
 }
 
+/// <summary>在所属 WPF Dispatcher 上异步执行清理，并把关闭中的 Dispatcher 视为 best-effort 完成。</summary>
+internal static class DispatcherCleanup
+{
+    /// <summary>同线程直接清理；跨线程异步投递，避免同步 Invoke 与退出路径相互等待。</summary>
+    internal static ValueTask RunAsync(Dispatcher dispatcher, Action cleanup)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        ArgumentNullException.ThrowIfNull(cleanup);
+        if (dispatcher.CheckAccess())
+        {
+            cleanup();
+            return ValueTask.CompletedTask;
+        }
+
+        if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        return MarshalAsync(dispatcher, cleanup);
+    }
+
+    /// <summary>等待异步 Dispatcher 操作；关闭竞态只终止本次 best-effort 清理。</summary>
+    private static async ValueTask MarshalAsync(Dispatcher dispatcher, Action cleanup)
+    {
+        try
+        {
+            await dispatcher.InvokeAsync(cleanup, DispatcherPriority.Send).Task.ConfigureAwait(false);
+        }
+        catch (Exception) when (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+        {
+            // Dispatcher 关闭会取消或拒绝排队操作；不得用该竞态遮蔽原始生命周期失败。
+        }
+    }
+}
+
 /// <summary>在组合根返回前即时接管资源，并把逆构造清理所有权一次性交给成品。</summary>
 internal sealed class CompositionResourceOwner
 {
@@ -58,7 +95,7 @@ internal sealed class CompositionResourceOwner
         var owner = new CompositionResourceOwner();
         try
         {
-            var result = await build(owner).ConfigureAwait(false);
+            var result = await build(owner);
             owner.Transfer();
             return result;
         }
@@ -66,7 +103,7 @@ internal sealed class CompositionResourceOwner
         {
             try
             {
-                await owner.DisposeAsync().ConfigureAwait(false);
+                await owner.DisposeAsync();
             }
             catch (Exception cleanupFailure)
             {
@@ -104,7 +141,7 @@ internal sealed class CompositionResourceOwner
     {
         if (!transferred)
         {
-            await PrepareCleanup().RunAsync().ConfigureAwait(false);
+            await PrepareCleanup().RunAsync();
         }
     }
 
@@ -180,11 +217,11 @@ internal sealed class CompositionStartupCoordinator
 
         try
         {
-            await startModuleAsync(cancellationToken).ConfigureAwait(false);
+            await startModuleAsync(cancellationToken);
             moduleStarted = true;
             startSession();
             sessionStarted = true;
-            await startDesktopAsync(cancellationToken).ConfigureAwait(false);
+            await startDesktopAsync(cancellationToken);
             desktopStarted = true;
         }
         catch (Exception startFailure)
@@ -192,7 +229,7 @@ internal sealed class CompositionStartupCoordinator
             startupFailed = true;
             try
             {
-                await cleanup.RunAsync().ConfigureAwait(false);
+                await cleanup.RunAsync();
             }
             catch (Exception cleanupFailure)
             {
