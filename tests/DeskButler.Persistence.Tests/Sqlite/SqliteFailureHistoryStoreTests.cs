@@ -44,10 +44,9 @@ public sealed class SqliteFailureHistoryStoreTests
 
         internal string Path { get; }
 
-        /// <summary>清空连接池后删除隔离数据库目录。</summary>
+        /// <summary>删除使用 Pooling=False 的隔离数据库目录。</summary>
         public void Dispose()
         {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             Directory.Delete(Path, true);
         }
     }

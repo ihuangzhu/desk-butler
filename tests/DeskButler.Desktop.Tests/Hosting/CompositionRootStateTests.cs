@@ -13,6 +13,112 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class CompositionRootStateTests
 {
+    /// <summary>构造中途失败时必须把已取得的资源按逆构造顺序各释放一次。</summary>
+    [Fact]
+    public async Task ConstructionFailureDisposesOwnedResourcesOnceInReverseOrder()
+    {
+        var calls = new List<string>();
+        var constructionFailure = new InvalidOperationException("window construction failed");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            CompositionResourceOwner.BuildAsync<object>(owner =>
+            {
+                owner.Own("diagnostic", "diagnostic", resource => RecordCleanupAsync(calls, resource));
+                owner.Own("repository", "repository", resource => RecordCleanupAsync(calls, resource));
+                owner.Own("view model", "view-model", resource => RecordCleanupAsync(calls, resource));
+                return Task.FromException<object>(constructionFailure);
+            }));
+
+        Assert.Same(constructionFailure, thrown);
+        Assert.Equal(["view-model", "repository", "diagnostic"], calls);
+    }
+
+    /// <summary>成功构造只转移一次所有权，原 owner 与重复根清理都不得重复释放。</summary>
+    [Fact]
+    public async Task SuccessfulConstructionTransfersCleanupWithoutDoubleDispose()
+    {
+        var calls = new List<string>();
+        var cleanup = await CompositionResourceOwner.BuildAsync(owner =>
+        {
+            owner.Own("resource", "resource", resource => RecordCleanupAsync(calls, resource));
+            return Task.FromResult(owner.PrepareCleanup());
+        });
+
+        await cleanup.RunAsync();
+        await cleanup.RunAsync();
+
+        Assert.Equal(["resource"], calls);
+    }
+
+    /// <summary>模块已启动而会话订阅失败时必须停止模块，后续 Dispose 不得重复清理。</summary>
+    [Fact]
+    public async Task ModuleStartThenSessionFailureStopsModuleAndDisposeIsIdempotent()
+    {
+        var calls = new List<string>();
+        var sessionFailure = new InvalidOperationException("session start failed");
+        var runtime = await CreateStartupRuntimeAsync(calls, sessionFailure, null);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runtime.Startup.StartAsync(runtime.Cleanup, CancellationToken.None));
+        await runtime.Cleanup.RunAsync();
+
+        Assert.Same(sessionFailure, thrown);
+        Assert.Equal(1, calls.Count(call => call == "module:stop"));
+        Assert.Equal(1, calls.Count(call => call == "session:stop"));
+    }
+
+    /// <summary>会话已启动而桌面变化源失败时，清理必须先停止会话再停止模块。</summary>
+    [Fact]
+    public async Task SessionStartThenDesktopFailureStopsSessionBeforeModule()
+    {
+        var calls = new List<string>();
+        var desktopFailure = new IOException("desktop start failed");
+        var runtime = await CreateStartupRuntimeAsync(calls, null, desktopFailure);
+
+        var thrown = await Assert.ThrowsAsync<IOException>(() =>
+            runtime.Startup.StartAsync(runtime.Cleanup, CancellationToken.None));
+
+        Assert.Same(desktopFailure, thrown);
+        Assert.True(calls.IndexOf("session:stop") < calls.IndexOf("module:stop"));
+        Assert.Equal(1, calls.Count(call => call == "module:stop"));
+    }
+
+    /// <summary>部分启动失败必须在释放诊断日志前封存并排空模块诊断 tracker。</summary>
+    [Fact]
+    public async Task PartialStartDrainsModuleDiagnosticsBeforeDiagnosticLogDispose()
+    {
+        var calls = new List<string>();
+        var runtime = await CreateStartupRuntimeAsync(
+            calls, new InvalidOperationException("session start failed"), null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            runtime.Startup.StartAsync(runtime.Cleanup, CancellationToken.None));
+
+        Assert.True(calls.IndexOf("diagnostics:drain") < calls.IndexOf("diagnostic-log:dispose"));
+        Assert.True(calls.IndexOf("module:stop") < calls.IndexOf("diagnostics:drain"));
+    }
+
+    /// <summary>成功启动后多次 Dispose 必须让三个停止阶段和所有资源清理各执行一次。</summary>
+    [Fact]
+    public async Task SuccessfulStartAndRepeatedDisposeDoNotDoubleStopOrDispose()
+    {
+        var calls = new List<string>();
+        var runtime = await CreateStartupRuntimeAsync(calls, null, null);
+
+        await runtime.Startup.StartAsync(runtime.Cleanup, CancellationToken.None);
+        await runtime.Cleanup.RunAsync();
+        await runtime.Cleanup.RunAsync();
+
+        Assert.Equal(1, calls.Count(call => call == "module:start"));
+        Assert.Equal(1, calls.Count(call => call == "session:start"));
+        Assert.Equal(1, calls.Count(call => call == "desktop:start"));
+        Assert.Equal(1, calls.Count(call => call == "session:stop"));
+        Assert.Equal(1, calls.Count(call => call == "module:stop"));
+        Assert.Equal(1, calls.Count(call => call == "desktop:stop"));
+        Assert.Equal(1, calls.Count(call => call == "diagnostics:drain"));
+        Assert.Equal(1, calls.Count(call => call == "diagnostic-log:dispose"));
+    }
+
     /// <summary>Report 正在创建任务时 Drain 必须等待登记完成且不得遗漏该任务。</summary>
     [Fact]
     public async Task ModuleDiagnosticDrainWaitsForTaskCreationAndRegistration()
@@ -90,16 +196,17 @@ public sealed class CompositionRootStateTests
         TaskScheduler.UnobservedTaskException += HandleUnobserved;
         try
         {
-            var lateTask = await RunTimedOutDiagnosticAndFailLateAsync(lateFailure);
-            for (var attempt = 0; attempt < 10 && lateTask.IsAlive; attempt++)
+            var probe = await RunTimedOutDiagnosticAndFailLateAsync(lateFailure);
+            for (var attempt = 0; attempt < 10 && probe.LateTask.IsAlive; attempt++)
             {
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
                 GC.Collect();
             }
 
-            Assert.False(lateTask.IsAlive);
+            Assert.False(probe.LateTask.IsAlive);
             Assert.Equal(0, Volatile.Read(ref unobserved));
+            GC.KeepAlive(probe.Runtime);
         }
         finally
         {
@@ -281,6 +388,88 @@ public sealed class CompositionRootStateTests
         Assert.False(updated.CaptureEnabled);
     }
 
+    /// <summary>注册调用静默无效时必须在保存目标 JSON 前失败，独立补偿并释放设置门。</summary>
+    [Fact]
+    public async Task StartupNoOpRegistrationMismatchCompensatesAndReleasesGate()
+    {
+        var calls = new List<string>();
+        var registrationRollbackFailure = new InvalidOperationException("注册补偿失败");
+        var settingsRollbackFailure = new IOException("设置补偿失败");
+        var initial = ButlerSettings.Default with { StartupEnabled = false };
+        var store = new RegistrationFailureSettingsStore(initial, calls, settingsRollbackFailure);
+        var registration = new NoOpTargetStartupRegistration(calls, registrationRollbackFailure);
+        using var settings = new SettingsCoordinator(store);
+        var handler = new SetStartupEnabledCommandHandler(settings, registration);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(
+            () => handler.HandleAsync(new SetStartupEnabledCommand(true), CancellationToken.None));
+        var mismatch = Assert.IsType<InvalidOperationException>(error.InnerExceptions[0]);
+        var updated = await settings.UpdateAsync(
+            current => current with { CaptureEnabled = false }, CancellationToken.None);
+
+        Assert.Contains("请求状态", mismatch.Message, StringComparison.Ordinal);
+        Assert.Same(registrationRollbackFailure, error.InnerExceptions[1]);
+        Assert.Same(settingsRollbackFailure, error.InnerExceptions[2]);
+        Assert.Equal(["registration:target", "registration:rollback", "settings:rollback"], calls[..3]);
+        Assert.False(store.TargetSaveAttempted);
+        Assert.True(store.RollbackAttempted);
+        Assert.True(registration.RollbackAttempted);
+        Assert.False(updated.CaptureEnabled);
+    }
+
+    /// <summary>注册在目标 JSON 保存期间翻转时必须把后置条件失败作为根因并尝试全部补偿。</summary>
+    [Fact]
+    public async Task StartupRegistrationFlipDuringTargetSaveCompensatesAndReleasesGate()
+    {
+        var calls = new List<string>();
+        var registrationRollbackFailure = new InvalidOperationException("注册补偿失败");
+        var settingsRollbackFailure = new IOException("设置补偿失败");
+        var registration = new FlippableStartupRegistration(calls, registrationRollbackFailure);
+        var store = new FlipAfterTargetSaveSettingsStore(
+            ButlerSettings.Default with { StartupEnabled = false },
+            registration,
+            calls,
+            settingsRollbackFailure);
+        using var settings = new SettingsCoordinator(store);
+        var handler = new SetStartupEnabledCommandHandler(settings, registration);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(
+            () => handler.HandleAsync(new SetStartupEnabledCommand(true), CancellationToken.None));
+        var mismatch = Assert.IsType<InvalidOperationException>(error.InnerExceptions[0]);
+        var updated = await settings.UpdateAsync(
+            current => current with { CaptureEnabled = false }, CancellationToken.None);
+
+        Assert.Contains("请求状态", mismatch.Message, StringComparison.Ordinal);
+        Assert.Same(registrationRollbackFailure, error.InnerExceptions[1]);
+        Assert.Same(settingsRollbackFailure, error.InnerExceptions[2]);
+        Assert.Equal(
+            ["registration:target", "settings:target", "registration:rollback", "settings:rollback"],
+            calls[..4]);
+        Assert.True(store.TargetSaveAttempted);
+        Assert.True(store.RollbackAttempted);
+        Assert.True(registration.RollbackAttempted);
+        Assert.False(updated.CaptureEnabled);
+    }
+
+    /// <summary>两个提交后置条件都成立时必须返回调用方请求的精确注册状态。</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartupSuccessReturnsRequestedRegistrationState(bool enabled)
+    {
+        var store = new InMemorySettingsStore(
+            ButlerSettings.Default with { StartupEnabled = !enabled });
+        var registration = new RecordingStartupRegistration(!enabled);
+        using var settings = new SettingsCoordinator(store);
+
+        var result = await settings.SetStartupEnabledAsync(
+            registration, enabled, CancellationToken.None);
+
+        Assert.Equal(enabled, result);
+        Assert.Equal(enabled, registration.IsEnabled);
+        Assert.Equal(enabled, store.Current.StartupEnabled);
+    }
+
     private sealed class SingleFailureSettingsStore(ButlerSettings initial, Exception failure) : ISettingsStore
     {
         private int saveCount;
@@ -317,6 +506,97 @@ public sealed class CompositionRootStateTests
 
         /// <inheritdoc />
         public void Disable() => IsEnabled = false;
+    }
+
+    private sealed class NoOpTargetStartupRegistration(
+        List<string> calls,
+        Exception rollbackFailure) : IStartupRegistration
+    {
+        /// <inheritdoc />
+        public bool IsEnabled => false;
+
+        internal bool RollbackAttempted { get; private set; }
+
+        /// <inheritdoc />
+        public void Enable() => calls.Add("registration:target");
+
+        /// <inheritdoc />
+        public void Disable()
+        {
+            calls.Add("registration:rollback");
+            RollbackAttempted = true;
+            throw rollbackFailure;
+        }
+    }
+
+    private sealed class FlippableStartupRegistration(
+        List<string> calls,
+        Exception rollbackFailure) : IStartupRegistration
+    {
+        /// <inheritdoc />
+        public bool IsEnabled { get; private set; }
+
+        internal bool RollbackAttempted { get; private set; }
+
+        /// <inheritdoc />
+        public void Enable()
+        {
+            calls.Add("registration:target");
+            IsEnabled = true;
+        }
+
+        /// <inheritdoc />
+        public void Disable()
+        {
+            calls.Add("registration:rollback");
+            RollbackAttempted = true;
+            IsEnabled = false;
+            throw rollbackFailure;
+        }
+
+        /// <summary>模拟外部注册状态在 JSON 保存期间被另一主体翻转。</summary>
+        internal void FlipOff() => IsEnabled = false;
+    }
+
+    private sealed class FlipAfterTargetSaveSettingsStore(
+        ButlerSettings initial,
+        FlippableStartupRegistration registration,
+        List<string> calls,
+        Exception rollbackFailure) : ISettingsStore
+    {
+        private int rollbackCount;
+
+        internal ButlerSettings Current { get; private set; } = initial;
+
+        internal bool TargetSaveAttempted { get; private set; }
+
+        internal bool RollbackAttempted { get; private set; }
+
+        /// <inheritdoc />
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken) => Task.FromResult(Current);
+
+        /// <inheritdoc />
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken)
+        {
+            if (settings.StartupEnabled)
+            {
+                TargetSaveAttempted = true;
+                calls.Add("settings:target");
+                Current = settings;
+                registration.FlipOff();
+                return Task.CompletedTask;
+            }
+
+            RollbackAttempted = true;
+            calls.Add("settings:rollback");
+            if (Interlocked.Increment(ref rollbackCount) == 1)
+            {
+                return Task.FromException(rollbackFailure);
+            }
+
+            Current = settings;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class RegistrationFailureSettingsStore(
@@ -413,6 +693,63 @@ public sealed class CompositionRootStateTests
         }
     }
 
+    /// <summary>创建与生产相同清理顺序的可控启动阶段对象图。</summary>
+    private static async Task<StartupTestRuntime> CreateStartupRuntimeAsync(
+        List<string> calls,
+        Exception? sessionFailure,
+        Exception? desktopFailure)
+    {
+        var startup = new CompositionStartupCoordinator(
+            _ =>
+            {
+                calls.Add("module:start");
+                return Task.CompletedTask;
+            },
+            _ =>
+            {
+                calls.Add("module:stop");
+                return Task.CompletedTask;
+            },
+            () =>
+            {
+                calls.Add("session:start");
+                if (sessionFailure is not null)
+                {
+                    throw sessionFailure;
+                }
+            },
+            () => calls.Add("session:stop"),
+            _ =>
+            {
+                calls.Add("desktop:start");
+                return desktopFailure is null
+                    ? Task.CompletedTask
+                    : Task.FromException(desktopFailure);
+            },
+            () => RecordCleanupAsync(calls, "desktop:stop"));
+        var cleanup = await CompositionResourceOwner.BuildAsync(owner =>
+        {
+            owner.Own("diagnostic log", "diagnostic-log:dispose", value => RecordCleanupAsync(calls, value));
+            owner.Own("desktop source", startup, coordinator => coordinator.DisposeDesktopAsync());
+            owner.Own("module diagnostics", "diagnostics:drain", value => RecordCleanupAsync(calls, value));
+            owner.Own("module host", startup, coordinator => coordinator.StopModuleIfStartedAsync());
+            owner.Own("session source", startup, coordinator => coordinator.DisposeSessionAsync());
+            return Task.FromResult(owner.PrepareCleanup());
+        });
+        return new StartupTestRuntime(startup, cleanup);
+    }
+
+    private sealed record StartupTestRuntime(
+        CompositionStartupCoordinator Startup,
+        BestEffortAsyncCleanup Cleanup);
+
+    /// <summary>记录一个可控资源清理动作。</summary>
+    private static ValueTask RecordCleanupAsync(List<string> calls, string resource)
+    {
+        calls.Add(resource);
+        return ValueTask.CompletedTask;
+    }
+
     private sealed class BlockingDiagnosticLog : IDiagnosticLog
     {
         internal List<DiagnosticEvent> Events { get; } = [];
@@ -439,8 +776,7 @@ public sealed class CompositionRootStateTests
 
     private sealed class LateFaultDiagnosticLog : IDiagnosticLog
     {
-        private TaskCompletionSource? completion =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource? completion = new();
         internal TaskCompletionSource CancellationObserved { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -475,7 +811,7 @@ public sealed class CompositionRootStateTests
 
     /// <summary>运行一次超时诊断并在 tracker 已完成后触发迟到 fault。</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static async Task<WeakReference> RunTimedOutDiagnosticAndFailLateAsync(Exception lateFailure)
+    private static async Task<DrainedDiagnosticProbe> RunTimedOutDiagnosticAndFailLateAsync(Exception lateFailure)
     {
         var calls = new List<string>();
         var log = new LateFaultDiagnosticLog();
@@ -489,6 +825,10 @@ public sealed class CompositionRootStateTests
         await log.CancellationObserved.Task.WaitAsync(TestContext.Current.CancellationToken);
         await runtime.DrainDiagnosticsAsync();
 
-        return log.FailLate(lateFailure);
+        return new DrainedDiagnosticProbe(runtime, log.FailLate(lateFailure));
     }
+
+    private sealed record DrainedDiagnosticProbe(
+        ModuleStateComposition Runtime,
+        WeakReference LateTask);
 }

@@ -83,9 +83,11 @@ public sealed class SettingsCoordinator : IDisposable
             try
             {
                 SetRegistration(registration, enabled);
+                EnsureRegistrationState(registration, enabled);
                 await store.SaveAsync(
                     originalSettings with { StartupEnabled = enabled }, cancellationToken).ConfigureAwait(false);
-                return registration.IsEnabled;
+                EnsureRegistrationState(registration, enabled);
+                return enabled;
             }
             catch (Exception originalFailure)
             {
@@ -133,6 +135,15 @@ public sealed class SettingsCoordinator : IDisposable
         else
         {
             registration.Disable();
+        }
+    }
+
+    /// <summary>核实外部登录启动注册已达到请求值，静默失败也必须进入事务补偿。</summary>
+    private static void EnsureRegistrationState(IStartupRegistration registration, bool enabled)
+    {
+        if (registration.IsEnabled != enabled)
+        {
+            throw new InvalidOperationException("登录启动注册未达到请求状态。");
         }
     }
 

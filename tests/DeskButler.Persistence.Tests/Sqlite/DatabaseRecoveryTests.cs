@@ -21,20 +21,20 @@ public sealed class DatabaseRecoveryTests
             command.CommandText = "CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(999);";
             await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
-        SqliteConnection.ClearAllPools();
+        ClearDatabasePool(paths.DatabasePath);
         var original = await File.ReadAllBytesAsync(paths.DatabasePath, TestContext.Current.CancellationToken);
         var lifecycle = new RecordingLifecycle();
         var recovery = new DatabaseRecovery(paths, lifecycle, new DatabaseMigrator(paths));
 
         await Assert.ThrowsAsync<FutureSchemaVersionException>(
             () => recovery.InitializeAsync(TestContext.Current.CancellationToken));
-        SqliteConnection.ClearAllPools();
+        ClearDatabasePool(paths.DatabasePath);
 
         Assert.Equal(0, lifecycle.CloseCalls);
         Assert.Equal(original, await File.ReadAllBytesAsync(paths.DatabasePath, TestContext.Current.CancellationToken));
         Assert.False(File.Exists(Path.Combine(paths.RootDirectory, "database-recovery.marker.json")));
         Assert.False(Directory.Exists(paths.DiagnosticsDirectory));
-        SqliteConnection.ClearAllPools();
+        ClearDatabasePool(paths.DatabasePath);
     }
 
     /// <summary>未来版本处于 WAL 时预检必须在副本完成，原 DB/WAL/SHM 字节均不得变化。</summary>
@@ -637,11 +637,18 @@ public sealed class DatabaseRecoveryTests
         /// <summary>删除本测试创建的隔离目录。</summary>
         public void Dispose()
         {
-            // Microsoft.Data.Sqlite 池可能跨测试保留目录句柄；断言结束后统一释放测试连接池。
-            SqliteConnection.ClearAllPools();
+            // 仅清理本隔离数据库的连接池，避免影响正在并行执行的其他夹具。
+            ClearDatabasePool(new AppDataPaths(Path).DatabasePath);
             GC.Collect();
             GC.WaitForPendingFinalizers();
             Directory.Delete(Path, true);
         }
+    }
+
+    /// <summary>只释放指定测试数据库 connection string 对应的 SQLite 池。</summary>
+    private static void ClearDatabasePool(string databasePath)
+    {
+        using var fixturePool = new SqliteConnection($"Data Source={databasePath}");
+        SqliteConnection.ClearPool(fixturePool);
     }
 }

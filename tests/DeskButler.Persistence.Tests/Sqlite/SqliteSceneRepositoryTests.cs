@@ -192,6 +192,54 @@ public sealed class SqliteSceneRepositoryTests
         }
     }
 
+    /// <summary>释放一个数据库夹具不得清除另一个并行测试的独立 SQLite 连接池。</summary>
+    [Fact]
+    public async Task FixtureCleanupLeavesUnrelatedSqlitePoolIntact()
+    {
+        var markerRoot = Path.Combine(
+            Path.GetTempPath(), $"DeskButler.Persistence.PoolMarker.{Guid.NewGuid():N}");
+        Directory.CreateDirectory(markerRoot);
+        var markerConnectionString = $"Data Source={Path.Combine(markerRoot, "marker.db")}";
+        try
+        {
+            await using (var marker = new SqliteConnection(markerConnectionString))
+            {
+                await marker.OpenAsync(TestContext.Current.CancellationToken);
+                await using var createMarker = marker.CreateCommand();
+                createMarker.CommandText = "CREATE TEMP TABLE fixture_pool_marker(value INTEGER);";
+                await createMarker.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+            }
+
+            Assert.Equal(1L, await CountTemporaryPoolMarkerAsync(markerConnectionString));
+            var unrelatedFixture = await RepositoryFixture.CreateAsync();
+            await unrelatedFixture.DisposeAsync();
+
+            Assert.Equal(1L, await CountTemporaryPoolMarkerAsync(markerConnectionString));
+        }
+        finally
+        {
+            using var markerPool = new SqliteConnection(markerConnectionString);
+            SqliteConnection.ClearPool(markerPool);
+            if (Directory.Exists(markerRoot))
+            {
+                Directory.Delete(markerRoot, recursive: true);
+            }
+        }
+    }
+
+    /// <summary>从指定测试连接池读取临时表标记，以观察该池是否被其他夹具失效。</summary>
+    private static async Task<long> CountTemporaryPoolMarkerAsync(string connectionString)
+    {
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT COUNT(*) FROM sqlite_temp_master WHERE type='table' AND name='fixture_pool_marker';";
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(TestContext.Current.CancellationToken),
+            System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     /// <summary>保存真实临时 SQLite 数据库的测试夹具，并在释放时删除测试根目录。</summary>
     private sealed class RepositoryFixture : IAsyncDisposable
     {
@@ -317,8 +365,12 @@ public sealed class SqliteSceneRepositoryTests
         public ValueTask DisposeAsync()
         {
             Repository.Dispose();
-            // SQLite 连接池会持有临时数据库句柄；清空池后才能在 Windows 上可靠删除测试目录。
-            SqliteConnection.ClearAllPools();
+            // 只释放本夹具连接串对应的池，不能失效并行测试持有的其他数据库池。
+            using (var fixturePool = new SqliteConnection($"Data Source={Paths.DatabasePath}"))
+            {
+                SqliteConnection.ClearPool(fixturePool);
+            }
+
             if (Directory.Exists(rootDirectory))
             {
                 Directory.Delete(rootDirectory, recursive: true);

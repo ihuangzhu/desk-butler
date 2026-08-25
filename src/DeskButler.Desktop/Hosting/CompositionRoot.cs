@@ -29,64 +29,31 @@ namespace DeskButler.Desktop.Hosting;
 /// <summary>手工组合 V1 的真实持久化、捕获、恢复与桌面界面服务。</summary>
 public sealed class CompositionRoot : IAsyncDisposable
 {
-    private readonly ModuleHost moduleHost;
-    private readonly SnapshotScheduler scheduler;
-    private readonly CaptureCoordinator captureCoordinator;
+    private readonly CompositionStartupCoordinator startup;
     private readonly SqliteSceneRepository repository;
-    private readonly SettingsCoordinator settingsCoordinator;
-    private readonly InventoryFingerprintChangeSource desktopChanges;
-    private readonly WindowsSessionEvents sessionEvents;
     private readonly RecoveryCardFocusCoordinator recoveryCardFocus;
     private readonly BestEffortAsyncCleanup cleanup;
-    private bool started;
 
     private CompositionRoot(
-        ModuleHost moduleHost,
-        SnapshotScheduler scheduler,
-        CaptureCoordinator captureCoordinator,
+        CompositionStartupCoordinator startup,
         SqliteSceneRepository repository,
-        SettingsCoordinator settingsCoordinator,
-        InventoryFingerprintChangeSource desktopChanges,
-        WindowsSessionEvents sessionEvents,
         RecoveryCardFocusCoordinator recoveryCardFocus,
         MainViewModel mainViewModel,
         RecoveryCardViewModel recoveryCardViewModel,
         MainWindow mainWindow,
         RecoveryCardWindow recoveryCardWindow,
         TrayIconService trayIcon,
-        RollingJsonLog diagnosticLog,
-        Func<ValueTask> drainModuleEventDiagnostics)
+        BestEffortAsyncCleanup cleanup)
     {
-        this.moduleHost = moduleHost;
-        this.scheduler = scheduler;
-        this.captureCoordinator = captureCoordinator;
+        this.startup = startup;
         this.repository = repository;
-        this.settingsCoordinator = settingsCoordinator;
-        this.desktopChanges = desktopChanges;
-        this.sessionEvents = sessionEvents;
         this.recoveryCardFocus = recoveryCardFocus;
         MainViewModel = mainViewModel;
         RecoveryCardViewModel = recoveryCardViewModel;
         MainWindow = mainWindow;
         RecoveryCardWindow = recoveryCardWindow;
         TrayIcon = trayIcon;
-        cleanup = new BestEffortAsyncCleanup(
-        [
-            new("tray", () => { TrayIcon.Dispose(); return ValueTask.CompletedTask; }),
-            new("desktop changes", async () => await desktopChanges.DisposeAsync()),
-            new("session events", () => { sessionEvents.Dispose(); return ValueTask.CompletedTask; }),
-            new("module host", async () => { if (started) await moduleHost.StopAsync(CancellationToken.None); }),
-            new("module event diagnostics", drainModuleEventDiagnostics),
-            new("main view model", () => { MainViewModel.Dispose(); return ValueTask.CompletedTask; }),
-            new("recovery view model", () => { RecoveryCardViewModel.Dispose(); return ValueTask.CompletedTask; }),
-            new("recovery window", () => { RecoveryCardWindow.CloseForExit(); return ValueTask.CompletedTask; }),
-            new("main window", () => { MainWindow.CloseForExit(); return ValueTask.CompletedTask; }),
-            new("scheduler", async () => await scheduler.DisposeAsync()),
-            new("capture coordinator", () => { captureCoordinator.Dispose(); return ValueTask.CompletedTask; }),
-            new("repository", () => { repository.Dispose(); return ValueTask.CompletedTask; }),
-            new("settings", () => { settingsCoordinator.Dispose(); return ValueTask.CompletedTask; }),
-            new("diagnostic log", async () => await diagnosticLog.DisposeAsync())
-        ]);
+        this.cleanup = cleanup;
     }
 
     /// <summary>获取共享主界面模型。</summary>
@@ -131,15 +98,7 @@ public sealed class CompositionRoot : IAsyncDisposable
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(cleanup.IsComplete, this);
-        if (started)
-        {
-            return;
-        }
-
-        await moduleHost.StartAsync(cancellationToken);
-        sessionEvents.Start();
-        await desktopChanges.StartAsync(cancellationToken);
-        started = true;
+        await startup.StartAsync(cleanup, cancellationToken);
     }
 
     /// <summary>加载最近现场并在存在时展示最新一份恢复卡片。</summary>
@@ -232,10 +191,13 @@ public sealed class CompositionRoot : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(requestExit);
         paths.EnsureRootDirectoryExists();
 
-        var clock = new SystemClock();
-        var diagnosticLog = new RollingJsonLog(paths.LogDirectory);
-        try
+        return await CompositionResourceOwner.BuildAsync(async ownership =>
         {
+            var clock = new SystemClock();
+            var diagnosticLog = ownership.Own(
+                "diagnostic log",
+                new RollingJsonLog(paths.LogDirectory),
+                static log => log.DisposeAsync());
             var databaseRecovery = new DatabaseRecovery(
                 paths, new SqliteConnectionLifecycle(), new DatabaseMigrator(paths));
             var databaseHealth = await databaseRecovery.InitializeAsync(cancellationToken);
@@ -259,8 +221,22 @@ public sealed class CompositionRoot : IAsyncDisposable
             var settingsStore = new JsonSettingsStore(paths);
             var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
             var startupRegistration = ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
-            var settingsCoordinator = new SettingsCoordinator(settingsStore);
-            var repository = new SqliteSceneRepository(paths);
+            var settingsCoordinator = ownership.Own(
+                "settings",
+                new SettingsCoordinator(settingsStore),
+                static settings =>
+                {
+                    settings.Dispose();
+                    return ValueTask.CompletedTask;
+                });
+            var repository = ownership.Own(
+                "repository",
+                new SqliteSceneRepository(paths),
+                static repository =>
+                {
+                    repository.Dispose();
+                    return ValueTask.CompletedTask;
+                });
             var failureHistoryStore = new SqliteFailureHistoryStore(paths);
             var notifyingRepository = new NotifyingSceneRepository(repository);
             var rawInventory = new Win32WindowInventory();
@@ -271,27 +247,62 @@ public sealed class CompositionRoot : IAsyncDisposable
                 CaptureEnabled = true,
                 ExcludedExecutablePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             };
-            var captureCoordinator = new CaptureCoordinator(
-                captureSettings,
-                captureInventory,
-                new SceneFilter(captureSettings),
-                notifyingRepository,
-                clock);
-            var scheduler = new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync);
+            var captureCoordinator = ownership.Own(
+                "capture coordinator",
+                new CaptureCoordinator(
+                    captureSettings,
+                    captureInventory,
+                    new SceneFilter(captureSettings),
+                    notifyingRepository,
+                    clock),
+                static coordinator =>
+                {
+                    coordinator.Dispose();
+                    return ValueTask.CompletedTask;
+                });
+            var scheduler = ownership.Own(
+                "scheduler",
+                new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync),
+                static scheduler => scheduler.DisposeAsync());
             var automaticCaptureGate = new AutomaticCaptureGate(
                 pauseAutomaticCapture,
                 pauseAutomaticCapture ? "检测到上次运行未正常结束，自动捕获已暂停。" : null);
+            ModuleHost? moduleHost = null;
+            InventoryFingerprintChangeSource? desktopChanges = null;
+            WindowsSessionEvents? sessionEvents = null;
+            var startup = new CompositionStartupCoordinator(
+                token => moduleHost!.StartAsync(token),
+                token => moduleHost!.StopAsync(token),
+                () => sessionEvents!.Start(),
+                () => sessionEvents!.Dispose(),
+                token => desktopChanges!.StartAsync(token),
+                () => desktopChanges!.DisposeAsync());
             // 两秒检测上限加既有十秒静止防抖，近似用户所见十秒静止语义。
-            var desktopChanges = new InventoryFingerprintChangeSource(
-                rawInventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, diagnosticLog);
+            var ownedDesktopChanges = ownership.Own(
+                "desktop changes",
+                new InventoryFingerprintChangeSource(
+                    rawInventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, diagnosticLog),
+                _ => startup.DisposeDesktopAsync());
+            desktopChanges = ownedDesktopChanges;
             var module = new WorkspaceRecoveryModule(
-                desktopChanges, scheduler, captureCoordinator, clock, automaticCaptureGate);
+                ownedDesktopChanges, scheduler, captureCoordinator, clock, automaticCaptureGate);
             var moduleState = CreateModuleStateComposition(module, diagnosticLog, clock);
-            var moduleHost = moduleState.Host;
-            var sessionEvents = new WindowsSessionEvents(
-                token => automaticCaptureGate.IsPaused
-                    ? Task.CompletedTask
-                    : captureCoordinator.SaveNowAsync("session-ending", token));
+            ownership.Own(
+                "module event diagnostics",
+                moduleState,
+                static composition => composition.DrainDiagnosticsAsync());
+            moduleHost = moduleState.Host;
+            ownership.Own(
+                "module host",
+                startup,
+                static coordinator => coordinator.StopModuleIfStartedAsync());
+            sessionEvents = ownership.Own(
+                "session events",
+                new WindowsSessionEvents(
+                    token => automaticCaptureGate.IsPaused
+                        ? Task.CompletedTask
+                        : captureCoordinator.SaveNowAsync("session-ending", token)),
+                _ => startup.DisposeSessionAsync());
 
             var commandBus = new InProcessCommandBus();
             commandBus.Register(new SaveSceneNowCommandHandler(captureCoordinator));
@@ -317,63 +328,87 @@ public sealed class CompositionRoot : IAsyncDisposable
             }
 #endif
 
-            var mainViewModel = new MainViewModel(
-                notifyingRepository, commandBus, settingsStore,
-                new WpfUiDispatcher(System.Windows.Application.Current.Dispatcher),
-                databaseHealth.HealthWarning,
-                async token =>
+            var mainViewModel = ownership.Own(
+                "main view model",
+                new MainViewModel(
+                    notifyingRepository, commandBus, settingsStore,
+                    new WpfUiDispatcher(System.Windows.Application.Current.Dispatcher),
+                    databaseHealth.HealthWarning,
+                    async token =>
+                    {
+                        var manifest = await diagnosticExporter.CreateManifestAsync(token);
+                        return manifest.Files.Count == 0
+                            ? "当前没有可预览的诊断文件。"
+                            : string.Join(
+                                Environment.NewLine + Environment.NewLine,
+                                manifest.Files.Select(file =>
+                                    $"[{file.ArchiveName}] {file.ByteCount} 字节{Environment.NewLine}" +
+                                    file.Preview[..Math.Min(file.Preview.Length, 4000)]));
+                    },
+                    startupRegistration,
+                    moduleState.EventBus,
+                    module.Descriptor,
+                    automaticCaptureGate),
+                static viewModel =>
                 {
-                    var manifest = await diagnosticExporter.CreateManifestAsync(token);
-                    return manifest.Files.Count == 0
-                        ? "当前没有可预览的诊断文件。"
-                        : string.Join(
-                            Environment.NewLine + Environment.NewLine,
-                            manifest.Files.Select(file =>
-                                $"[{file.ArchiveName}] {file.ByteCount} 字节{Environment.NewLine}" +
-                                file.Preview[..Math.Min(file.Preview.Length, 4000)]));
-                },
-                startupRegistration,
-                moduleState.EventBus,
-                module.Descriptor,
-                automaticCaptureGate);
+                    viewModel.Dispose();
+                    return ValueTask.CompletedTask;
+                });
             await mainViewModel.LoadAsync();
-            var recoveryCardViewModel = new RecoveryCardViewModel(
-                commandBus, clock, persistedSettings.RecoveryCardDismissSeconds, failureHistoryStore);
-            var mainWindow = new MainWindow(mainViewModel);
-            var recoveryCardWindow = new RecoveryCardWindow(recoveryCardViewModel);
+            var recoveryCardViewModel = ownership.Own(
+                "recovery view model",
+                new RecoveryCardViewModel(
+                    commandBus, clock, persistedSettings.RecoveryCardDismissSeconds, failureHistoryStore),
+                static viewModel =>
+                {
+                    viewModel.Dispose();
+                    return ValueTask.CompletedTask;
+                });
+            var mainWindow = ownership.Own(
+                "main window",
+                new MainWindow(mainViewModel),
+                static window =>
+                {
+                    window.CloseForExit();
+                    return ValueTask.CompletedTask;
+                });
+            var recoveryCardWindow = ownership.Own(
+                "recovery window",
+                new RecoveryCardWindow(recoveryCardViewModel),
+                static window =>
+                {
+                    window.CloseForExit();
+                    return ValueTask.CompletedTask;
+                });
             CompositionRoot? root = null;
             var recoveryCardFocus = new RecoveryCardFocusCoordinator(
                 () => root?.ShowRecoveryCardForLatestSceneAsync() ?? Task.FromResult(false),
                 recoveryCardWindow.FocusForKeyboard);
-            var trayIcon = new TrayIconService(
-                mainViewModel,
-                () => root?.ShowMainWindow(),
-                recoveryCardFocus.FocusAsync,
-                requestExit);
+            var trayIcon = ownership.Own(
+                "tray",
+                new TrayIconService(
+                    mainViewModel,
+                    () => root?.ShowMainWindow(),
+                    recoveryCardFocus.FocusAsync,
+                    requestExit),
+                static tray =>
+                {
+                    tray.Dispose();
+                    return ValueTask.CompletedTask;
+                });
+            var cleanup = ownership.PrepareCleanup();
             root = new CompositionRoot(
-                moduleHost,
-                scheduler,
-                captureCoordinator,
+                startup,
                 repository,
-                settingsCoordinator,
-                desktopChanges,
-                sessionEvents,
                 recoveryCardFocus,
                 mainViewModel,
                 recoveryCardViewModel,
                 mainWindow,
                 recoveryCardWindow,
                 trayIcon,
-                diagnosticLog,
-                moduleState.DrainDiagnosticsAsync);
+                cleanup);
             return root;
-        }
-        catch
-        {
-            // 对象图尚未交给 CompositionRoot 时，由工厂释放独占日志写者锁。
-            await diagnosticLog.DisposeAsync();
-            throw;
-        }
+        }).ConfigureAwait(false);
     }
 
     /// <summary>创建共享同一事件总线的模块宿主和可清理诊断观察边界。</summary>
