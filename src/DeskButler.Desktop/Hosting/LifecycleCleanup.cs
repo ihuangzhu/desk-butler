@@ -6,97 +6,161 @@ namespace DeskButler.Desktop.Hosting;
 /// <summary>表示一个可独立重试的异步清理步骤。</summary>
 internal sealed record CleanupStep(string Name, Func<ValueTask> RunAsync);
 
-/// <summary>逐步尽力清理；成功步骤只执行一次，失败步骤可在后续调用重试。</summary>
-internal sealed class BestEffortAsyncCleanup(IEnumerable<CleanupStep> steps)
+/// <summary>原子协调清理步骤状态、live pass 共享与最终结果发布。</summary>
+internal sealed class CleanupPassCoordinator(IEnumerable<CleanupStep> steps)
 {
-    private readonly CleanupState[] states = steps.Select(step => new CleanupState(step)).ToArray();
+    private readonly CleanupStepState[] states = steps.Select(step => new CleanupStepState(step)).ToArray();
     private readonly object syncRoot = new();
     private Task? inFlight;
 
-    /// <summary>获取所有步骤是否均已成功完成。</summary>
+    /// <summary>获取所有步骤是否均已成功，且没有仍在执行的 pass。</summary>
     internal bool IsComplete
     {
         get
         {
             lock (syncRoot)
             {
+                DiscardCompletedPass();
                 return inFlight is null && states.All(state => state.Completed);
             }
         }
     }
 
-    /// <summary>共享一个正在执行的清理 pass；全部完成后直接幂等返回。</summary>
-    internal ValueTask RunAsync()
+    /// <summary>加入 live pass，或为尚未完成的步骤原子建立一个新 pass。</summary>
+    internal CleanupPass Enter()
     {
-        Task sharedPass;
-        TaskCompletionSource? completion = null;
         lock (syncRoot)
         {
+            DiscardCompletedPass();
             if (inFlight is not null)
             {
-                return new ValueTask(inFlight);
+                return new CleanupPass(inFlight, null);
             }
 
             if (states.All(state => state.Completed))
             {
-                return ValueTask.CompletedTask;
+                return new CleanupPass(Task.CompletedTask, null);
             }
 
-            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            sharedPass = completion.Task;
-            inFlight = sharedPass;
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            inFlight = completion.Task;
+            return new CleanupPass(completion.Task, completion);
+        }
+    }
+
+    /// <summary>取得本轮尚未成功的稳定步骤快照。</summary>
+    internal IReadOnlyList<CleanupStepState> GetIncompleteStates()
+    {
+        lock (syncRoot)
+        {
+            return states.Where(state => !state.Completed).ToArray();
+        }
+    }
+
+    /// <summary>把一个成功步骤标记为后续 pass 不再执行。</summary>
+    internal void MarkCompleted(CleanupStepState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        lock (syncRoot)
+        {
+            state.Completed = true;
+        }
+    }
+
+    /// <summary>在同一锁内撤销 live 登记并发布本轮最终结果。</summary>
+    internal void Publish(CleanupPass pass, Exception? failure)
+    {
+        var completion = pass.Completion
+            ?? throw new InvalidOperationException("只有新建清理 pass 的调用方可以发布结果。");
+        lock (syncRoot)
+        {
+            if (ReferenceEquals(inFlight, pass.Task))
+            {
+                inFlight = null;
+            }
+
+            if (failure is null)
+            {
+                completion.TrySetResult();
+            }
+            else
+            {
+                completion.TrySetException(failure);
+            }
+        }
+    }
+
+    /// <summary>已向外完成的 Task 不再属于 live pass，即使旧发布顺序暂未清除其引用。</summary>
+    private void DiscardCompletedPass()
+    {
+        if (inFlight?.IsCompleted == true)
+        {
+            inFlight = null;
+        }
+    }
+}
+
+/// <summary>表示一次共享清理 pass；只有创建方持有其完成源。</summary>
+internal readonly record struct CleanupPass(Task Task, TaskCompletionSource? Completion)
+{
+    internal bool StartsPass => Completion is not null;
+}
+
+/// <summary>保存单个清理步骤及其永久成功位。</summary>
+internal sealed class CleanupStepState(CleanupStep step)
+{
+    internal CleanupStep Step { get; } = step;
+
+    internal bool Completed { get; set; }
+}
+
+/// <summary>逐步尽力清理；成功步骤只执行一次，失败步骤可在后续调用重试。</summary>
+internal sealed class BestEffortAsyncCleanup(IEnumerable<CleanupStep> steps)
+{
+    private readonly CleanupPassCoordinator coordinator = new(steps);
+
+    /// <summary>获取所有步骤是否均已成功完成。</summary>
+    internal bool IsComplete => coordinator.IsComplete;
+
+    /// <summary>共享一个正在执行的清理 pass；全部完成后直接幂等返回。</summary>
+    internal ValueTask RunAsync()
+    {
+        var pass = coordinator.Enter();
+        if (pass.StartsPass)
+        {
+            // 必须先发布 live pass 再在锁外调用资源代码，确保同步重入也只看到同一个 pass。
+            _ = RunPassAndCompleteAsync(pass);
         }
 
-        // 必须先发布 inFlight 再在锁外调用资源代码，确保同步重入也只看到同一个 pass。
-        _ = RunPassAndCompleteAsync(completion);
-        return new ValueTask(sharedPass);
+        return new ValueTask(pass.Task);
     }
 
     /// <summary>执行一次 pass，并在所有步骤与聚合完成后开放失败步骤重试。</summary>
-    private async Task RunPassAndCompleteAsync(TaskCompletionSource completion)
+    private async Task RunPassAndCompleteAsync(CleanupPass pass)
     {
+        Exception? failure = null;
         try
         {
             await RunPassAsync().ConfigureAwait(false);
-            completion.TrySetResult();
         }
         catch (Exception exception)
         {
-            completion.TrySetException(exception);
+            failure = exception;
         }
-        finally
-        {
-            lock (syncRoot)
-            {
-                if (ReferenceEquals(inFlight, completion.Task))
-                {
-                    inFlight = null;
-                }
-            }
-        }
+
+        coordinator.Publish(pass, failure);
     }
 
     /// <summary>按既定顺序尝试全部未完成步骤，并汇总本次 pass 的错误。</summary>
     private async Task RunPassAsync()
     {
         var failures = new List<Exception>();
-        foreach (var state in states)
+        foreach (var state in coordinator.GetIncompleteStates())
         {
-            lock (syncRoot)
-            {
-                if (state.Completed)
-                {
-                    continue;
-                }
-            }
-
             try
             {
                 await state.Step.RunAsync().ConfigureAwait(false);
-                lock (syncRoot)
-                {
-                    state.Completed = true;
-                }
+                coordinator.MarkCompleted(state);
             }
             catch (Exception exception)
             {
@@ -108,13 +172,6 @@ internal sealed class BestEffortAsyncCleanup(IEnumerable<CleanupStep> steps)
         {
             throw new AggregateException("DeskButler 清理未完全成功。", failures);
         }
-    }
-
-    private sealed class CleanupState(CleanupStep step)
-    {
-        internal CleanupStep Step { get; } = step;
-
-        internal bool Completed { get; set; }
     }
 }
 

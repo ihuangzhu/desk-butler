@@ -4,6 +4,94 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class BestEffortAsyncCleanupTests
 {
+    /// <summary>已经向调用方发布失败的旧 pass 不得阻止未完成步骤开启重试。</summary>
+    [Fact]
+    public async Task ExternallyCompletedFailedPassCannotBeReturnedForRetry()
+    {
+        var coordinator = new CleanupPassCoordinator(
+        [
+            new("retryable", () => ValueTask.CompletedTask)
+        ]);
+        var failedPass = coordinator.Enter();
+        var failure = new IOException("cleanup pass failed");
+
+        failedPass.Completion!.TrySetException(failure);
+        var observed = await Assert.ThrowsAsync<IOException>(() => failedPass.Task);
+        var retry = coordinator.Enter();
+
+        Assert.Same(failure, observed);
+        Assert.True(retry.StartsPass);
+        Assert.NotSame(failedPass.Task, retry.Task);
+    }
+
+    /// <summary>两个调用方遇到已完成旧 pass 时必须只创建并共享一个新重试 pass。</summary>
+    [Fact]
+    public async Task CallersAtExternallyCompletedBoundaryShareOneRetryPass()
+    {
+        var coordinator = new CleanupPassCoordinator(
+        [
+            new("retryable", () => ValueTask.CompletedTask)
+        ]);
+        var failedPass = coordinator.Enter();
+        failedPass.Completion!.TrySetException(new IOException("cleanup pass failed"));
+        _ = failedPass.Task.Exception;
+        var releaseCallers = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callers = Enumerable.Range(0, 2)
+            .Select(_ => Task.Run(async () =>
+            {
+                await releaseCallers.Task.WaitAsync(TestContext.Current.CancellationToken);
+                return coordinator.Enter();
+            }))
+            .ToArray();
+
+        releaseCallers.TrySetResult();
+        var retries = await Task.WhenAll(callers);
+
+        Assert.Single(retries, retry => retry.StartsPass);
+        Assert.Same(retries[0].Task, retries[1].Task);
+        Assert.NotSame(failedPass.Task, retries[0].Task);
+    }
+
+    /// <summary>全部步骤成功且结果已向调用方发布后，不得因旧 pass 登记而报告未完成。</summary>
+    [Fact]
+    public async Task ExternallyCompletedSuccessfulPassReportsComplete()
+    {
+        var coordinator = new CleanupPassCoordinator(
+        [
+            new("completed", () => ValueTask.CompletedTask)
+        ]);
+        var pass = coordinator.Enter();
+        var state = Assert.Single(coordinator.GetIncompleteStates());
+        coordinator.MarkCompleted(state);
+
+        pass.Completion!.TrySetResult();
+        await pass.Task;
+
+        Assert.True(coordinator.IsComplete);
+    }
+
+    /// <summary>资源回调同步重入时必须观察已经发布的同一个 live pass。</summary>
+    [Fact]
+    public async Task SynchronousReentrantRunSharesPublishedPass()
+    {
+        BestEffortAsyncCleanup cleanup = null!;
+        Task? reentrantPass = null;
+        cleanup = new BestEffortAsyncCleanup(
+        [
+            new("reentrant", () =>
+            {
+                reentrantPass = cleanup.RunAsync().AsTask();
+                return ValueTask.CompletedTask;
+            })
+        ]);
+
+        var firstPass = cleanup.RunAsync().AsTask();
+        await firstPass;
+
+        Assert.Same(firstPass, reentrantPass);
+        Assert.True(cleanup.IsComplete);
+    }
+
     /// <summary>两个并发调用必须共享同一清理 pass，成功步骤只执行一次。</summary>
     [Fact]
     public async Task ConcurrentRunsShareOneSuccessfulPass()
