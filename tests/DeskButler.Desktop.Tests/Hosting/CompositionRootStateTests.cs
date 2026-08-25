@@ -154,6 +154,103 @@ public sealed class CompositionRootStateTests
         Assert.Equal(0, Volatile.Read(ref closeCount));
     }
 
+    /// <summary>清理委托已进入后即使 Dispatcher 开始关闭，其真实失败也必须传播并保持步骤可重试。</summary>
+    [Fact]
+    public async Task WindowCleanupFailureAfterDelegateStartsAndShutdownPropagatesAndCanRetry()
+    {
+        using var dispatcherHost = StaDispatcherHost.Start();
+        using var releaseCleanup = new ManualResetEventSlim();
+        var cleanupEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupFailure = new IOException("window close failed");
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var cleanupCount = 0;
+        var cleanup = new BestEffortAsyncCleanup(
+        [
+            new CleanupStep(
+                "window",
+                () => DispatcherCleanup.RunAsync(
+                    dispatcherHost.Dispatcher,
+                    () =>
+                    {
+                        Interlocked.Increment(ref cleanupCount);
+                        cleanupEntered.TrySetResult();
+                        releaseCleanup.Wait(cancellationToken);
+                        dispatcherHost.Dispatcher.InvokeShutdown();
+                        throw cleanupFailure;
+                    }))
+        ]);
+
+        try
+        {
+            var firstRun = cleanup.RunAsync().AsTask();
+            await cleanupEntered.Task.WaitAsync(cancellationToken);
+            releaseCleanup.Set();
+
+            var thrown = await Assert.ThrowsAsync<AggregateException>(() => firstRun);
+            var stepFailure = Assert.IsType<InvalidOperationException>(
+                Assert.Single(thrown.InnerExceptions));
+
+            Assert.Same(cleanupFailure, stepFailure.InnerException);
+            Assert.False(cleanup.IsComplete);
+
+            await cleanup.RunAsync();
+
+            Assert.True(cleanup.IsComplete);
+            Assert.Equal(1, Volatile.Read(ref cleanupCount));
+        }
+        finally
+        {
+            releaseCleanup.Set();
+        }
+    }
+
+    /// <summary>排队清理尚未进入就被 Dispatcher shutdown 中止时必须静默完成且不调用委托。</summary>
+    [Fact]
+    public async Task WindowCleanupAbortedBeforeDelegateStartsDuringShutdownCompletesBestEffort()
+    {
+        using var dispatcherHost = StaDispatcherHost.Start();
+        using var releaseDispatcher = new ManualResetEventSlim();
+        var dispatcherBlocked = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var cleanupCount = 0;
+
+        _ = dispatcherHost.Dispatcher.BeginInvoke(
+            () =>
+            {
+                dispatcherBlocked.TrySetResult();
+                releaseDispatcher.Wait(cancellationToken);
+                dispatcherHost.Dispatcher.InvokeShutdown();
+            },
+            DispatcherPriority.Send);
+
+        try
+        {
+            await dispatcherBlocked.Task.WaitAsync(cancellationToken);
+            var cleanup = new BestEffortAsyncCleanup(
+            [
+                new CleanupStep(
+                    "window",
+                    () => DispatcherCleanup.RunAsync(
+                        dispatcherHost.Dispatcher,
+                        () => Interlocked.Increment(ref cleanupCount)))
+            ]);
+            var run = cleanup.RunAsync().AsTask();
+            Assert.False(run.IsCompleted);
+
+            releaseDispatcher.Set();
+            await run;
+
+            Assert.True(cleanup.IsComplete);
+            Assert.Equal(0, Volatile.Read(ref cleanupCount));
+        }
+        finally
+        {
+            releaseDispatcher.Set();
+        }
+    }
+
     /// <summary>成功构造只转移一次所有权，原 owner 与重复根清理都不得重复释放。</summary>
     [Fact]
     public async Task SuccessfulConstructionTransfersCleanupWithoutDoubleDispose()
@@ -926,6 +1023,50 @@ public sealed class CompositionRootStateTests
         thread.Start();
         thread.Join();
         return dispatcher ?? throw new InvalidOperationException("未能创建测试 Dispatcher。");
+    }
+
+    /// <summary>承载可由测试线程控制关闭的专用 STA Dispatcher。</summary>
+    private sealed class StaDispatcherHost : IDisposable
+    {
+        private readonly Thread thread;
+
+        private StaDispatcherHost(Dispatcher dispatcher, Thread thread)
+        {
+            Dispatcher = dispatcher;
+            this.thread = thread;
+        }
+
+        internal Dispatcher Dispatcher { get; }
+
+        /// <summary>启动 Dispatcher 消息循环，并在返回前用同步门确保实例已发布。</summary>
+        internal static StaDispatcherHost Start()
+        {
+            Dispatcher? dispatcher = null;
+            using var ready = new ManualResetEventSlim();
+            var thread = new Thread(() =>
+            {
+                dispatcher = Dispatcher.CurrentDispatcher;
+                ready.Set();
+                Dispatcher.Run();
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            ready.Wait();
+            return new StaDispatcherHost(
+                dispatcher ?? throw new InvalidOperationException("未能创建测试 Dispatcher。"),
+                thread);
+        }
+
+        /// <summary>停止仍在运行的 Dispatcher，并等待专用线程确定性退出。</summary>
+        public void Dispose()
+        {
+            if (!Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+            {
+                Dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
+            }
+
+            thread.Join();
+        }
     }
 
     private sealed class BlockingDiagnosticLog : IDiagnosticLog

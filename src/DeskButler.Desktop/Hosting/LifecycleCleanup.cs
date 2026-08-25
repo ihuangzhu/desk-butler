@@ -70,13 +70,22 @@ internal static class DispatcherCleanup
     /// <summary>等待异步 Dispatcher 操作；关闭竞态只终止本次 best-effort 清理。</summary>
     private static async ValueTask MarshalAsync(Dispatcher dispatcher, Action cleanup)
     {
+        var cleanupStarted = 0;
         try
         {
-            await dispatcher.InvokeAsync(cleanup, DispatcherPriority.Send).Task.ConfigureAwait(false);
+            await dispatcher.InvokeAsync(
+                () =>
+                {
+                    Volatile.Write(ref cleanupStarted, 1);
+                    cleanup();
+                },
+                DispatcherPriority.Send).Task.ConfigureAwait(false);
         }
-        catch (Exception) when (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+        catch (Exception) when (
+            Volatile.Read(ref cleanupStarted) == 0 &&
+            (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished))
         {
-            // Dispatcher 关闭会取消或拒绝排队操作；不得用该竞态遮蔽原始生命周期失败。
+            // 仅忽略尚未进入的排队操作；cleanup 自身失败必须传播并保留清理重试资格。
         }
     }
 }
