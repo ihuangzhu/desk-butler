@@ -1,6 +1,7 @@
 using DeskButler.Application.Commands;
 using DeskButler.Application.Hosting;
 using DeskButler.Application.Events;
+using DeskButler.Application.Modules;
 using DeskButler.Core.Capture;
 using DeskButler.Core.Persistence;
 using DeskButler.Core.Scenes;
@@ -53,7 +54,8 @@ public sealed class CompositionRoot : IAsyncDisposable
         MainWindow mainWindow,
         RecoveryCardWindow recoveryCardWindow,
         TrayIconService trayIcon,
-        RollingJsonLog diagnosticLog)
+        RollingJsonLog diagnosticLog,
+        Func<ValueTask> drainModuleEventDiagnostics)
     {
         this.moduleHost = moduleHost;
         this.scheduler = scheduler;
@@ -74,6 +76,7 @@ public sealed class CompositionRoot : IAsyncDisposable
             new("desktop changes", async () => await desktopChanges.DisposeAsync()),
             new("session events", () => { sessionEvents.Dispose(); return ValueTask.CompletedTask; }),
             new("module host", async () => { if (started) await moduleHost.StopAsync(CancellationToken.None); }),
+            new("module event diagnostics", drainModuleEventDiagnostics),
             new("main view model", () => { MainViewModel.Dispose(); return ValueTask.CompletedTask; }),
             new("recovery view model", () => { RecoveryCardViewModel.Dispose(); return ValueTask.CompletedTask; }),
             new("recovery window", () => { RecoveryCardWindow.CloseForExit(); return ValueTask.CompletedTask; }),
@@ -283,8 +286,8 @@ public sealed class CompositionRoot : IAsyncDisposable
                 rawInventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, diagnosticLog);
             var module = new WorkspaceRecoveryModule(
                 desktopChanges, scheduler, captureCoordinator, clock, automaticCaptureGate);
-            var eventBus = new InProcessEventBus();
-            var moduleHost = new ModuleHost([module], eventBus);
+            var moduleState = CreateModuleStateComposition(module, diagnosticLog, clock);
+            var moduleHost = moduleState.Host;
             var sessionEvents = new WindowsSessionEvents(
                 token => automaticCaptureGate.IsPaused
                     ? Task.CompletedTask
@@ -330,7 +333,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                                 file.Preview[..Math.Min(file.Preview.Length, 4000)]));
                 },
                 startupRegistration,
-                eventBus,
+                moduleState.EventBus,
                 module.Descriptor,
                 automaticCaptureGate);
             await mainViewModel.LoadAsync();
@@ -361,7 +364,8 @@ public sealed class CompositionRoot : IAsyncDisposable
                 mainWindow,
                 recoveryCardWindow,
                 trayIcon,
-                diagnosticLog);
+                diagnosticLog,
+                moduleState.DrainDiagnosticsAsync);
             return root;
         }
         catch
@@ -370,6 +374,65 @@ public sealed class CompositionRoot : IAsyncDisposable
             await diagnosticLog.DisposeAsync();
             throw;
         }
+    }
+
+    /// <summary>创建共享同一事件总线的模块宿主和可清理诊断观察边界。</summary>
+    internal static ModuleStateComposition CreateModuleStateComposition(
+        IModule module,
+        IDiagnosticLog diagnosticLog,
+        IClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(module);
+        ArgumentNullException.ThrowIfNull(diagnosticLog);
+        ArgumentNullException.ThrowIfNull(clock);
+        var eventBus = new InProcessEventBus();
+        var diagnostics = new ModuleEventDiagnosticTracker(
+            exception => ReportModuleEventFailureAsync(diagnosticLog, clock, exception));
+        return new ModuleStateComposition(
+            new ModuleHost([module], eventBus, diagnostics.Report),
+            eventBus,
+            diagnostics.DrainAsync);
+    }
+
+    /// <summary>在两秒边界内写入不含异常消息和用户数据的模块观察故障。</summary>
+    private static async Task ReportModuleEventFailureAsync(
+        IDiagnosticLog diagnosticLog,
+        IClock clock,
+        Exception exception)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var diagnosticEvent = new DiagnosticEvent(
+                clock.UtcNow,
+                DiagnosticLevel.Warning,
+                "module-status",
+                "模块状态观察者处理失败。",
+                new Dictionary<string, object?>
+                {
+                    ["exceptionType"] = exception.GetType().FullName
+                });
+            // 防止接口实现返回 Task 前同步阻塞；迟到任务的异常另有观察边界。
+            var writeTask = Task.Run(
+                () => diagnosticLog.WriteAsync(diagnosticEvent, timeout.Token),
+                CancellationToken.None);
+            ObserveLateFailure(writeTask);
+            await writeTask.WaitAsync(timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // 诊断日志是最终观察边界，任何失败都不得污染模块生命周期或退出清理。
+        }
+    }
+
+    /// <summary>观察超时后迟到诊断任务的异常，避免形成未观察任务故障。</summary>
+    private static void ObserveLateFailure(Task task)
+    {
+        _ = task.ContinueWith(
+            completed => _ = completed.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>仅为正式宿主同步当前用户 HKCU 登录启动设置；Debug 注入路径不触碰注册表。</summary>
@@ -430,4 +493,81 @@ public sealed class CompositionRoot : IAsyncDisposable
             Task.Delay(delay, cancellationToken);
     }
 
+}
+
+/// <summary>跟踪同步诊断回调启动的全部有界任务，供组合根退出时统一封存并等待。</summary>
+internal sealed class ModuleEventDiagnosticTracker
+{
+    private readonly object syncRoot = new();
+    private readonly List<Task> pending = [];
+    private readonly Func<Exception, Task> startDiagnosticTask;
+    private bool sealedForCleanup;
+
+    /// <summary>使用只负责启动单个有界诊断任务的工厂创建 tracker。</summary>
+    internal ModuleEventDiagnosticTracker(Func<Exception, Task> startDiagnosticTask)
+    {
+        this.startDiagnosticTask = startDiagnosticTask ??
+            throw new ArgumentNullException(nameof(startDiagnosticTask));
+    }
+
+    /// <summary>在同一同步边界内检查封存状态、创建并登记诊断任务。</summary>
+    internal void Report(Exception exception)
+    {
+        lock (syncRoot)
+        {
+            if (sealedForCleanup)
+            {
+                return;
+            }
+
+            try
+            {
+                // Task.Run 与登记都在锁内；委托即使立即开始，Drain 也只能在引用可见后快照。
+                var task = Task.Run(
+                    () => startDiagnosticTask(exception),
+                    CancellationToken.None);
+                pending.Add(task);
+            }
+            catch
+            {
+                // 最终诊断任务工厂自身失败也不得污染模块生命周期。
+            }
+        }
+    }
+
+    /// <summary>首次调用时封存 tracker，并在锁外幂等等待封存前登记的全部任务。</summary>
+    internal async ValueTask DrainAsync()
+    {
+        Task[] snapshot;
+        lock (syncRoot)
+        {
+            sealedForCleanup = true;
+            snapshot = [.. pending];
+        }
+
+        try
+        {
+            await Task.WhenAll(snapshot).ConfigureAwait(false);
+        }
+        catch
+        {
+            // 最终诊断边界不得让日志任务故障污染退出清理。
+        }
+    }
+}
+
+/// <summary>封装生产模块宿主、共享事件总线和对应诊断清理步骤。</summary>
+internal sealed class ModuleStateComposition(
+    ModuleHost host,
+    InProcessEventBus eventBus,
+    Func<ValueTask> drainDiagnosticsAsync)
+{
+    /// <summary>获取使用共享生产事件总线的模块宿主。</summary>
+    internal ModuleHost Host { get; } = host;
+
+    /// <summary>获取同时供模块宿主和状态 ViewModel 使用的生产事件总线。</summary>
+    internal InProcessEventBus EventBus { get; } = eventBus;
+
+    /// <summary>等待同步诊断接收器已经启动的全部有界任务。</summary>
+    internal ValueTask DrainDiagnosticsAsync() => drainDiagnosticsAsync();
 }

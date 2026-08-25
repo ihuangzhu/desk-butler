@@ -4,7 +4,7 @@
 
 | 范围 | 状态 | 截至 2026-08-25 的证据 |
 |---|---|---|
-| Windows 10 x64 19045 自动快速测试 | PASS | 最终修复后的 Release 套件：380 总计、377 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误。 |
+| Windows 10 x64 19045 自动快速测试 | PASS | 最终状态一致性修复后的 Release 套件：409 总计、406 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误。 |
 | Windows 10 受控短交互 | PASS | Debug/Release 的两个受控窗口、Explorer 往返和 150% DPI 定位通过，窗口四边误差门槛 8 物理像素。 |
 | 30 分钟资源验证 | PASS | 独立 workload PID；10,000 次通知、100 次捕获、3 份有效快照；末五次句柄 `[331,334,337,340,334]`，最终回落。 |
 | Windows 11 x64 | PENDING | 当前机器不是 Windows 11，尚未执行真实 Windows 11 清单。 |
@@ -30,4 +30,4 @@
 
 ## 发布判定
 
-当前只能称“本地 release candidate / 自动化候选”。正式发布至少还需要：Windows 11 清单 PASS、干净专用账户安装与删除链 PASS、用户当下确认后的真实重启 PASS、诊断 bundle 导出链闭环，并由独立审查确认结果。任何 `BLOCK/PENDING/NEEDS_USER_CONFIRMATION` 都不能折算成 PASS。
+恢复卡快照、设置并发/补偿和模块生命周期观察的内部状态一致性缺口已纳入自动测试；这不会替代外部环境证据。当前只能称“本地 release candidate / 自动化候选”。正式发布至少还需要：Windows 11 清单 PASS、干净专用账户安装与删除链 PASS、用户当下确认后的真实重启 PASS、诊断 bundle 导出链闭环、产品代码签名，并由独立审查确认结果。任何 `BLOCK/PENDING/NEEDS_USER_CONFIRMATION` 都不能折算成 PASS。
