@@ -9,6 +9,51 @@ namespace DeskButler.Modules.WorkspaceRecovery.Tests;
 
 public sealed class WorkspaceRecoveryModuleTests
 {
+    /// <summary>崩溃安全模式的运行期门禁必须吞掉自动变化，且不得触发持久化保存。</summary>
+    [Fact]
+    public async Task RuntimeSafeModePreventsAutomaticDesktopChangeSave()
+    {
+        var clock = new FakeClock();
+        var source = new FakeDesktopChangeSource();
+        var repository = new ModuleSceneRepository();
+        var coordinator = CreateCoordinator(ButlerSettings.Default, repository, clock);
+        var gate = new AutomaticCaptureGate(paused: true, "检测到上次异常退出");
+        await using var scheduler = new SnapshotScheduler(clock, coordinator.SaveNowAsync);
+        var module = new WorkspaceRecoveryModule(source, scheduler, coordinator, clock, gate);
+
+        await module.StartAsync(TestContext.Current.CancellationToken);
+        source.Raise();
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Empty(repository.Snapshots);
+        Assert.True(gate.IsPaused);
+        await module.StopAsync(TestContext.Current.CancellationToken);
+        Assert.Empty(repository.Snapshots);
+    }
+
+    /// <summary>用户明确解除运行期门禁后，同类桌面变化才允许再次保存。</summary>
+    [Fact]
+    public async Task ExplicitRuntimeResumeAllowsLaterDesktopChangeSave()
+    {
+        var clock = new FakeClock();
+        var source = new FakeDesktopChangeSource();
+        var repository = new ModuleSceneRepository();
+        var coordinator = CreateCoordinator(ButlerSettings.Default, repository, clock);
+        var gate = new AutomaticCaptureGate(paused: true, "检测到上次异常退出");
+        await using var scheduler = new SnapshotScheduler(clock, coordinator.SaveNowAsync);
+        var module = new WorkspaceRecoveryModule(source, scheduler, coordinator, clock, gate);
+        await module.StartAsync(TestContext.Current.CancellationToken);
+
+        source.Raise();
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(10));
+        gate.Resume();
+        source.Raise();
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Single(repository.Snapshots);
+        await module.StopAsync(TestContext.Current.CancellationToken);
+    }
+
     /// <summary>验证启动后来自任意线程的变化信号被安全合并，停止后事件源已释放。</summary>
     [Fact]
     public async Task StartSubscribesThreadSafeDesktopChangesAndStopUnsubscribes()

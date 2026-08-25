@@ -1,5 +1,6 @@
 using DeskButler.Application.Commands;
 using DeskButler.Application.Hosting;
+using DeskButler.Application.Events;
 using DeskButler.Core.Capture;
 using DeskButler.Core.Persistence;
 using DeskButler.Core.Scenes;
@@ -104,9 +105,11 @@ public sealed class CompositionRoot : IAsyncDisposable
     public static Task<CompositionRoot> CreateAsync(
         AppDataPaths paths,
         Action requestExit,
+        bool pauseAutomaticCapture,
         CancellationToken cancellationToken) =>
         CreateCoreAsync(
-            paths, requestExit, createFixture: false, applyStartupRegistration: true, cancellationToken);
+            paths, requestExit, createFixture: false, applyStartupRegistration: true,
+            pauseAutomaticCapture, cancellationToken);
 
 #if DEBUG
     /// <summary>Debug 构建可在隔离数据根创建一份无敏感内容的冒烟现场。</summary>
@@ -114,9 +117,11 @@ public sealed class CompositionRoot : IAsyncDisposable
         AppDataPaths paths,
         Action requestExit,
         bool createFixture,
+        bool pauseAutomaticCapture,
         CancellationToken cancellationToken) =>
         CreateCoreAsync(
-            paths, requestExit, createFixture, applyStartupRegistration: false, cancellationToken);
+            paths, requestExit, createFixture, applyStartupRegistration: false,
+            pauseAutomaticCapture, cancellationToken);
 #endif
 
     /// <summary>启动工作区模块、会话关机检查点与轮询变化源。</summary>
@@ -217,6 +222,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         Action requestExit,
         bool createFixture,
         bool applyStartupRegistration,
+        bool pauseAutomaticCapture,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(paths);
@@ -249,7 +255,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 ["deskbutler.jsonl", "deskbutler.1.jsonl", "deskbutler.2.jsonl"]);
             var settingsStore = new JsonSettingsStore(paths);
             var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
-            ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
+            var startupRegistration = ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
             var settingsCoordinator = new SettingsCoordinator(settingsStore);
             var repository = new SqliteSceneRepository(paths);
             var failureHistoryStore = new SqliteFailureHistoryStore(paths);
@@ -269,13 +275,20 @@ public sealed class CompositionRoot : IAsyncDisposable
                 notifyingRepository,
                 clock);
             var scheduler = new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync);
+            var automaticCaptureGate = new AutomaticCaptureGate(
+                pauseAutomaticCapture,
+                pauseAutomaticCapture ? "检测到上次运行未正常结束，自动捕获已暂停。" : null);
             // 两秒检测上限加既有十秒静止防抖，近似用户所见十秒静止语义。
             var desktopChanges = new InventoryFingerprintChangeSource(
                 rawInventory, clock, TimeSpan.FromSeconds(2), reportFailure: null, diagnosticLog);
-            var module = new WorkspaceRecoveryModule(desktopChanges, scheduler, captureCoordinator, clock);
-            var moduleHost = new ModuleHost([module]);
+            var module = new WorkspaceRecoveryModule(
+                desktopChanges, scheduler, captureCoordinator, clock, automaticCaptureGate);
+            var eventBus = new InProcessEventBus();
+            var moduleHost = new ModuleHost([module], eventBus);
             var sessionEvents = new WindowsSessionEvents(
-                token => captureCoordinator.SaveNowAsync("session-ending", token));
+                token => automaticCaptureGate.IsPaused
+                    ? Task.CompletedTask
+                    : captureCoordinator.SaveNowAsync("session-ending", token));
 
             var commandBus = new InProcessCommandBus();
             commandBus.Register(new SaveSceneNowCommandHandler(captureCoordinator));
@@ -287,7 +300,11 @@ public sealed class CompositionRoot : IAsyncDisposable
                     settingsStore,
                     failureHistoryStore,
                     diagnosticLog));
-            commandBus.Register(new SetCaptureEnabledCommandHandler(settingsCoordinator));
+            commandBus.Register(new SetCaptureEnabledCommandHandler(settingsCoordinator, automaticCaptureGate));
+            if (startupRegistration is not null)
+            {
+                commandBus.Register(new SetStartupEnabledCommandHandler(settingsStore, startupRegistration));
+            }
             commandBus.Register(new PersistExclusionCommandHandler(settingsCoordinator));
 
 #if DEBUG
@@ -311,10 +328,14 @@ public sealed class CompositionRoot : IAsyncDisposable
                             manifest.Files.Select(file =>
                                 $"[{file.ArchiveName}] {file.ByteCount} 字节{Environment.NewLine}" +
                                 file.Preview[..Math.Min(file.Preview.Length, 4000)]));
-                });
+                },
+                startupRegistration,
+                eventBus,
+                module.Descriptor,
+                automaticCaptureGate);
             await mainViewModel.LoadAsync();
             var recoveryCardViewModel = new RecoveryCardViewModel(
-                commandBus, clock, persistedSettings.RecoveryCardDismissSeconds);
+                commandBus, clock, persistedSettings.RecoveryCardDismissSeconds, failureHistoryStore);
             var mainWindow = new MainWindow(mainViewModel);
             var recoveryCardWindow = new RecoveryCardWindow(recoveryCardViewModel);
             CompositionRoot? root = null;
@@ -352,11 +373,12 @@ public sealed class CompositionRoot : IAsyncDisposable
     }
 
     /// <summary>仅为正式宿主同步当前用户 HKCU 登录启动设置；Debug 注入路径不触碰注册表。</summary>
-    private static void ApplyStartupRegistration(ButlerSettings settings, bool applyStartupRegistration)
+    private static RegistryStartupRegistration? ApplyStartupRegistration(
+        ButlerSettings settings, bool applyStartupRegistration)
     {
         if (!applyStartupRegistration)
         {
-            return;
+            return null;
         }
 
         var executablePath = Environment.ProcessPath
@@ -370,6 +392,8 @@ public sealed class CompositionRoot : IAsyncDisposable
         {
             startup.Disable();
         }
+
+        return startup;
     }
 
 #if DEBUG

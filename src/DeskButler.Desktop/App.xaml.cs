@@ -66,10 +66,12 @@ public partial class App : System.Windows.Application, IDisposable
             crashSentinel = new CrashSentinel(paths.RootDirectory);
 #if DEBUG
             composition = await CompositionRoot.CreateDebugAsync(
-                paths, () => _ = RequestExitAsync(), createFixture, CancellationToken.None);
+                paths, () => _ = RequestExitAsync(), createFixture,
+                crashSentinel.IsPreviousRunUnclean, CancellationToken.None);
 #else
             composition = await CompositionRoot.CreateAsync(
-                paths, () => _ = RequestExitAsync(), CancellationToken.None);
+                paths, () => _ = RequestExitAsync(),
+                crashSentinel.IsPreviousRunUnclean, CancellationToken.None);
 #endif
             await composition.StartAsync(CancellationToken.None);
             uninstallRequestServer = new UninstallRequestServer(
@@ -93,7 +95,7 @@ public partial class App : System.Windows.Application, IDisposable
                 return;
             }
 #endif
-            if (crashSentinel.IsPreviousRunUnclean)
+            if (ShouldQueryRecoveryCard(firstInstanceStarted: true, crashSentinel.IsPreviousRunUnclean))
             {
                 await composition.ShowRecoveryCardForLatestSceneAsync();
             }
@@ -179,6 +181,13 @@ public partial class App : System.Windows.Application, IDisposable
     /// <summary>维护命令与 smoke 失败仅用退出码报告，避免隐藏安装流程被对话框阻塞。</summary>
     internal static bool ShouldShowStartupFailure(string[] args, bool isSmokeRequest) =>
         !isSmokeRequest && !IsPrepareUninstallRequest(args) && !IsPrepareUpgradeRequest(args);
+
+    /// <summary>首实例对象图成功启动后始终查询恢复卡；unclean 仅属于自动捕获安全门禁。</summary>
+    internal static bool ShouldQueryRecoveryCard(bool firstInstanceStarted, bool previousRunUnclean)
+    {
+        _ = previousRunUnclean;
+        return firstInstanceStarted;
+    }
 
     /// <summary>解析数据根；Release 构建始终使用正式 LocalAppData 目录。</summary>
     internal static AppDataPaths ResolveAppDataPaths(

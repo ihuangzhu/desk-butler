@@ -2,15 +2,17 @@ using System.Collections.ObjectModel;
 using DeskButler.Application.Commands;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Time;
+using DeskButler.Core.Restore;
+using DeskButler.Core.Diagnostics;
 using DeskButler.Desktop.Hosting;
 using System.IO;
 
 namespace DeskButler.Desktop.ViewModels;
 
 /// <summary>表示恢复卡片中的一个可勾选场景项目。</summary>
-public sealed class RecoveryItemViewModel(SceneItem item) : ObservableObject
+public sealed class RecoveryItemViewModel(SceneItem item, bool failureProtected = false) : ObservableObject
 {
-    private bool isSelected = true;
+    private bool isSelected = !failureProtected;
 
     /// <summary>获取原始不可变场景项目。</summary>
     public SceneItem Item { get; } = item ?? throw new ArgumentNullException(nameof(item));
@@ -19,6 +21,12 @@ public sealed class RecoveryItemViewModel(SceneItem item) : ObservableObject
     public string DisplayName => string.IsNullOrWhiteSpace(Item.TitleHint)
         ? Path.GetFileNameWithoutExtension(Item.ExecutablePath)
         : Item.TitleHint;
+
+    /// <summary>获取连续失败保护原因；未受该保护时为空。</summary>
+    public string? ProtectionReason => failureProtected ? "连续失败 3 次，已默认取消；可手动重新勾选重试。" : null;
+
+    /// <summary>获取该项显示时是否因连续失败保护而默认取消。</summary>
+    internal bool WasFailureProtected => failureProtected;
 
     /// <summary>获取或设置本次恢复是否包含该项。</summary>
     public bool IsSelected
@@ -34,6 +42,7 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     private readonly ICommandBus commands;
     private readonly IClock clock;
     private readonly TimeSpan dismissDelay;
+    private readonly IFailureHistoryStore? failureHistoryStore;
     // 所有卡片动作共享此门，避免独立 ICommand 防重入边界互相穿透。
     private readonly SemaphoreSlim actionGate = new(1, 1);
     // 每次显示拥有独立代次；旧倒计时不得隐藏后来显示的新现场。
@@ -41,14 +50,26 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     private SceneSnapshot? scene;
     private bool isVisible;
     private string? errorMessage;
+    private string lastRestoreSummary = "尚未执行恢复";
 
     /// <summary>使用命令总线和可控时钟创建恢复卡片。</summary>
     public RecoveryCardViewModel(ICommandBus commands, IClock clock, int dismissSeconds)
+        : this(commands, clock, dismissSeconds, null)
+    {
+    }
+
+    /// <summary>使用失败历史加载边界创建可应用三次失败默认保护的恢复卡片。</summary>
+    public RecoveryCardViewModel(
+        ICommandBus commands,
+        IClock clock,
+        int dismissSeconds,
+        IFailureHistoryStore? failureHistoryStore)
     {
         this.commands = commands ?? throw new ArgumentNullException(nameof(commands));
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(dismissSeconds, 0);
         dismissDelay = TimeSpan.FromSeconds(dismissSeconds);
+        this.failureHistoryStore = failureHistoryStore;
         RestoreImmediatelyCommand = new AsyncCommand(RestoreImmediatelyAsync);
         RestoreSafelyCommand = new AsyncCommand(RestoreSafelyAsync);
         SkipCommand = new AsyncCommand(SkipAsync);
@@ -75,6 +96,13 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref errorMessage, value);
     }
 
+    /// <summary>获取最近一次逐项恢复结果摘要，供卡片和辅助技术持续呈现。</summary>
+    public string LastRestoreSummary
+    {
+        get => lastRestoreSummary;
+        private set => SetProperty(ref lastRestoreSummary, value);
+    }
+
     /// <summary>获取立即恢复命令。</summary>
     public AsyncCommand RestoreImmediatelyCommand { get; }
 
@@ -88,20 +116,22 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     public AsyncCommand ExcludePermanentlyCommand { get; }
 
     /// <summary>展示指定现场并启动只负责隐藏的倒计时。</summary>
-    public Task ShowAsync(SceneSnapshot snapshot)
+    public async Task ShowAsync(SceneSnapshot snapshot)
     {
         scene = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
+        var failureHistory = failureHistoryStore is null
+            ? FailureHistory.Empty
+            : await failureHistoryStore.LoadAsync(CancellationToken.None);
         ErrorMessage = null;
         CancelDismissTimer();
         Items.Clear();
         foreach (var item in snapshot.Items)
         {
-            Items.Add(new RecoveryItemViewModel(item));
+            Items.Add(new RecoveryItemViewModel(item, failureHistory.CountFor(item.Id) >= 3));
         }
 
         IsVisible = true;
         StartDismissTimer();
-        return Task.CompletedTask;
     }
 
     /// <summary>显式请求普通恢复当前选中项目。</summary>
@@ -169,9 +199,28 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
             var currentScene = scene;
             var selectedIds = Items.Where(item => item.IsSelected).Select(item => item.Item.Id).ToArray();
             ErrorMessage = null;
-            await commands.SendAsync(
-                new RestoreSceneCommand(currentScene, selectedIds, safeMode), CancellationToken.None);
-            Hide();
+            var explicitRetries = Items
+                .Where(item => item.WasFailureProtected && item.IsSelected)
+                .Select(item => item.Item.Id)
+                .ToHashSet(StringComparer.Ordinal);
+            var result = await commands.SendAsync(
+                new RestoreSceneCommand(currentScene, selectedIds, safeMode)
+                {
+                    ExplicitFailureRetryItemIds = explicitRetries
+                }, CancellationToken.None);
+            result ??= new RestoreResult([]);
+            LastRestoreSummary = RestoreResultSummary.Format(result);
+            var needsRetry = result.Items.Any(
+                item => item.Status is RestoreItemStatus.Failed or RestoreItemStatus.Cancelled);
+            if (needsRetry)
+            {
+                ErrorMessage = LastRestoreSummary;
+                IsVisible = true;
+            }
+            else
+            {
+                Hide();
+            }
         }
         catch (Exception exception)
         {

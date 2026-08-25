@@ -60,12 +60,16 @@
                 </Grid>
             </TabItem>
             <TabItem Header="模块">
-                <TextBlock Margin="18" Text="工作现场恢复  ·  已启用" FontSize="16" />
+                <TextBlock Margin="18" Text="{Binding ModuleStatusText}" FontSize="16" TextWrapping="Wrap" />
             </TabItem>
             <TabItem Header="设置">
                 <StackPanel Margin="18">
                     <TextBlock Text="捕获与排除设置会保存在当前 Windows 用户目录。" TextWrapping="Wrap" />
-                    <TextBlock Text="随系统启动：安装版按当前设置自动维护" Margin="0,8,0,0" Foreground="#FF66666F" />
+                    <CheckBox Content="登录 Windows 后自动启动 DeskButler"
+                              IsChecked="{Binding IsStartupEnabled, Mode=OneWay}"
+                              Command="{Binding ToggleStartupCommand}" Margin="0,12,0,0" />
+                    <TextBlock Text="{Binding StartupErrorMessage}" Margin="0,6,0,0"
+                               Foreground="#FFB42318" TextWrapping="Wrap" />
                     <TextBlock Text="永久排除列表" FontWeight="SemiBold" Margin="0,18,0,8" />
                     <ListBox ItemsSource="{Binding ExcludedExecutablePaths}" MinHeight="80" MaxHeight="220"
                              BorderBrush="#FFE4E4E7" Padding="8" />

@@ -324,6 +324,34 @@ public sealed class RestorePlannerTests
         Assert.Equal(RestoreDisposition.SkipUnsafe, item.Disposition);
     }
 
+    /// <summary>用户显式重选连续失败项时只覆盖该失败保护，不得阻止正常启动规划。</summary>
+    [Fact]
+    public void BuildAllowsExplicitRetryAfterThreeFailures()
+    {
+        var scene = SceneWith(App("flaky", @"C:\Apps\flaky.exe"));
+        var history = new FailureHistory(new Dictionary<string, int> { ["flaky"] = 3 });
+
+        var item = Assert.Single(PlannerWithExistingPaths(@"C:\Apps\flaky.exe")
+            .Build(scene, [], history, safeMode: false,
+                explicitFailureRetries: new HashSet<string> { "flaky" }).Items);
+
+        Assert.Equal(RestoreDisposition.Launch, item.Disposition);
+    }
+
+    /// <summary>显式失败重试绝不能绕过提升权限这一独立安全边界。</summary>
+    [Fact]
+    public void ExplicitFailureRetryDoesNotBypassElevatedBoundary()
+    {
+        var scene = SceneWith(App("admin", @"C:\Apps\admin.exe") with { WasElevated = true });
+        var history = new FailureHistory(new Dictionary<string, int> { ["admin"] = 3 });
+
+        var item = Assert.Single(PlannerWithExistingPaths(@"C:\Apps\admin.exe")
+            .Build(scene, [], history, safeMode: false,
+                explicitFailureRetries: new HashSet<string> { "admin" }).Items);
+
+        Assert.Equal(RestoreDisposition.SkipUnsafe, item.Disposition);
+    }
+
     /// <summary>验证失败少于三次仍允许正常规划。</summary>
     [Fact]
     public void BuildDoesNotSkipItemBeforeThirdConsecutiveFailure()

@@ -5,6 +5,34 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class PrepareUninstallCoordinatorTests
 {
+    /// <summary>同一 PID 的启动时刻已变化时视为原进程退出，不得等待无关新进程。</summary>
+    [Fact]
+    public async Task ProcessExitWaiterDoesNotWaitForReusedPid()
+    {
+        using var current = System.Diagnostics.Process.GetCurrentProcess();
+        var reusedIdentity = new UninstallProcessIdentity(
+            current.Id, current.StartTime.ToUniversalTime().AddSeconds(-1));
+
+        var exited = await new ProcessExitWaiter().WaitForExitAsync(
+            reusedIdentity, TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+        Assert.True(exited);
+        Assert.False(current.HasExited);
+    }
+
+    /// <summary>启动时刻匹配的真实原进程退出后，稳定身份等待必须完成。</summary>
+    [Fact]
+    public async Task ProcessExitWaiterCompletesForOriginalProcessIdentity()
+    {
+        using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+            "cmd.exe", "/c exit 0")
+        { CreateNoWindow = true, UseShellExecute = false })!;
+        var identity = new UninstallProcessIdentity(process.Id, process.StartTime.ToUniversalTime());
+
+        Assert.True(await new ProcessExitWaiter().WaitForExitAsync(
+            identity, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+    }
+
     /// <summary>验证无运行实例时只删除自己的启动值并释放单实例租约。</summary>
     [Fact]
     public async Task ExecuteAsync无运行实例时只清理自身启动项()
@@ -134,11 +162,11 @@ public sealed class PrepareUninstallCoordinatorTests
         await using var server = new UninstallRequestServer(pipeName, () => requested.TrySetResult());
         server.Start();
 
-        var processId = await new NamedPipeUninstallRequestClient(pipeName, Environment.ProcessPath!)
+        var processIdentity = await new NamedPipeUninstallRequestClient(pipeName, Environment.ProcessPath!)
             .RequestExitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
 
         await requested.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(Environment.ProcessId, processId);
+        Assert.Equal(Environment.ProcessId, processIdentity.ProcessId);
     }
 
     /// <summary>验证响应 PID 必须等于 Windows 从管道句柄取得的真实服务端 PID。</summary>
@@ -171,11 +199,11 @@ public sealed class PrepareUninstallCoordinatorTests
         server.Start();
         await SendInvalidRequestAsync(pipeName, "not-the-protocol");
 
-        var processId = await new NamedPipeUninstallRequestClient(pipeName, Environment.ProcessPath!)
+        var processIdentity = await new NamedPipeUninstallRequestClient(pipeName, Environment.ProcessPath!)
             .RequestExitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
 
         await requested.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(Environment.ProcessId, processId);
+        Assert.Equal(Environment.ProcessId, processIdentity.ProcessId);
     }
 
     /// <summary>验证多个断连客户端不会让服务端停止或泄漏唯一实例。</summary>
@@ -211,7 +239,7 @@ public sealed class PrepareUninstallCoordinatorTests
             .RequestExitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
 
         await requested.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
-        Assert.Equal(Environment.ProcessId, processId);
+        Assert.Equal(Environment.ProcessId, processId.ProcessId);
     }
 
     /// <summary>验证多个无效会话之间始终持有首个服务端实例，无法抢建同名管道。</summary>
@@ -256,19 +284,23 @@ public sealed class PrepareUninstallCoordinatorTests
     private sealed class RecordingRequestClient(List<string> calls, int processId) : IUninstallRequestClient
     {
         /// <summary>记录固定退出请求。</summary>
-        public Task<int> RequestExitAsync(TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<UninstallProcessIdentity> RequestExitAsync(
+            TimeSpan timeout, CancellationToken cancellationToken)
         {
             calls.Add("request");
-            return Task.FromResult(processId);
+            return Task.FromResult(new UninstallProcessIdentity(processId, DateTime.UnixEpoch));
         }
     }
 
     private sealed class RecordingProcessWaiter(List<string> calls, bool exited) : IProcessExitWaiter
     {
         /// <summary>记录目标进程和等待期限。</summary>
-        public Task<bool> WaitForExitAsync(int processId, TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<bool> WaitForExitAsync(
+            UninstallProcessIdentity processIdentity,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
         {
-            calls.Add($"wait:{processId}:{timeout.TotalSeconds:0}");
+            calls.Add($"wait:{processIdentity.ProcessId}:{timeout.TotalSeconds:0}");
             return Task.FromResult(exited);
         }
     }

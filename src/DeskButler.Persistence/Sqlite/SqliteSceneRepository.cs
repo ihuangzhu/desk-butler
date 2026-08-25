@@ -11,6 +11,7 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
 {
     private const int MaximumValidSnapshots = 3;
     private const int CandidatePageSize = 16;
+    private const int CurrentFormatVersion = 1;
     private const string CapturedAtStorageFormat = "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'";
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -66,7 +67,7 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
 
         await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
         var snapshots = new List<SceneSnapshot>(maximumCount);
-        var invalidRows = new List<SnapshotRow>();
+        var invalidRows = new List<(SnapshotRow Row, string Reason)>();
         var offset = 0;
 
         while (snapshots.Count < maximumCount)
@@ -80,16 +81,34 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
             offset += rows.Count;
             foreach (var row in rows)
             {
+                if (row.FormatVersion != CurrentFormatVersion)
+                {
+                    invalidRows.Add((row, $"unsupported-format-version:{row.FormatVersion}"));
+                    continue;
+                }
+
                 try
                 {
                     var snapshot = JsonSerializer.Deserialize<SceneSnapshot>(row.Payload, SerializerOptions)
                         ?? throw new JsonException("场景快照 JSON 为空。");
+                    if (snapshot.Id != row.Id)
+                    {
+                        invalidRows.Add((row, "row-payload-id-mismatch"));
+                        continue;
+                    }
+
+                    if (snapshot.FormatVersion != row.FormatVersion)
+                    {
+                        invalidRows.Add((row, "row-payload-format-version-mismatch"));
+                        continue;
+                    }
+
                     snapshots.Add(snapshot);
                 }
                 catch (JsonException)
                 {
                     // 原始数据必须保留；收集后再标记，避免 OFFSET 在后续页查询时因集合变化而跳过候选行。
-                    invalidRows.Add(row);
+                    invalidRows.Add((row, "payload-json-invalid"));
                 }
 
                 if (snapshots.Count == maximumCount)
@@ -101,7 +120,7 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
 
         foreach (var invalidRow in invalidRows)
         {
-            await MarkInvalidAsync(invalidRow.Id, "场景快照数据无法读取。", cancellationToken).ConfigureAwait(false);
+            await MarkInvalidAsync(invalidRow.Row.Id, invalidRow.Reason, cancellationToken).ConfigureAwait(false);
         }
 
         return snapshots;
@@ -226,7 +245,7 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT id, payload_json
+            SELECT id, format_version, payload_json, is_valid, invalid_reason
             FROM scene_snapshots
             WHERE is_valid = 1
             ORDER BY captured_at DESC, id DESC
@@ -238,7 +257,9 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
         var rows = new List<SnapshotRow>();
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            rows.Add(new SnapshotRow(Guid.Parse(reader.GetString(0)), reader.GetString(1)));
+            rows.Add(new SnapshotRow(
+                Guid.Parse(reader.GetString(0)), reader.GetInt32(1), reader.GetString(2),
+                reader.GetInt64(3) != 0, reader.IsDBNull(4) ? null : reader.GetString(4)));
         }
 
         return rows;
@@ -254,6 +275,10 @@ public sealed class SqliteSceneRepository : ISceneRepository, IDisposable
 
     /// <summary>表示从数据库读取但尚未反序列化的快照行。</summary>
     /// <param name="Id">快照唯一标识。</param>
+    /// <param name="FormatVersion">数据库行声明的格式版本。</param>
     /// <param name="Payload">快照 JSON 内容。</param>
-    private sealed record SnapshotRow(Guid Id, string Payload);
+    /// <param name="IsValid">数据库行当前有效标志。</param>
+    /// <param name="InvalidReason">数据库行当前无效原因。</param>
+    private sealed record SnapshotRow(
+        Guid Id, int FormatVersion, string Payload, bool IsValid, string? InvalidReason);
 }

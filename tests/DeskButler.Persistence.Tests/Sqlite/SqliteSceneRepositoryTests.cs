@@ -67,6 +67,40 @@ public sealed class SqliteSceneRepositoryTests
         Assert.Equal(1L, await fixture.GetInt64Async($"SELECT COUNT(*) FROM scene_snapshots WHERE id = '{snapshot.Id:D}';"));
     }
 
+    /// <summary>未知未来格式必须保留原始 payload 并以稳定原因标记无效，不能参与恢复。</summary>
+    [Fact]
+    public async Task GetRecentAsyncPreservesFutureFormatPayloadAsInvalid()
+    {
+        await using var fixture = await RepositoryFixture.CreateAsync();
+        var snapshot = SceneFactory.AtMinute(1) with { FormatVersion = 2 };
+        var payload = JsonSerializer.Serialize(snapshot, TestSerializerOptions).Replace("'", "''", StringComparison.Ordinal);
+        await fixture.ExecuteSqlAsync(
+            $"INSERT INTO scene_snapshots(id,captured_at,capture_reason,format_version,payload_json,is_valid) " +
+            $"VALUES('{snapshot.Id:D}','2026-08-24T09:01:00.0000000Z','future',2,'{payload}',1);");
+
+        Assert.Empty(await fixture.Repository.GetRecentAsync(10, CancellationToken.None));
+        Assert.Equal("unsupported-format-version:2", await fixture.GetStringAsync(
+            $"SELECT invalid_reason FROM scene_snapshots WHERE id='{snapshot.Id:D}';"));
+        Assert.Equal(payload.Replace("''", "'", StringComparison.Ordinal), await fixture.GetStringAsync(
+            $"SELECT payload_json FROM scene_snapshots WHERE id='{snapshot.Id:D}';"));
+    }
+
+    /// <summary>行 ID 与 payload ID 不一致时必须保留行并拒绝恢复。</summary>
+    [Fact]
+    public async Task GetRecentAsyncRejectsRowAndPayloadIdMismatch()
+    {
+        await using var fixture = await RepositoryFixture.CreateAsync();
+        var snapshot = SceneFactory.AtMinute(1);
+        await fixture.Repository.SaveAsync(snapshot, CancellationToken.None);
+        var otherId = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        await fixture.ExecuteSqlAsync(
+            $"UPDATE scene_snapshots SET id='{otherId:D}' WHERE id='{snapshot.Id:D}';");
+
+        Assert.Empty(await fixture.Repository.GetRecentAsync(10, CancellationToken.None));
+        Assert.Equal("row-payload-id-mismatch", await fixture.GetStringAsync(
+            $"SELECT invalid_reason FROM scene_snapshots WHERE id='{otherId:D}';"));
+    }
+
     /// <summary>验证最新候选快照损坏时，读取会继续查找并返回请求数量的下一份有效快照。</summary>
     [Fact]
     public async Task GetRecentAsyncSkipsMalformedNewestSnapshotWithoutConsumingValidResultLimit()
@@ -268,6 +302,16 @@ public sealed class SqliteSceneRepositoryTests
             return Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
         }
 
+        /// <summary>执行返回单个字符串的测试查询。</summary>
+        public async Task<string> GetStringAsync(string sql)
+        {
+            await using var connection = new SqliteConnection($"Data Source={Paths.DatabasePath}");
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            return Convert.ToString(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture)!;
+        }
+
         /// <summary>删除测试夹具创建的临时应用数据目录。</summary>
         /// <returns>释放完成的任务。</returns>
         public ValueTask DisposeAsync()
@@ -314,7 +358,7 @@ public sealed class SqliteSceneRepositoryTests
         {
             return new SceneSnapshot(
                 Guid.Parse("b1de59e3-c158-46c2-ae0d-469daa7974db"),
-                7,
+                1,
                 new DateTimeOffset(2026, 8, 24, 10, 45, 30, TimeSpan.FromHours(8)),
                 "用户手动保存",
                 [

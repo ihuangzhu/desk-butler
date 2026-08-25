@@ -3,8 +3,13 @@ using DeskButler.Application.Commands;
 using DeskButler.Core.Persistence;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
+using DeskButler.Core.Restore;
 using DeskButler.Desktop.Hosting;
 using System.Globalization;
+using DeskButler.Infrastructure.Windows.Startup;
+using DeskButler.Application.Events;
+using DeskButler.Application.Modules;
+using DeskButler.Modules.WorkspaceRecovery;
 
 namespace DeskButler.Desktop.ViewModels;
 
@@ -30,10 +35,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly IUiDispatcher dispatcher;
     private readonly NotifyingSceneRepository? notifyingRepository;
     private readonly Func<CancellationToken, Task<string>> diagnosticPreviewLoader;
+    private readonly IStartupRegistration? startupRegistration;
+    private readonly IDisposable? moduleStatusSubscription;
+    private readonly AutomaticCaptureGate? automaticCaptureGate;
     private bool isCapturePaused;
     private string statusText = "就绪";
     private string healthStatusText;
     private string diagnosticPreviewText = "点击“预览诊断内容”查看即将导出的脱敏类别。";
+    private bool isStartupEnabled;
+    private string? startupErrorMessage;
+    private string moduleStatusText = "模块状态正在初始化";
 
     /// <summary>使用实际仓库、命令总线和设置存储创建主界面模型。</summary>
     public MainViewModel(ISceneRepository repository, ICommandBus commands, ISettingsStore settingsStore)
@@ -48,13 +59,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ISettingsStore settingsStore,
         IUiDispatcher dispatcher,
         string? healthWarning = null,
-        Func<CancellationToken, Task<string>>? diagnosticPreviewLoader = null)
+        Func<CancellationToken, Task<string>>? diagnosticPreviewLoader = null,
+        IStartupRegistration? startupRegistration = null,
+        IEventBus? eventBus = null,
+        ModuleDescriptor? moduleDescriptor = null,
+        AutomaticCaptureGate? automaticCaptureGate = null)
     {
         this.repository = repository ?? throw new ArgumentNullException(nameof(repository));
         this.commands = commands ?? throw new ArgumentNullException(nameof(commands));
         this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         this.dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         this.diagnosticPreviewLoader = diagnosticPreviewLoader ?? (_ => Task.FromResult("当前没有可预览的诊断文件。"));
+        this.startupRegistration = startupRegistration;
+        this.automaticCaptureGate = automaticCaptureGate;
+        if (eventBus is not null && moduleDescriptor is not null)
+        {
+            ModuleStatusText = $"{moduleDescriptor.DisplayName} {moduleDescriptor.Version} · 正在启动";
+            moduleStatusSubscription = eventBus.Subscribe<ModuleStatusChanged>(
+                "main-view-model", (status, _) => HandleModuleStatusAsync(moduleDescriptor, status));
+        }
         healthStatusText = healthWarning ?? "数据库与本地服务运行正常";
         notifyingRepository = repository as NotifyingSceneRepository;
         if (notifyingRepository is not null)
@@ -69,6 +92,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 : Task.CompletedTask);
         RefreshCommand = new AsyncCommand(LoadAsync);
         LoadDiagnosticsCommand = new AsyncCommand(LoadDiagnosticsAsync);
+        ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync);
     }
 
     /// <summary>获取最新优先且最多三份的现场历史。</summary>
@@ -114,6 +138,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref diagnosticPreviewText, value);
     }
 
+    /// <summary>获取当前权威登录启动注册状态。</summary>
+    public bool IsStartupEnabled
+    {
+        get => isStartupEnabled;
+        private set => SetProperty(ref isStartupEnabled, value);
+    }
+
+    /// <summary>获取最近一次登录启动切换错误。</summary>
+    public string? StartupErrorMessage
+    {
+        get => startupErrorMessage;
+        private set => SetProperty(ref startupErrorMessage, value);
+    }
+
+    /// <summary>获取真实模块描述与最近生命周期状态。</summary>
+    public string ModuleStatusText
+    {
+        get => moduleStatusText;
+        private set => SetProperty(ref moduleStatusText, value);
+    }
+
     /// <summary>获取立即保存命令。</summary>
     public AsyncCommand SaveNowCommand { get; }
 
@@ -129,12 +174,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>获取加载诊断包脱敏预览的命令。</summary>
     public AsyncCommand LoadDiagnosticsCommand { get; }
 
+    /// <summary>获取切换登录启动的键盘可执行命令。</summary>
+    public AsyncCommand ToggleStartupCommand { get; }
+
     /// <summary>加载设置与最近三份有效现场。</summary>
     public async Task LoadAsync()
     {
         var settings = await settingsStore.LoadAsync(CancellationToken.None);
         var scenes = await repository.GetRecentAsync(3, CancellationToken.None);
-        IsCapturePaused = !settings.CaptureEnabled;
+        IsCapturePaused = !settings.CaptureEnabled || (automaticCaptureGate?.IsPaused ?? false);
+        if (automaticCaptureGate?.IsPaused == true)
+        {
+            StatusText = automaticCaptureGate.PauseReason ?? "自动捕获因安全模式暂停";
+        }
+        IsStartupEnabled = startupRegistration?.IsEnabled ?? settings.StartupEnabled;
         ExcludedExecutablePaths.Clear();
         foreach (var path in settings.ExcludedExecutablePaths.Order(StringComparer.OrdinalIgnoreCase))
         {
@@ -160,10 +213,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task RestoreSceneAsync(SceneSummaryViewModel scene, bool safeMode = false)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        await commands.SendAsync(
+        var result = await commands.SendAsync(
             new RestoreSceneCommand(scene.Scene, scene.Scene.Items.Select(item => item.Id).ToArray(), safeMode),
             CancellationToken.None);
-        StatusText = "恢复请求已完成";
+        StatusText = RestoreResultSummary.Format(result ?? new RestoreResult([]));
     }
 
     /// <summary>切换并持久化捕获暂停状态。</summary>
@@ -173,6 +226,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await commands.SendAsync(new SetCaptureEnabledCommand(enable), CancellationToken.None);
         IsCapturePaused = !enable;
         StatusText = enable ? "已继续捕获" : "已暂停捕获";
+    }
+
+    /// <summary>切换登录启动；失败时重新读取权威注册状态并显示可理解错误。</summary>
+    public async Task ToggleStartupAsync()
+    {
+        try
+        {
+            IsStartupEnabled = await commands.SendAsync(
+                new SetStartupEnabledCommand(!IsStartupEnabled), CancellationToken.None);
+            StartupErrorMessage = null;
+            StatusText = IsStartupEnabled ? "已启用登录启动" : "已禁用登录启动";
+        }
+        catch (Exception exception)
+        {
+            var settings = await settingsStore.LoadAsync(CancellationToken.None);
+            IsStartupEnabled = startupRegistration?.IsEnabled ?? settings.StartupEnabled;
+            StartupErrorMessage = $"登录启动设置失败：{exception.Message}";
+            StatusText = StartupErrorMessage;
+        }
     }
 
     /// <summary>加载白名单诊断文件的脱敏预览，不在此步骤创建或上传 ZIP。</summary>
@@ -192,10 +264,32 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>解除自动保存通知，退出后不再排队 UI 工作。</summary>
     public void Dispose()
     {
+        moduleStatusSubscription?.Dispose();
         if (notifyingRepository is not null)
         {
             notifyingRepository.SceneSaved -= OnSceneSaved;
         }
+    }
+
+    /// <summary>把共享事件总线的模块状态投影回 UI 线程。</summary>
+    private Task HandleModuleStatusAsync(ModuleDescriptor descriptor, ModuleStatusChanged status)
+    {
+        if (!StringComparer.Ordinal.Equals(descriptor.Id, status.ModuleId))
+        {
+            return Task.CompletedTask;
+        }
+
+        dispatcher.Post(() =>
+        {
+            ModuleStatusText = status.State switch
+            {
+                ModuleRunState.Running => $"{descriptor.DisplayName} {descriptor.Version} · 运行中",
+                ModuleRunState.Stopped => $"{descriptor.DisplayName} {descriptor.Version} · 已停止",
+                _ => $"{descriptor.DisplayName} {descriptor.Version} · 失败：{status.ErrorMessage}"
+            };
+            return Task.CompletedTask;
+        });
+        return Task.CompletedTask;
     }
 
     /// <summary>将后台保存通知切回 UI Dispatcher，并隔离刷新故障。</summary>

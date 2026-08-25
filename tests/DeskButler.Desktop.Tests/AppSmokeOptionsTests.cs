@@ -4,6 +4,15 @@ namespace DeskButler.Desktop.Tests;
 
 public sealed class AppSmokeOptionsTests
 {
+    /// <summary>首实例完成启动后无论上次是否干净都必须查询最新有效快照。</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StartedFirstInstanceAlwaysQueriesRecoveryCard(bool previousRunUnclean)
+    {
+        Assert.True(App.ShouldQueryRecoveryCard(firstInstanceStarted: true, previousRunUnclean));
+    }
+
     /// <summary>smoke 未显式指定隔离 data-root 时必须在对象图启动前拒绝。</summary>
     [Fact]
     public void SmokeWithoutExplicitDataRootIsRejected()

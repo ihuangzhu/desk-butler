@@ -7,6 +7,8 @@ using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
 using DeskButler.Modules.WorkspaceRecovery.Capture;
 using DeskButler.Modules.WorkspaceRecovery.Restore;
+using DeskButler.Modules.WorkspaceRecovery;
+using DeskButler.Infrastructure.Windows.Startup;
 using System.IO;
 
 namespace DeskButler.Desktop.Hosting;
@@ -18,10 +20,17 @@ public sealed record SaveSceneNowCommand : ICommand<bool>;
 public sealed record RestoreSceneCommand(
     SceneSnapshot Scene,
     IReadOnlyList<string> SelectedItemIds,
-    bool SafeMode) : ICommand<RestoreResult>;
+    bool SafeMode) : ICommand<RestoreResult>
+{
+    /// <summary>获取用户在卡片中明确重新勾选、仅允许覆盖连续失败保护的项目。</summary>
+    public IReadOnlySet<string> ExplicitFailureRetryItemIds { get; init; } = new HashSet<string>();
+}
 
 /// <summary>请求持久化捕获启用状态。</summary>
 public sealed record SetCaptureEnabledCommand(bool IsEnabled) : ICommand<bool>;
+
+/// <summary>请求以可补偿事务切换当前用户登录启动。</summary>
+public sealed record SetStartupEnabledCommand(bool IsEnabled) : ICommand<bool>;
 
 /// <summary>请求永久排除一个可执行文件路径。</summary>
 public sealed record PersistExclusionCommand(string ExecutablePath) : ICommand<bool>;
@@ -144,7 +153,9 @@ public sealed class RestoreSceneCommandHandler : ICommandHandler<RestoreSceneCom
         };
         var currentWindows = await inventory.CaptureAsync(cancellationToken).ConfigureAwait(false);
         var failureHistory = await failureHistoryStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-        var plan = planner.Build(selectedScene, currentWindows, failureHistory, command.SafeMode);
+        var plan = planner.Build(
+            selectedScene, currentWindows, failureHistory, command.SafeMode,
+            command.ExplicitFailureRetryItemIds);
         var result = await executor.ExecuteAsync(plan, cancellationToken).ConfigureAwait(false);
         try
         {
@@ -264,6 +275,7 @@ internal static class ExecutablePathExclusions
 public sealed class SetCaptureEnabledCommandHandler : ICommandHandler<SetCaptureEnabledCommand, bool>
 {
     private readonly SettingsCoordinator settings;
+    private readonly AutomaticCaptureGate? automaticCaptureGate;
 
     /// <summary>使用独立设置存储创建处理器，适合小型宿主或测试。</summary>
     public SetCaptureEnabledCommandHandler(ISettingsStore store)
@@ -273,8 +285,17 @@ public sealed class SetCaptureEnabledCommandHandler : ICommandHandler<SetCapture
 
     /// <summary>使用共享串行设置协调器创建处理器。</summary>
     public SetCaptureEnabledCommandHandler(SettingsCoordinator settings)
+        : this(settings, null)
+    {
+    }
+
+    /// <summary>使用共享设置协调器，并在用户明确继续时解除运行期安全门禁。</summary>
+    public SetCaptureEnabledCommandHandler(
+        SettingsCoordinator settings,
+        AutomaticCaptureGate? automaticCaptureGate)
     {
         this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        this.automaticCaptureGate = automaticCaptureGate;
     }
 
     /// <inheritdoc />
@@ -282,7 +303,61 @@ public sealed class SetCaptureEnabledCommandHandler : ICommandHandler<SetCapture
     {
         await settings.UpdateAsync(
             current => current with { CaptureEnabled = command.IsEnabled }, cancellationToken).ConfigureAwait(false);
+        if (command.IsEnabled)
+        {
+            automaticCaptureGate?.Resume();
+        }
+
         return true;
+    }
+}
+
+/// <summary>同时维护 JSON 设置与唯一 HKCU Run 值，失败时恢复原状态。</summary>
+public sealed class SetStartupEnabledCommandHandler : ICommandHandler<SetStartupEnabledCommand, bool>
+{
+    private readonly ISettingsStore settingsStore;
+    private readonly IStartupRegistration startupRegistration;
+
+    /// <summary>使用设置存储和当前用户启动注册边界创建处理器。</summary>
+    public SetStartupEnabledCommandHandler(
+        ISettingsStore settingsStore,
+        IStartupRegistration startupRegistration)
+    {
+        this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
+        this.startupRegistration = startupRegistration ?? throw new ArgumentNullException(nameof(startupRegistration));
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> HandleAsync(SetStartupEnabledCommand command, CancellationToken cancellationToken)
+    {
+        var originalSettings = await settingsStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var originalRegistration = startupRegistration.IsEnabled;
+        try
+        {
+            await settingsStore.SaveAsync(
+                originalSettings with { StartupEnabled = command.IsEnabled }, cancellationToken).ConfigureAwait(false);
+            SetRegistration(command.IsEnabled);
+            return startupRegistration.IsEnabled;
+        }
+        catch
+        {
+            await settingsStore.SaveAsync(originalSettings, CancellationToken.None).ConfigureAwait(false);
+            SetRegistration(originalRegistration);
+            throw;
+        }
+    }
+
+    /// <summary>只调用 DeskButler 启动注册边界，不接触其他 Run 值。</summary>
+    private void SetRegistration(bool enabled)
+    {
+        if (enabled)
+        {
+            startupRegistration.Enable();
+        }
+        else
+        {
+            startupRegistration.Disable();
+        }
     }
 }
 

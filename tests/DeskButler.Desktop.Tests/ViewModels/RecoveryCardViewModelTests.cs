@@ -1,10 +1,85 @@
 using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.ViewModels;
+using DeskButler.Application.Commands;
+using DeskButler.Core.Restore;
+using DeskButler.Core.Diagnostics;
 
 namespace DeskButler.Desktop.Tests.ViewModels;
 
 public sealed class RecoveryCardViewModelTests
 {
+    /// <summary>卡片加载时连续失败三次的项目必须默认不选并解释保护原因。</summary>
+    [Fact]
+    public async Task ShowDefaultsThreeFailureItemToUnselectedWithReason()
+    {
+        var clock = new FakeClock();
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000043", clock.UtcNow,
+            @"C:\Apps\Editor.exe");
+        var history = new FixedFailureHistoryStore(new FailureHistory(
+            new Dictionary<string, int> { [scene.Items[0].Id] = 3 }));
+        var vm = new RecoveryCardViewModel(new RecordingCommandBus(), clock, 15, history);
+
+        await vm.ShowAsync(scene);
+
+        Assert.False(vm.Items[0].IsSelected);
+        Assert.Contains("连续失败 3 次", vm.Items[0].ProtectionReason, StringComparison.Ordinal);
+    }
+
+    private sealed class FixedFailureHistoryStore(FailureHistory history) : IFailureHistoryStore
+    {
+        /// <inheritdoc />
+        public Task<FailureHistory> LoadAsync(CancellationToken cancellationToken) => Task.FromResult(history);
+
+        /// <inheritdoc />
+        public Task RecordAsync(RestoreResult result, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    /// <summary>全失败结果必须保留卡片、数量摘要和诊断原因，维持唯一重试入口。</summary>
+    [Fact]
+    public async Task AllFailedResultKeepsRetryCardAndShowsReason()
+    {
+        var clock = new FakeClock();
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000041", clock.UtcNow,
+            @"C:\Apps\Editor.exe");
+        var vm = new RecoveryCardViewModel(
+            new ResultBus(new RestoreResult([new(scene.Items[0].Id, RestoreItemStatus.Failed, "启动超时")])),
+            clock, 15);
+        await vm.ShowAsync(scene);
+
+        await vm.RestoreImmediatelyAsync();
+
+        Assert.True(vm.IsVisible);
+        Assert.Contains("失败 1", vm.ErrorMessage, StringComparison.Ordinal);
+        Assert.Contains("启动超时", vm.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    /// <summary>取消结果必须保留卡片，全成功结果才可隐藏。</summary>
+    [Theory]
+    [InlineData(RestoreItemStatus.Cancelled, true, "取消 1")]
+    [InlineData(RestoreItemStatus.Succeeded, false, "成功 1")]
+    public async Task ResultVisibilityFollowsRetryability(
+        RestoreItemStatus status, bool expectedVisible, string expectedSummary)
+    {
+        var clock = new FakeClock();
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000042", clock.UtcNow,
+            @"C:\Apps\Editor.exe");
+        var vm = new RecoveryCardViewModel(
+            new ResultBus(new RestoreResult([new(scene.Items[0].Id, status, "用户取消")])), clock, 15);
+        await vm.ShowAsync(scene);
+
+        await vm.RestoreImmediatelyAsync();
+
+        Assert.Equal(expectedVisible, vm.IsVisible);
+        Assert.Contains(expectedSummary, vm.LastRestoreSummary, StringComparison.Ordinal);
+    }
+
+    private sealed class ResultBus(RestoreResult result) : ICommandBus
+    {
+        /// <inheritdoc />
+        public Task<TResponse> SendAsync<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken) =>
+            Task.FromResult((TResponse)(object)result);
+    }
+
     /// <summary>未加载任何现场时误触恢复入口不得显示空卡或发送无效命令。</summary>
     [Fact]
     public async Task RestoreWithoutSceneRemainsHiddenAndDoesNotSendCommand()

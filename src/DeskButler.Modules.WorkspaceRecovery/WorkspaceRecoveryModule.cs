@@ -22,6 +22,7 @@ public sealed class WorkspaceRecoveryModule : IModule
     private readonly CaptureCoordinator coordinator;
     private readonly IClock clock;
     private readonly TimeSpan finalFlushTimeout;
+    private readonly AutomaticCaptureGate automaticCaptureGate;
     private bool subscriptionPending;
     private bool subscribed;
     private bool stopped;
@@ -38,7 +39,18 @@ public sealed class WorkspaceRecoveryModule : IModule
         SnapshotScheduler scheduler,
         CaptureCoordinator coordinator,
         IClock clock)
-        : this(desktopChangeSource, scheduler, coordinator, clock, DefaultFinalFlushTimeout)
+        : this(desktopChangeSource, scheduler, coordinator, clock, new AutomaticCaptureGate(false), DefaultFinalFlushTimeout)
+    {
+    }
+
+    /// <summary>创建绑定进程内自动捕获门禁的工作区恢复模块。</summary>
+    public WorkspaceRecoveryModule(
+        IDesktopChangeSource desktopChangeSource,
+        SnapshotScheduler scheduler,
+        CaptureCoordinator coordinator,
+        IClock clock,
+        AutomaticCaptureGate automaticCaptureGate)
+        : this(desktopChangeSource, scheduler, coordinator, clock, automaticCaptureGate, DefaultFinalFlushTimeout)
     {
     }
 
@@ -54,17 +66,35 @@ public sealed class WorkspaceRecoveryModule : IModule
         CaptureCoordinator coordinator,
         IClock clock,
         TimeSpan finalFlushTimeout)
+        : this(desktopChangeSource, scheduler, coordinator, clock, new AutomaticCaptureGate(false), finalFlushTimeout)
+    {
+    }
+
+    /// <summary>创建使用指定运行期门禁和最终刷新上限的工作区恢复模块。</summary>
+    public WorkspaceRecoveryModule(
+        IDesktopChangeSource desktopChangeSource,
+        SnapshotScheduler scheduler,
+        CaptureCoordinator coordinator,
+        IClock clock,
+        AutomaticCaptureGate automaticCaptureGate,
+        TimeSpan finalFlushTimeout)
     {
         this.desktopChangeSource = desktopChangeSource ?? throw new ArgumentNullException(nameof(desktopChangeSource));
         this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        this.automaticCaptureGate = automaticCaptureGate ?? throw new ArgumentNullException(nameof(automaticCaptureGate));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(finalFlushTimeout, TimeSpan.Zero);
         this.finalFlushTimeout = finalFlushTimeout;
     }
 
     /// <inheritdoc />
     public string Id => "workspace-recovery";
+
+    /// <inheritdoc />
+    public ModuleDescriptor Descriptor { get; } = new(
+        "workspace-recovery", "工作现场恢复", new Version(1, 0), true,
+        ["窗口捕获", "现场恢复"], ["捕获开关", "永久排除"], ["最近失败", "快照健康"]);
 
     /// <summary>获取模块边界或后台调度器最近一次可观察失败。</summary>
     public Exception? LastFailure
@@ -198,6 +228,11 @@ public sealed class WorkspaceRecoveryModule : IModule
     {
         try
         {
+            if (automaticCaptureGate.IsPaused)
+            {
+                return;
+            }
+
             scheduler.NotifyDesktopChanged();
         }
         catch (Exception exception)
@@ -244,6 +279,11 @@ public sealed class WorkspaceRecoveryModule : IModule
     {
         await scheduler.StopAsync(cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
+        if (automaticCaptureGate.IsPaused)
+        {
+            return;
+        }
+
         await coordinator.SaveNowAsync("module-stop", cancellationToken).ConfigureAwait(false);
     }
 

@@ -31,13 +31,13 @@ internal sealed class PrepareUninstallCoordinator(
             return;
         }
 
-        var processId = await requestClient.RequestExitAsync(timeout, cancellationToken);
-        if (processId <= 0 || processId == Environment.ProcessId)
+        var processIdentity = await requestClient.RequestExitAsync(timeout, cancellationToken);
+        if (processIdentity.ProcessId <= 0 || processIdentity.ProcessId == Environment.ProcessId)
         {
             throw new InvalidOperationException("卸载退出通道返回了无效的 DeskButler 进程身份。");
         }
 
-        if (!await processExitWaiter.WaitForExitAsync(processId, timeout, cancellationToken))
+        if (!await processExitWaiter.WaitForExitAsync(processIdentity, timeout, cancellationToken))
         {
             throw new TimeoutException("DeskButler 运行实例未在卸载准备超时内干净退出。");
         }
@@ -56,14 +56,20 @@ internal sealed class PrepareUninstallCoordinator(
 internal interface IUninstallRequestClient
 {
     /// <summary>请求运行实例干净退出，并返回被请求实例的进程号。</summary>
-    Task<int> RequestExitAsync(TimeSpan timeout, CancellationToken cancellationToken);
+    Task<UninstallProcessIdentity> RequestExitAsync(TimeSpan timeout, CancellationToken cancellationToken);
 }
+
+/// <summary>绑定经管道验证时观察到的 PID 与进程启动时刻，阻止后续 PID 复用。</summary>
+internal sealed record UninstallProcessIdentity(int ProcessId, DateTime StartTimeUtc);
 
 /// <summary>等待已明确识别的单个进程自然退出。</summary>
 internal interface IProcessExitWaiter
 {
     /// <summary>在限时内等待指定进程退出，绝不终止该进程。</summary>
-    Task<bool> WaitForExitAsync(int processId, TimeSpan timeout, CancellationToken cancellationToken);
+    Task<bool> WaitForExitAsync(
+        UninstallProcessIdentity processIdentity,
+        TimeSpan timeout,
+        CancellationToken cancellationToken);
 }
 
 /// <summary>通过当前用户专属命名管道发送固定卸载请求。</summary>
@@ -73,7 +79,8 @@ internal sealed class NamedPipeUninstallRequestClient(string pipeName, string ex
     internal const string ProtocolRequest = "prepare-uninstall-v1";
 
     /// <inheritdoc />
-    public async Task<int> RequestExitAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    public async Task<UninstallProcessIdentity> RequestExitAsync(
+        TimeSpan timeout, CancellationToken cancellationToken)
     {
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutSource.CancelAfter(timeout);
@@ -90,7 +97,8 @@ internal sealed class NamedPipeUninstallRequestClient(string pipeName, string ex
                     new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
             }
 
-            VerifyServerExecutable(checked((int)serverProcessId), expectedExecutablePath);
+            var processIdentity = VerifyServerExecutable(
+                checked((int)serverProcessId), expectedExecutablePath);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true)
             {
                 AutoFlush = true
@@ -106,7 +114,7 @@ internal sealed class NamedPipeUninstallRequestClient(string pipeName, string ex
             {
                 throw new InvalidDataException("卸载退出通道响应的 PID 与 Windows 识别的服务端 PID 不一致。");
             }
-            return responseProcessId;
+            return processIdentity;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -115,7 +123,7 @@ internal sealed class NamedPipeUninstallRequestClient(string pipeName, string ex
     }
 
     /// <summary>验证服务端进程的可执行文件与当前维护客户端完全相同。</summary>
-    private static void VerifyServerExecutable(int processId, string expectedPath)
+    private static UninstallProcessIdentity VerifyServerExecutable(int processId, string expectedPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(expectedPath);
         using var process = Process.GetProcessById(processId);
@@ -126,6 +134,8 @@ internal sealed class NamedPipeUninstallRequestClient(string pipeName, string ex
         {
             throw new InvalidDataException("命名管道服务端不是当前 DeskButler 可执行文件。");
         }
+
+        return new UninstallProcessIdentity(processId, process.StartTime.ToUniversalTime());
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -161,14 +171,14 @@ internal sealed class ProcessExitWaiter : IProcessExitWaiter
 {
     /// <inheritdoc />
     public async Task<bool> WaitForExitAsync(
-        int processId,
+        UninstallProcessIdentity processIdentity,
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
         Process process;
         try
         {
-            process = Process.GetProcessById(processId);
+            process = Process.GetProcessById(processIdentity.ProcessId);
         }
         catch (ArgumentException)
         {
@@ -178,6 +188,12 @@ internal sealed class ProcessExitWaiter : IProcessExitWaiter
         using (process)
         using (var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
         {
+            if (process.StartTime.ToUniversalTime() != processIdentity.StartTimeUtc)
+            {
+                // 原进程已经退出且 PID 被复用；不得等待或影响无关新进程。
+                return true;
+            }
+
             timeoutSource.CancelAfter(timeout);
             try
             {

@@ -1,10 +1,141 @@
 using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.ViewModels;
+using DeskButler.Application.Commands;
+using DeskButler.Core.Restore;
+using DeskButler.Infrastructure.Windows.Startup;
 
 namespace DeskButler.Desktop.Tests.ViewModels;
 
 public sealed class MainViewModelTests
 {
+    /// <summary>登录启动命令启用时必须同时提交 JSON 与唯一注册值。</summary>
+    [Fact]
+    public async Task StartupToggleHandlerEnablesSettingsAndRegistration()
+    {
+        var store = new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default with
+        {
+            StartupEnabled = false
+        });
+        var registration = new FakeStartupRegistration(false);
+        var handler = new SetStartupEnabledCommandHandler(store, registration);
+
+        Assert.True(await handler.HandleAsync(new SetStartupEnabledCommand(true), CancellationToken.None));
+        Assert.True(store.Current.StartupEnabled);
+        Assert.True(registration.IsEnabled);
+    }
+
+    /// <summary>注册失败时必须补偿恢复 JSON、注册状态与 UI 可用的返回错误边界。</summary>
+    [Fact]
+    public async Task StartupToggleHandlerRollsBackSettingsWhenRegistrationFails()
+    {
+        var store = new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default with
+        {
+            StartupEnabled = false
+        });
+        var registration = new FakeStartupRegistration(false) { FailEnable = true };
+        var handler = new SetStartupEnabledCommandHandler(store, registration);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => handler.HandleAsync(new SetStartupEnabledCommand(true), CancellationToken.None));
+
+        Assert.False(store.Current.StartupEnabled);
+        Assert.False(registration.IsEnabled);
+    }
+
+    /// <summary>登录启动命令禁用时必须同步提交 JSON 与注册值。</summary>
+    [Fact]
+    public async Task StartupToggleHandlerDisablesSettingsAndRegistration()
+    {
+        var store = new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default);
+        var registration = new FakeStartupRegistration(true);
+        var handler = new SetStartupEnabledCommandHandler(store, registration);
+
+        Assert.False(await handler.HandleAsync(new SetStartupEnabledCommand(false), CancellationToken.None));
+        Assert.False(store.Current.StartupEnabled);
+        Assert.False(registration.IsEnabled);
+    }
+
+    /// <summary>设置保存失败时注册表与原 JSON 状态必须保持不变。</summary>
+    [Fact]
+    public async Task StartupToggleHandlerKeepsRegistrationWhenSettingsSaveFails()
+    {
+        var original = DeskButler.Core.Settings.ButlerSettings.Default;
+        var store = new FailOnceSettingsStore(original);
+        var registration = new FakeStartupRegistration(true);
+        var handler = new SetStartupEnabledCommandHandler(store, registration);
+
+        await Assert.ThrowsAsync<IOException>(
+            () => handler.HandleAsync(new SetStartupEnabledCommand(false), CancellationToken.None));
+
+        Assert.Equal(original, store.Current);
+        Assert.True(registration.IsEnabled);
+    }
+
+    private sealed class FailOnceSettingsStore(DeskButler.Core.Settings.ButlerSettings initial)
+        : DeskButler.Core.Settings.ISettingsStore
+    {
+        private int failuresRemaining = 1;
+        internal DeskButler.Core.Settings.ButlerSettings Current { get; private set; } = initial;
+
+        /// <inheritdoc />
+        public Task<DeskButler.Core.Settings.ButlerSettings> LoadAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Current);
+
+        /// <inheritdoc />
+        public Task SaveAsync(
+            DeskButler.Core.Settings.ButlerSettings settings, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Exchange(ref failuresRemaining, 0) == 1)
+            {
+                Current = settings;
+                throw new IOException("设置写入失败");
+            }
+
+            Current = settings;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeStartupRegistration(bool enabled) : IStartupRegistration
+    {
+        public bool FailEnable { get; init; }
+        public bool IsEnabled { get; private set; } = enabled;
+        /// <inheritdoc />
+        public void Enable()
+        {
+            if (FailEnable) throw new InvalidOperationException("注册表写入失败");
+            IsEnabled = true;
+        }
+        /// <inheritdoc />
+        public void Disable() => IsEnabled = false;
+    }
+
+    /// <summary>首页恢复必须消费逐项结果并保留部分失败原因，而不是报告无条件完成。</summary>
+    [Fact]
+    public async Task RestoreSceneAsyncSummarizesPartialFailureWithReason()
+    {
+        var scene = SceneFactory.Create("00000000-0000-0000-0000-000000000031", DateTimeOffset.UtcNow,
+            @"C:\Apps\Editor.exe", @"C:\Apps\Browser.exe");
+        var result = new RestoreResult([
+            new(scene.Items[0].Id, RestoreItemStatus.Succeeded),
+            new(scene.Items[1].Id, RestoreItemStatus.Failed, "窗口定位失败")]);
+        var vm = new MainViewModel(new InMemorySceneRepository(scene), new RestoreResultCommandBus(result),
+            new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default));
+
+        await vm.RestoreSceneAsync(new SceneSummaryViewModel(scene));
+
+        Assert.Contains("成功 1", vm.StatusText, StringComparison.Ordinal);
+        Assert.Contains("失败 1", vm.StatusText, StringComparison.Ordinal);
+        Assert.Contains("窗口定位失败", vm.StatusText, StringComparison.Ordinal);
+    }
+
+    private sealed class RestoreResultCommandBus(RestoreResult result) : ICommandBus
+    {
+        /// <inheritdoc />
+        public Task<TResponse> SendAsync<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken) =>
+            Task.FromResult((TResponse)(object)result);
+    }
+
     /// <summary>初始化只加载最近三份现场，并保留仓库的最新优先顺序。</summary>
     [Fact]
     public async Task LoadAsyncExposesOnlyThreeMostRecentScenes()

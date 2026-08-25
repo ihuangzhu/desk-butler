@@ -17,5 +17,6 @@ public interface IRestorePlanner
         SceneSnapshot scene,
         IReadOnlyCollection<WindowCandidate> currentWindows,
         FailureHistory failureHistory,
-        bool safeMode);
+        bool safeMode,
+        IReadOnlySet<string>? explicitFailureRetries = null);
 }

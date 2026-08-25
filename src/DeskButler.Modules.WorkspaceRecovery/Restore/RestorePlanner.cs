@@ -29,7 +29,8 @@ public sealed class RestorePlanner : IRestorePlanner
         SceneSnapshot scene,
         IReadOnlyCollection<WindowCandidate> currentWindows,
         FailureHistory failureHistory,
-        bool safeMode)
+        bool safeMode,
+        IReadOnlySet<string>? explicitFailureRetries = null)
     {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(currentWindows);
@@ -43,7 +44,7 @@ public sealed class RestorePlanner : IRestorePlanner
         var decisions = new RestorePlanItem?[sceneItems.Length];
         var consumedHandles = new HashSet<nint>();
 
-        MarkPersistedUnsafeItems(sceneItems, failureHistory, decisions);
+        MarkPersistedUnsafeItems(sceneItems, failureHistory, explicitFailureRetries, decisions);
         MatchExplorerPaths(sceneItems, candidates, decisions, consumedHandles);
         MatchExecutableClassAndTitle(sceneItems, candidates, decisions, consumedHandles);
         MatchUniqueExecutables(sceneItems, candidates, decisions, consumedHandles);
@@ -57,11 +58,14 @@ public sealed class RestorePlanner : IRestorePlanner
     private static void MarkPersistedUnsafeItems(
         IReadOnlyList<SceneProjection> sceneItems,
         FailureHistory failureHistory,
+        IReadOnlySet<string>? explicitFailureRetries,
         RestorePlanItem?[] decisions)
     {
         foreach (var scene in sceneItems)
         {
-            if (scene.Item.WasElevated || failureHistory.CountFor(scene.Item.Id) >= UnsafeFailureThreshold)
+            var failureProtected = failureHistory.CountFor(scene.Item.Id) >= UnsafeFailureThreshold &&
+                !(explicitFailureRetries?.Contains(scene.Item.Id) ?? false);
+            if (scene.Item.WasElevated || failureProtected)
             {
                 decisions[scene.Index] = Decision(scene.Item, RestoreDisposition.SkipUnsafe);
             }
