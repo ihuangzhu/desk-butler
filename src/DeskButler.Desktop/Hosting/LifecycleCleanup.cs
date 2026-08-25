@@ -10,20 +10,93 @@ internal sealed record CleanupStep(string Name, Func<ValueTask> RunAsync);
 internal sealed class BestEffortAsyncCleanup(IEnumerable<CleanupStep> steps)
 {
     private readonly CleanupState[] states = steps.Select(step => new CleanupState(step)).ToArray();
+    private readonly object syncRoot = new();
+    private Task? inFlight;
 
     /// <summary>获取所有步骤是否均已成功完成。</summary>
-    internal bool IsComplete => states.All(state => state.Completed);
+    internal bool IsComplete
+    {
+        get
+        {
+            lock (syncRoot)
+            {
+                return inFlight is null && states.All(state => state.Completed);
+            }
+        }
+    }
 
-    /// <summary>执行全部未完成步骤，并在最后汇总本轮错误。</summary>
-    internal async ValueTask RunAsync()
+    /// <summary>共享一个正在执行的清理 pass；全部完成后直接幂等返回。</summary>
+    internal ValueTask RunAsync()
+    {
+        Task sharedPass;
+        TaskCompletionSource? completion = null;
+        lock (syncRoot)
+        {
+            if (inFlight is not null)
+            {
+                return new ValueTask(inFlight);
+            }
+
+            if (states.All(state => state.Completed))
+            {
+                return ValueTask.CompletedTask;
+            }
+
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            sharedPass = completion.Task;
+            inFlight = sharedPass;
+        }
+
+        // 必须先发布 inFlight 再在锁外调用资源代码，确保同步重入也只看到同一个 pass。
+        _ = RunPassAndCompleteAsync(completion);
+        return new ValueTask(sharedPass);
+    }
+
+    /// <summary>执行一次 pass，并在所有步骤与聚合完成后开放失败步骤重试。</summary>
+    private async Task RunPassAndCompleteAsync(TaskCompletionSource completion)
+    {
+        try
+        {
+            await RunPassAsync().ConfigureAwait(false);
+            completion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
+        finally
+        {
+            lock (syncRoot)
+            {
+                if (ReferenceEquals(inFlight, completion.Task))
+                {
+                    inFlight = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>按既定顺序尝试全部未完成步骤，并汇总本次 pass 的错误。</summary>
+    private async Task RunPassAsync()
     {
         var failures = new List<Exception>();
-        foreach (var state in states.Where(state => !state.Completed))
+        foreach (var state in states)
         {
+            lock (syncRoot)
+            {
+                if (state.Completed)
+                {
+                    continue;
+                }
+            }
+
             try
             {
-                await state.Step.RunAsync();
-                state.Completed = true;
+                await state.Step.RunAsync().ConfigureAwait(false);
+                lock (syncRoot)
+                {
+                    state.Completed = true;
+                }
             }
             catch (Exception exception)
             {

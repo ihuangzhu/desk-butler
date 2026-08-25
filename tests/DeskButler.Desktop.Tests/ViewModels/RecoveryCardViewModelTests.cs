@@ -440,6 +440,67 @@ public sealed class RecoveryCardViewModelTests
         Assert.Empty(restoreCommand.SelectedItemIds);
     }
 
+    /// <summary>旧卡片项目排队期间若新卡片已发布，不得取消新选择或持久化旧路径。</summary>
+    [Fact]
+    public async Task StaleExclusionQueuedBehindNewShowDoesNotPersistOldItem()
+    {
+        var firstExclusionStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirstExclusion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commands = new ControlledCommandBus(async command =>
+        {
+            if (command is PersistExclusionCommand exclusion &&
+                exclusion.ExecutablePath == @"C:\Apps\GateHolder.exe")
+            {
+                firstExclusionStarted.TrySetResult();
+                await releaseFirstExclusion.Task.WaitAsync(TestContext.Current.CancellationToken);
+            }
+        });
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(commands, clock, 15);
+        var older = SceneFactory.Create("00000000-0000-0000-0000-000000000060", clock.UtcNow,
+            @"C:\Apps\GateHolder.exe", @"C:\Apps\Stale.exe");
+        var newer = SceneFactory.Create("00000000-0000-0000-0000-000000000061", clock.UtcNow,
+            @"C:\Apps\Current.exe");
+        await vm.ShowAsync(older);
+        var staleItem = vm.Items[1];
+
+        var gateHolder = vm.ExcludePermanentlyAsync(vm.Items[0]);
+        await firstExclusionStarted.Task;
+        var newShow = vm.ShowAsync(newer);
+        var staleExclusion = vm.ExcludePermanentlyAsync(staleItem);
+
+        releaseFirstExclusion.TrySetResult();
+        await Task.WhenAll(gateHolder, newShow, staleExclusion);
+
+        var exclusions = commands.SentCommands.OfType<PersistExclusionCommand>().ToArray();
+        Assert.Equal([@"C:\Apps\GateHolder.exe"], exclusions.Select(item => item.ExecutablePath));
+        Assert.Equal([newer.Items[0].Id], vm.Items.Select(item => item.Item.Id));
+        Assert.True(vm.Items[0].IsSelected);
+        Assert.Null(vm.ErrorMessage);
+    }
+
+    /// <summary>同代次但不属于当前集合的伪造项目不得改变选择或持久化路径。</summary>
+    [Fact]
+    public async Task ExclusionRequiresSamePublishedItemInstance()
+    {
+        var commands = new RecordingCommandBus();
+        var clock = new FakeClock();
+        var vm = new RecoveryCardViewModel(commands, clock, 15);
+        await vm.ShowAsync(SceneFactory.Create("00000000-0000-0000-0000-000000000062", clock.UtcNow,
+            @"C:\Apps\Current.exe"));
+        var publishedItem = vm.Items[0];
+        var mismatchedItem = new RecoveryItemViewModel(
+            publishedItem.Item, failureProtected: false,
+            publicationIdentity: publishedItem.PublicationIdentity);
+
+        await vm.ExcludePermanentlyAsync(mismatchedItem);
+
+        Assert.True(publishedItem.IsSelected);
+        Assert.True(mismatchedItem.IsSelected);
+        Assert.Empty(commands.SentCommands);
+        Assert.Null(vm.ErrorMessage);
+    }
+
     /// <summary>恢复失败时卡片与选择必须保留并显示错误，随后可原地重试成功。</summary>
     [Fact]
     public async Task FailedRestoreKeepsCardVisibleAndAllowsRetry()

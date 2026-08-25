@@ -95,6 +95,7 @@ public sealed class SettingsCoordinator : IDisposable
                 try
                 {
                     SetRegistration(registration, originalRegistration);
+                    EnsureRegistrationState(registration, originalRegistration);
                 }
                 catch (Exception rollbackFailure)
                 {
@@ -104,6 +105,8 @@ public sealed class SettingsCoordinator : IDisposable
                 try
                 {
                     await store.SaveAsync(originalSettings, CancellationToken.None).ConfigureAwait(false);
+                    var restoredSettings = await store.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+                    EnsureStartupSettingState(restoredSettings, originalSettings.StartupEnabled);
                 }
                 catch (Exception rollbackFailure)
                 {
@@ -144,6 +147,15 @@ public sealed class SettingsCoordinator : IDisposable
         if (registration.IsEnabled != enabled)
         {
             throw new InvalidOperationException("登录启动注册未达到请求状态。");
+        }
+    }
+
+    /// <summary>核实补偿保存后的登录启动设置已恢复原值，静默存储失败也必须进入聚合诊断。</summary>
+    private static void EnsureStartupSettingState(ButlerSettings settings, bool enabled)
+    {
+        if (settings.StartupEnabled != enabled)
+        {
+            throw new InvalidOperationException("登录启动设置未恢复到原始状态。");
         }
     }
 

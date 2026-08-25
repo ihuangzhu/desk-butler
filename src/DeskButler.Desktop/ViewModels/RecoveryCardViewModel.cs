@@ -10,12 +10,28 @@ using System.IO;
 namespace DeskButler.Desktop.ViewModels;
 
 /// <summary>表示恢复卡片中的一个可勾选场景项目。</summary>
-public sealed class RecoveryItemViewModel(SceneItem item, bool failureProtected = false) : ObservableObject
+public sealed class RecoveryItemViewModel : ObservableObject
 {
-    private bool isSelected = !failureProtected;
+    private readonly bool failureProtected;
+    private bool isSelected;
+
+    /// <summary>使用原始场景项目与可选失败保护创建公开项目模型。</summary>
+    public RecoveryItemViewModel(SceneItem item, bool failureProtected = false)
+        : this(item, failureProtected, 0)
+    {
+    }
+
+    /// <summary>使用恢复卡内部发布代次创建项目模型。</summary>
+    internal RecoveryItemViewModel(SceneItem item, bool failureProtected, long publicationIdentity)
+    {
+        Item = item ?? throw new ArgumentNullException(nameof(item));
+        this.failureProtected = failureProtected;
+        isSelected = !failureProtected;
+        PublicationIdentity = publicationIdentity;
+    }
 
     /// <summary>获取原始不可变场景项目。</summary>
-    public SceneItem Item { get; } = item ?? throw new ArgumentNullException(nameof(item));
+    public SceneItem Item { get; }
 
     /// <summary>获取便于用户识别的窗口标题。</summary>
     public string DisplayName => string.IsNullOrWhiteSpace(Item.TitleHint)
@@ -27,6 +43,9 @@ public sealed class RecoveryItemViewModel(SceneItem item, bool failureProtected 
 
     /// <summary>获取该项显示时是否因连续失败保护而默认取消。</summary>
     internal bool WasFailureProtected => failureProtected;
+
+    /// <summary>获取创建该项的恢复卡发布代次，供排队动作识别过期项目。</summary>
+    internal long PublicationIdentity { get; }
 
     /// <summary>获取或设置本次恢复是否包含该项。</summary>
     public bool IsSelected
@@ -49,6 +68,8 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     private readonly object lifecycleSync = new();
     // 显示请求只允许最后发起者发布，避免较慢历史读取让界面倒退。
     private long latestShowRequest;
+    // 已原子发布到 scene 与 Items 的显示代次；排队动作必须与它匹配。
+    private long publishedShowRequest;
     // 每次显示拥有独立代次；旧倒计时不得隐藏后来显示的新现场。
     private CancellationTokenSource? dismissSource;
     private SceneSnapshot? scene;
@@ -135,7 +156,8 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
             ? FailureHistory.Empty
             : await failureHistoryStore.LoadAsync(CancellationToken.None);
         var candidateItems = snapshot.Items
-            .Select(item => new RecoveryItemViewModel(item, failureHistory.CountFor(item.Id) >= 3))
+            .Select(item => new RecoveryItemViewModel(
+                item, failureHistory.CountFor(item.Id) >= 3, request))
             .ToArray();
 
         await actionGate.WaitAsync();
@@ -150,6 +172,7 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
                 }
 
                 scene = snapshot;
+                publishedShowRequest = request;
                 Items.Clear();
                 if (IsDisposed)
                 {
@@ -210,13 +233,16 @@ public sealed class RecoveryCardViewModel : ObservableObject, IDisposable
     public async Task ExcludePermanentlyAsync(RecoveryItemViewModel item)
     {
         ArgumentNullException.ThrowIfNull(item);
+        var publicationIdentity = item.PublicationIdentity;
         await actionGate.WaitAsync();
         try
         {
             string executablePath;
             lock (lifecycleSync)
             {
-                if (IsDisposed)
+                if (IsDisposed ||
+                    publicationIdentity != publishedShowRequest ||
+                    !Items.Contains(item))
                 {
                     return;
                 }

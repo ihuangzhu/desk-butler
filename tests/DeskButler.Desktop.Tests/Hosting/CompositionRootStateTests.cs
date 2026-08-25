@@ -337,6 +337,53 @@ public sealed class CompositionRootStateTests
         Assert.Equal(1, calls.Count(call => call == "diagnostic-log:dispose"));
     }
 
+    /// <summary>启动失败回滚与外部释放重叠时必须共享清理 pass，并各自观察一致结果。</summary>
+    [Fact]
+    public async Task StartupFailureCleanupOverlappingDisposeRunsEachStepOnce()
+    {
+        var cleanupStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupCalls = 0;
+        var startupFailure = new IOException("desktop start failed");
+        var cleanup = new BestEffortAsyncCleanup(
+        [
+            new CleanupStep("shared", async () =>
+            {
+                Interlocked.Increment(ref cleanupCalls);
+                cleanupStarted.TrySetResult();
+                await releaseCleanup.Task.WaitAsync(TestContext.Current.CancellationToken);
+            })
+        ]);
+        var startup = new CompositionStartupCoordinator(
+            _ => Task.CompletedTask,
+            _ => Task.CompletedTask,
+            () => { },
+            () => { },
+            _ => Task.FromException(startupFailure),
+            () => ValueTask.CompletedTask);
+
+        var start = startup.StartAsync(cleanup, CancellationToken.None);
+        await cleanupStarted.Task.WaitAsync(TestContext.Current.CancellationToken);
+        var dispose = cleanup.RunAsync().AsTask();
+        try
+        {
+            Assert.Equal(1, Volatile.Read(ref cleanupCalls));
+            Assert.False(start.IsCompleted);
+            Assert.False(dispose.IsCompleted);
+        }
+        finally
+        {
+            releaseCleanup.TrySetResult();
+        }
+
+        var thrown = await Assert.ThrowsAsync<IOException>(() => start);
+        await dispose;
+
+        Assert.Same(startupFailure, thrown);
+        Assert.Equal(1, Volatile.Read(ref cleanupCalls));
+        Assert.True(cleanup.IsComplete);
+    }
+
     /// <summary>Report 正在创建任务时 Drain 必须等待登记完成且不得遗漏该任务。</summary>
     [Fact]
     public async Task ModuleDiagnosticDrainWaitsForTaskCreationAndRegistration()
@@ -606,6 +653,81 @@ public sealed class CompositionRootStateTests
         Assert.False(updated.CaptureEnabled);
     }
 
+    /// <summary>注册目标失败后的静默无效注册回滚必须作为独立补偿故障，并释放设置门。</summary>
+    [Fact]
+    public async Task StartupTargetFailureDetectsSilentRegistrationRollbackMismatch()
+    {
+        var targetFailure = new InvalidOperationException("注册目标失败");
+        var store = new InMemorySettingsStore(
+            ButlerSettings.Default with { StartupEnabled = false });
+        var registration = new ChangeThenThrowNoOpRollbackStartupRegistration(targetFailure);
+        using var settings = new SettingsCoordinator(store);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() =>
+            settings.SetStartupEnabledAsync(registration, true, CancellationToken.None));
+        var updated = await settings.UpdateAsync(
+            current => current with { CaptureEnabled = false }, CancellationToken.None);
+
+        Assert.Equal(2, error.InnerExceptions.Count);
+        Assert.Same(targetFailure, error.InnerExceptions[0]);
+        Assert.Contains("注册", error.InnerExceptions[1].Message, StringComparison.Ordinal);
+        Assert.True(registration.RollbackAttempted);
+        Assert.True(registration.IsEnabled);
+        Assert.False(updated.CaptureEnabled);
+    }
+
+    /// <summary>目标保存失败后的静默无效设置回滚必须重载发现错误值，并释放设置门。</summary>
+    [Fact]
+    public async Task StartupSaveFailureDetectsSilentSettingsRollbackMismatch()
+    {
+        var targetFailure = new IOException("目标保存失败");
+        var store = new SilentRollbackSettingsStore(
+            ButlerSettings.Default with { StartupEnabled = false }, targetFailure);
+        var registration = new RecordingStartupRegistration(false);
+        using var settings = new SettingsCoordinator(store);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() =>
+            settings.SetStartupEnabledAsync(registration, true, CancellationToken.None));
+        var updated = await settings.UpdateAsync(
+            current => current with { CaptureEnabled = false }, CancellationToken.None);
+
+        Assert.Equal(2, error.InnerExceptions.Count);
+        Assert.Same(targetFailure, error.InnerExceptions[0]);
+        Assert.Contains("设置", error.InnerExceptions[1].Message, StringComparison.Ordinal);
+        Assert.False(registration.IsEnabled);
+        Assert.True(store.RollbackAttempted);
+        Assert.Equal(CancellationToken.None, store.RollbackReloadToken);
+        Assert.True(store.Current.StartupEnabled);
+        Assert.False(updated.CaptureEnabled);
+    }
+
+    /// <summary>注册与设置静默回滚同时失效时必须保留两个诊断且原始失败仍位于首位。</summary>
+    [Fact]
+    public async Task StartupSaveFailurePreservesBothSilentCompensationMismatches()
+    {
+        var targetFailure = new IOException("目标保存失败");
+        var store = new SilentRollbackSettingsStore(
+            ButlerSettings.Default with { StartupEnabled = false }, targetFailure);
+        var registration = new NoOpRollbackStartupRegistration(false);
+        using var settings = new SettingsCoordinator(store);
+
+        var error = await Assert.ThrowsAsync<AggregateException>(() =>
+            settings.SetStartupEnabledAsync(registration, true, CancellationToken.None));
+        var updated = await settings.UpdateAsync(
+            current => current with { CaptureEnabled = false }, CancellationToken.None);
+
+        Assert.Equal(3, error.InnerExceptions.Count);
+        Assert.Same(targetFailure, error.InnerExceptions[0]);
+        Assert.Contains("注册", error.InnerExceptions[1].Message, StringComparison.Ordinal);
+        Assert.Contains("设置", error.InnerExceptions[2].Message, StringComparison.Ordinal);
+        Assert.True(registration.RollbackAttempted);
+        Assert.True(registration.IsEnabled);
+        Assert.True(store.RollbackAttempted);
+        Assert.Equal(CancellationToken.None, store.RollbackReloadToken);
+        Assert.True(store.Current.StartupEnabled);
+        Assert.False(updated.CaptureEnabled);
+    }
+
     /// <summary>注册调用静默无效时必须在保存目标 JSON 前失败，独立补偿并释放设置门。</summary>
     [Fact]
     public async Task StartupNoOpRegistrationMismatchCompensatesAndReleasesGate()
@@ -724,6 +846,84 @@ public sealed class CompositionRootStateTests
 
         /// <inheritdoc />
         public void Disable() => IsEnabled = false;
+    }
+
+    private sealed class ChangeThenThrowNoOpRollbackStartupRegistration(Exception targetFailure)
+        : IStartupRegistration
+    {
+        /// <inheritdoc />
+        public bool IsEnabled { get; private set; }
+
+        internal bool RollbackAttempted { get; private set; }
+
+        /// <inheritdoc />
+        public void Enable()
+        {
+            IsEnabled = true;
+            throw targetFailure;
+        }
+
+        /// <inheritdoc />
+        public void Disable() => RollbackAttempted = true;
+    }
+
+    private sealed class NoOpRollbackStartupRegistration(bool enabled) : IStartupRegistration
+    {
+        /// <inheritdoc />
+        public bool IsEnabled { get; private set; } = enabled;
+
+        internal bool RollbackAttempted { get; private set; }
+
+        /// <inheritdoc />
+        public void Enable() => IsEnabled = true;
+
+        /// <inheritdoc />
+        public void Disable() => RollbackAttempted = true;
+    }
+
+    private sealed class SilentRollbackSettingsStore(
+        ButlerSettings initial,
+        Exception targetFailure) : ISettingsStore
+    {
+        private int loadCount;
+        private int saveCount;
+
+        internal ButlerSettings Current { get; private set; } = initial;
+
+        internal bool RollbackAttempted { get; private set; }
+
+        internal CancellationToken? RollbackReloadToken { get; private set; }
+
+        /// <inheritdoc />
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref loadCount) == 2)
+            {
+                RollbackReloadToken = cancellationToken;
+            }
+
+            return Task.FromResult(Current);
+        }
+
+        /// <inheritdoc />
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken)
+        {
+            var call = Interlocked.Increment(ref saveCount);
+            if (call == 1)
+            {
+                Current = settings;
+                throw targetFailure;
+            }
+
+            if (call == 2)
+            {
+                RollbackAttempted = true;
+                return Task.CompletedTask;
+            }
+
+            Current = settings;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class NoOpTargetStartupRegistration(
