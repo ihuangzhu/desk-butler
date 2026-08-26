@@ -2,13 +2,14 @@
 
 本页只记录已有证据。状态为 `PENDING`、`BLOCK` 或 `NEEDS_USER_CONFIRMATION` 的项目不能写成通过。
 
-| 范围 | 状态 | 截至 2026-08-25 的证据 |
+| 范围 | 状态 | 截至 2026-08-27 的证据 |
 |---|---|---|
-| Windows 10 x64 19045 自动快速测试 | PASS | 最终状态一致性修复后的 Release 套件：420 总计、417 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误。 |
+| Windows 10 x64 19045 自动快速测试 | PASS | 本轮最终 `verify-release.cmd`：636 总计、633 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误，publish 与 Inno Setup 7.1.0 成功。 |
 | Windows 10 受控短交互 | PASS | Debug/Release 的两个受控窗口、Explorer 往返和 150% DPI 定位通过，窗口四边误差门槛 8 物理像素。 |
-| 30 分钟资源验证 | PASS | 独立 workload PID；10,000 次通知、100 次捕获、3 份有效快照；末五次句柄 `[331,334,337,340,334]`，最终回落。 |
+| Windows 10 常驻应用专用 VM 链 | PENDING | 本轮未启动真实 QQ、微信或富途，也未执行缩托盘发现、顺序、去重、主动退出、立即启动例外或第三方卸载存活验证。 |
+| 本构建 30 分钟资源验证 | PENDING | Release 套件按显式 `DESKBUTLER_RUN_LONG_E2E=1` 门禁跳过；旧构建证据不能替代本轮含常驻功能的 30 分钟实测。 |
 | Windows 11 x64 | PENDING | 当前机器不是 Windows 11，尚未执行真实 Windows 11 清单。 |
-| 干净账户安装/升级/保留与删除卸载 | BLOCK | 当前账户已有真实数据，且没有可用 Sandbox/专用测试账户；只读门禁阻止继续。 |
+| 干净账户安装/升级/保留与删除卸载 | BLOCK | 当前账户不是获准的专用干净 VM；未执行真实安装或卸载。自动契约覆盖默认保留整个数据根与 `/DELETEUSERDATA=1` 精确删除，但不等同于实体链。 |
 | 真实重启恢复 | NEEDS_USER_CONFIRMATION | 已停在重启前清单；没有调用重启、注销或关机命令。 |
 | 诊断 ZIP 用户导出与 bundle id | PENDING | 脱敏预览已实现；当前 UI 没有 ZIP 导出按钮，人工清单尚无 bundle id。 |
 | 产品代码签名 | PENDING | Inno 编译器签名有效；DeskButler 安装器本身未签名。 |
@@ -30,4 +31,4 @@
 
 ## 发布判定
 
-恢复卡快照、设置并发/补偿和模块生命周期观察的内部状态一致性缺口已纳入自动测试；这不会替代外部环境证据。当前只能称“本地 release candidate / 自动化候选”。正式发布至少还需要：Windows 11 清单 PASS、干净专用账户安装与删除链 PASS、用户当下确认后的真实重启 PASS、诊断 bundle 导出链闭环、产品代码签名，并由独立审查确认结果。任何 `BLOCK/PENDING/NEEDS_USER_CONFIRMATION` 都不能折算成 PASS。
+恢复卡快照、常驻应用发现/设置/登录批次、设置并发补偿和模块生命周期观察的内部状态一致性缺口已纳入自动测试；这不会替代外部环境证据。当前只能称“本地 release candidate / 自动化候选”。正式发布至少还需要：Windows 10 专用 VM 的 QQ/微信/富途完整清单 PASS、Windows 11 独立清单 PASS、干净专用账户安装与删除链 PASS、用户当下确认后的真实重启 PASS、本构建 30 分钟资源测试 PASS、诊断 bundle 导出链闭环、产品代码签名，并由独立审查确认结果。任何 `BLOCK/PENDING/NEEDS_USER_CONFIRMATION` 都不能折算成 PASS。

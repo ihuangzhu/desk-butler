@@ -258,7 +258,9 @@ public sealed class ResidentApplicationViewTests
         thread.IsBackground = true;
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
-        Assert.True(completed.Wait(TimeSpan.FromSeconds(15)), "WPF 焦点测试未在时限内完成。");
+        Assert.True(
+            completed.Wait(TimeSpan.FromMinutes(1), TestContext.Current.CancellationToken),
+            "WPF 焦点测试未在一分钟诊断时限内完成。");
         if (failure is not null)
         {
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();

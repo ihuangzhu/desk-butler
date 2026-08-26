@@ -20,15 +20,18 @@ DeskButler 0.1.0 的长期工作现场、设置和诊断保存在当前 Windows 
 
 同一数据库的 `failure_history` 只包含场景项目 id 和连续失败次数（1–3），不是逐次恢复结果明细。成功恢复会清除此项目计数；失败会增加计数；跳过和取消不改变计数。
 
-`settings.json` 包含：是否捕获、是否登录启动、恢复卡隐藏秒数、永久排除的可执行文件完整路径列表。损坏设置会改名保留为 `settings.corrupt-<时间>-<随机>.json`，然后使用默认设置。
+`settings.json` 包含：是否捕获、是否登录启动、恢复卡隐藏秒数、永久排除的可执行文件完整路径列表；常驻应用部分还包含总开关 `residentApplicationsEnabled`，以及每项的显示名 `displayName`、实际启动入口 `launchPath`、用于判断产品已运行的完整路径集合 `knownProcessPaths`、启用状态 `enabled` 和启动顺序 `launchOrder`。这些路径会透露安装目录、用户名或软件名称。损坏设置会改名保留为 `settings.corrupt-<时间>-<随机>.json`，然后使用默认设置。
 
-结构化日志每条包含时间、级别、类别、消息和经过校验的属性。0.1.0 实际写入的是异常健康事件：桌面变化检测失败及异常类型、数据库恢复健康警告及故障备份目录名，以及“恢复已完成但失败历史未能持久化”及异常类型；它不会记录每个恢复项目的成功、失败、取消状态或恢复错误明细。标题和路径会存入本机数据库；日志消息或属性也可能间接透露备份名、程序名或目录结构，因此这些内容都应按敏感信息处理。标题可能暴露文档名，路径可能暴露用户名、客户名或项目结构。
+`resident-launch-session.json` 保存当前 Windows 登录会话的一批固定启动证据：格式版本、`logonSessionId`（当前进程 token 的 Authentication LUID 十六进制字符串）、`completed`，以及固定 `plan` 中每项经过 SHA-256 转换、不含原始路径的 `launchIdentity` 和 `attempted`。Authentication LUID 只是 Windows 分配给本地登录会话的标识，不是账号 token、登录凭据或可用于认证的秘密。它用于保证同一登录会话只自动处理一批；文件本身不保存第三方账号、命令行或启动参数。
+
+结构化日志每条包含时间、级别、类别、消息和经过校验的属性。0.1.0 实际写入桌面变化检测失败、数据库恢复健康警告、失败历史持久化异常，以及常驻设置正规化分类、候选/诊断数量摘要和常驻启动结果。常驻启动单项日志可能包含显示名、以 `%USERPROFILE%` 替换用户目录前缀后的启动路径、结果与异常类型；批次日志不写 LUID、异常消息或原始计划。恢复日志不会记录每个恢复项目的成功、失败、取消状态或恢复错误明细。标题和路径会存入本机数据库；日志消息或属性也可能间接透露备份名、程序名或目录结构，因此这些内容都应按敏感信息处理。标题可能暴露文档名，路径可能暴露用户名、客户名或项目结构。
 
 `run.lock` 只含随机运行 token、进程 id 和 UTC 启动时间，用于识别上次非正常退出；它不是账号 token。正常退出时按持有的文件身份删除。`database-recovery.marker.json` 保存格式版本、恢复 id、备份完整路径、恢复阶段，以及各证据的文件名、长度、SHA-256。恢复成功后删除；恢复中断或失败时保留，以便下次安全继续。
 
 以下文件是原子写入或互斥所需的短期文件：
 
 - `settings.json.tmp` 是保存设置时生成的完整新设置；替换成功或正常返回/报错时由 `finally` 删除，但若进程或电脑在写入中突然中止，可能残留。
+- `resident-launch-session.json.tmp` 是保存固定常驻启动计划、`attempted` 或 `completed` 状态时生成的完整新会话文件；原子替换成功或正常返回/报错时会删除，进程或电脑突然中止时可能残留。
 - `database-recovery.marker.json.tmp` 是写入恢复阶段 marker 时生成的完整新 marker；移动成功或正常返回/报错时由 `finally` 删除，突然中止时可能残留。
 - `diagnostics\logs\deskbutler.writer.lock` 是日志单写者锁；程序不会向它写入内容，新建时为空。日志对象存活期间以独占、关闭即删除方式持有；正常退出乃至进程终止后句柄关闭时应消失，只有文件系统或清理异常时才可能看见残留。
 
@@ -38,6 +41,9 @@ DeskButler 0.1.0 的长期工作现场、设置和诊断保存在当前 Windows 
 - `%LOCALAPPDATA%\DeskButler\deskbutler.db-wal`、`deskbutler.db-shm`（SQLite 运行时可能出现）
 - `%LOCALAPPDATA%\DeskButler\settings.json`
 - `%LOCALAPPDATA%\DeskButler\settings.json.tmp`（仅设置保存期间；突然中止时可能残留）
+- `%LOCALAPPDATA%\DeskButler\resident-launch-session.json`（当前登录会话固定计划、`attempted` 与 `completed`）
+- `%LOCALAPPDATA%\DeskButler\resident-launch-session.json.tmp`（仅会话文件原子保存期间；突然中止时可能残留）
+- `%LOCALAPPDATA%\DeskButler\resident-launch-session.corrupt-*.json`（仅会话文件损坏且证据保全成功时）
 - `%LOCALAPPDATA%\DeskButler\run.lock`
 - `%LOCALAPPDATA%\DeskButler\database-recovery.marker.json`（仅恢复中断时）
 - `%LOCALAPPDATA%\DeskButler\database-recovery.marker.json.tmp`（仅 marker 原子写入期间；突然中止时可能残留）
@@ -51,11 +57,13 @@ DeskButler 0.1.0 的长期工作现场、设置和诊断保存在当前 Windows 
 
 每次打开已有数据库时，模式检查会把当时存在的主库、WAL、SHM **完整复制**到新的 `%TEMP%\DeskButler.SchemaInspection\<随机 GUID>`，只读检查完成或正常报错时在 `finally` 中递归删除该 GUID 目录。若应用崩溃、进程被强制结束或电脑突然断电，目录可能来不及删除并保留数据库中的全部敏感字段。确认 DeskButler 已完全退出后，可以在资源管理器中检查 `%TEMP%\DeskButler.SchemaInspection`，只删除其中确认属于已结束检查的旧 GUID 子目录；这些临时副本不用于数据库故障恢复。
 
+若 `resident-launch-session.json` 损坏，DeskButler 会先把原文件移动为唯一的 `resident-launch-session.corrupt-*` 证据，再为当前 Authentication LUID 写入已完成的空计划；本次登录不会自动启动常驻应用。若证据无法移动，程序保持原文件不变并停止本次自动启动，不会用新内容覆盖故障证据。
+
 程序文件默认位于 `%LOCALAPPDATA%\Programs\DeskButler`，开始菜单快捷方式位于当前用户开始菜单目录。登录启动只维护 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下名为 `DeskButler` 的一个值。
 
 ## 明确不存储
 
-不存储屏幕截图或录像、键盘输入、鼠标轨迹、剪贴板、文档正文、未保存内容、完整命令行、账号 token、密码或远程控制凭据。首版也没有云同步、遥测账号或远程命令通道。
+不存储屏幕截图或录像、键盘输入、鼠标轨迹、剪贴板、文档正文、未保存内容、完整命令行、账号 token、密码或远程控制凭据。常驻会话中的 Authentication LUID 不是账号 token。首版也没有云同步、遥测账号或远程命令通道。
 
 ## 诊断白名单、脱敏和预览
 

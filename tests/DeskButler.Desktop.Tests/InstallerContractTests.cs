@@ -67,7 +67,39 @@ public sealed class InstallerContractTests
         Assert.Contains("RegDeleteValue(HKCU, 'Software\\Microsoft\\Windows\\CurrentVersion\\Run', 'DeskButler')",
             script, StringComparison.Ordinal);
         Assert.DoesNotContain("taskkill", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("schtasks", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Schedule.Service", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("sc.exe", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("[Services]", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("QQ.exe", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("WeChat.exe", script, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Futu", script, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("HKLM", script, StringComparison.OrdinalIgnoreCase);
+
+        var runValueDeletes = script
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => line.Contains("RegDeleteValue(", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        Assert.Single(runValueDeletes);
+        Assert.Equal(
+            "RegDeleteValue(HKCU, 'Software\\Microsoft\\Windows\\CurrentVersion\\Run', 'DeskButler');",
+            runValueDeletes[0]);
+    }
+
+    /// <summary>验证发布卸载夹具覆盖常驻设置与登录批次文件的保留和精确删除语义。</summary>
+    [Fact]
+    public void 卸载夹具覆盖整个常驻数据根的保留与删除()
+    {
+        var fixture = ReadUninstallFixture();
+
+        Assert.Contains("residentSettingsMarker", fixture, StringComparison.Ordinal);
+        Assert.Contains("'settings.json'", fixture, StringComparison.Ordinal);
+        Assert.Contains("residentLaunchSessionMarker", fixture, StringComparison.Ordinal);
+        Assert.Contains("'resident-launch-session.json'", fixture, StringComparison.Ordinal);
+        Assert.Contains("Default uninstall did not preserve resident settings.", fixture, StringComparison.Ordinal);
+        Assert.Contains("Default uninstall did not preserve the resident launch session.", fixture, StringComparison.Ordinal);
+        Assert.Contains("Delete-data uninstall left resident settings behind.", fixture, StringComparison.Ordinal);
+        Assert.Contains("Delete-data uninstall left the resident launch session behind.", fixture, StringComparison.Ordinal);
     }
 
     /// <summary>验证静默卸载准备失败只记录并中止，不创建任何阻塞消息框。</summary>
@@ -130,5 +162,9 @@ public sealed class InstallerContractTests
     /// <summary>读取安装脚本供声明式安全契约测试使用。</summary>
     private static string ReadInstallerScript() =>
         File.ReadAllText(Path.Combine(RepositoryRoot, "installer", "DeskButler.iss"));
+
+    /// <summary>读取发布卸载夹具供数据根行为契约测试使用。</summary>
+    private static string ReadUninstallFixture() =>
+        File.ReadAllText(Path.Combine(RepositoryRoot, "tests", "installer", "verify-uninstall.ps1"));
 
 }

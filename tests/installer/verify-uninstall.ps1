@@ -15,6 +15,8 @@ $runKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $unrelatedName = "DeskButlerUninstallFixture_$fixtureId"
 $unrelatedValue = "unrelated-$fixtureId"
 $dataMarker = Join-Path $dataDirectory "installer-fixture-$fixtureId.marker"
+$residentSettingsMarker = Join-Path $dataDirectory 'settings.json'
+$residentLaunchSessionMarker = Join-Path $dataDirectory 'resident-launch-session.json'
 $registryBase = $null
 $runKey = $null
 $installed = $false
@@ -55,19 +57,35 @@ try {
     Install-Fixture
     New-Item -ItemType Directory -Path $dataDirectory | Out-Null
     Set-Content -LiteralPath $dataMarker -Value 'preserve-delete-fixture' -NoNewline
+    Set-Content -LiteralPath $residentSettingsMarker -Value "resident-settings-$fixtureId" -NoNewline
+    Set-Content -LiteralPath $residentLaunchSessionMarker -Value "resident-session-$fixtureId" -NoNewline
     Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
     $installed = $false
     if (-not (Test-Path -LiteralPath $dataMarker)) {
         throw 'Silent uninstall did not preserve user data by default.'
     }
+    if (-not (Test-Path -LiteralPath $residentSettingsMarker)) {
+        throw 'Default uninstall did not preserve resident settings.'
+    }
+    if (-not (Test-Path -LiteralPath $residentLaunchSessionMarker)) {
+        throw 'Default uninstall did not preserve the resident launch session.'
+    }
 
     Install-Fixture
-    if (-not (Test-Path -LiteralPath $dataMarker)) {
+    if ((-not (Test-Path -LiteralPath $dataMarker)) -or
+        (-not (Test-Path -LiteralPath $residentSettingsMarker)) -or
+        (-not (Test-Path -LiteralPath $residentLaunchSessionMarker))) {
         throw 'Reinstall could not see preserved user data.'
     }
     Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DELETEUSERDATA=1')
     $installed = $false
 
+    if (Test-Path -LiteralPath $residentSettingsMarker) {
+        throw 'Delete-data uninstall left resident settings behind.'
+    }
+    if (Test-Path -LiteralPath $residentLaunchSessionMarker) {
+        throw 'Delete-data uninstall left the resident launch session behind.'
+    }
     if ((Test-Path -LiteralPath $installDirectory) -or
         (Test-Path -LiteralPath $shortcutDirectory) -or
         (Test-Path -LiteralPath $dataDirectory)) {
