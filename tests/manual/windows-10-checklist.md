@@ -7,7 +7,7 @@
 - [ ] 记录日期、执行人、机器/VM 标识、Windows edition、版本及完整 OS build。
 - [ ] 记录 x64、当前用户名是否为专用测试账户、DeskButler fixture/安装器版本。
 - [ ] 记录每台显示器设备名、主屏、分辨率、工作区坐标（含负坐标）、缩放/DPI 与排列图。
-- [ ] 记录本轮安装器文件大小 `64,593,675` 字节、SHA-256 `62EDE7ADD876683D9B357719565538E059D8513C056B7933F5191AAEBC515697`；重新计算并确认一致。
+- [ ] 记录本轮安装器文件大小 `64,573,986` 字节、SHA-256 `EEB7BE5C1228519DAA68A1C029D2F60F8BDBF1D0E4B57561345AE11550F0F736`；重新计算并确认一致。
 - [ ] 运行 `verify-clean-account-prerequisites.ps1 -ExpectedTestAccount <专用账户>`；必须为 `READY`，不得绕过 `BLOCK`。
 - [ ] 确认 QQ、微信、富途均为专用 VM 中的测试安装与测试账号；记录各自主程序版本、启动入口完整路径和初始 PID。
 

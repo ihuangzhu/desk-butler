@@ -17,7 +17,7 @@ DeskButler 是一个完全在本机运行的 Windows 工作现场管家。当前
 
 当前安装器未做产品代码签名。若 Windows 显示来源提示，请先核对本次验证脚本输出的 SHA-256，不要从未知来源获取安装包。
 
-本轮最终安装器为 `artifacts\installer\DeskButler-Setup-0.1.0.exe`，大小 **64,593,675 字节**，SHA-256 **`62EDE7ADD876683D9B357719565538E059D8513C056B7933F5191AAEBC515697`**。
+本轮最终安装器为 `artifacts\installer\DeskButler-Setup-0.1.0.exe`，大小 **64,573,986 字节**，SHA-256 **`EEB7BE5C1228519DAA68A1C029D2F60F8BDBF1D0E4B57561345AE11550F0F736`**。
 
 ## 第一次使用：文字截图流程
 
