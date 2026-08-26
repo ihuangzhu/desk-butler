@@ -29,6 +29,104 @@ public sealed class CaptureCoordinatorTests
         Assert.Empty(repository.Snapshots);
     }
 
+    /// <summary>验证手动观察在捕获暂停时仍返回普通窗口路径，但绝不写入快照。</summary>
+    [Fact]
+    public async Task ManualObservedCaptureDisabledReturnsPathsWithoutSaving()
+    {
+        var repository = new InMemorySceneRepository();
+        var settings = ButlerSettings.Default;
+        var coordinator = new CaptureCoordinator(
+            settings,
+            new DelegateWindowInventory(
+                _ => throw new InvalidOperationException("manual observed capture must not enumerate again")),
+            new SceneFilter(settings),
+            repository,
+            new FakeClock());
+
+        var outcome = await coordinator.SaveObservedAsync(
+            "manual",
+            [CandidateFactory.Normal(@"C:\Apps\.\EDITOR.exe", "Draft")],
+            saveEnabled: false,
+            CancellationToken.None);
+
+        Assert.False(outcome.SnapshotSaved);
+        Assert.Equal(CaptureSkipReason.Disabled, outcome.SkipReason);
+        Assert.Equal(@"C:\Apps\EDITOR.exe", Assert.Single(outcome.WindowExecutablePaths));
+        Assert.Empty(repository.Snapshots);
+    }
+
+    /// <summary>验证启用的手动观察没有平台候选时返回 NoCandidates。</summary>
+    [Fact]
+    public async Task ManualObservedCaptureWithoutCandidatesReturnsNoCandidates()
+    {
+        var repository = new InMemorySceneRepository();
+        var coordinator = CreateCoordinator([], repository);
+
+        var outcome = await coordinator.SaveObservedAsync(
+            "manual", [], saveEnabled: true, CancellationToken.None);
+
+        Assert.False(outcome.SnapshotSaved);
+        Assert.Equal(CaptureSkipReason.NoCandidates, outcome.SkipReason);
+        Assert.Empty(outcome.WindowExecutablePaths);
+        Assert.Empty(repository.Snapshots);
+    }
+
+    /// <summary>验证手动观察候选全部被安全规则过滤时返回 NoItems。</summary>
+    [Fact]
+    public async Task ManualObservedCaptureWithoutSafeItemsReturnsNoItems()
+    {
+        var repository = new InMemorySceneRepository();
+        var coordinator = CreateCoordinator([], repository);
+
+        var outcome = await coordinator.SaveObservedAsync(
+            "manual",
+            [CandidateFactory.Normal() with { IsTemporaryWindow = true }],
+            saveEnabled: true,
+            CancellationToken.None);
+
+        Assert.False(outcome.SnapshotSaved);
+        Assert.Equal(CaptureSkipReason.NoItems, outcome.SkipReason);
+        Assert.Empty(outcome.WindowExecutablePaths);
+        Assert.Empty(repository.Snapshots);
+    }
+
+    /// <summary>验证手动观察与最新现场相同时返回 Unchanged 且保留普通窗口路径。</summary>
+    [Fact]
+    public async Task ManualObservedCaptureMatchingLatestReturnsUnchanged()
+    {
+        var candidate = CandidateFactory.Normal(@"C:\Apps\editor.exe", "Draft");
+        var repository = new InMemorySceneRepository();
+        var coordinator = CreateCoordinator([candidate], repository);
+        await coordinator.SaveNowAsync("initial", CancellationToken.None);
+
+        var outcome = await coordinator.SaveObservedAsync(
+            "manual", [candidate], saveEnabled: true, CancellationToken.None);
+
+        Assert.False(outcome.SnapshotSaved);
+        Assert.Equal(CaptureSkipReason.Unchanged, outcome.SkipReason);
+        Assert.Equal(@"C:\Apps\editor.exe", Assert.Single(outcome.WindowExecutablePaths));
+        Assert.Single(repository.Snapshots);
+    }
+
+    /// <summary>验证有效手动观察保存新快照并返回 None 和同批正规化路径。</summary>
+    [Fact]
+    public async Task ManualObservedCaptureSavesSnapshotAndReturnsPaths()
+    {
+        var repository = new InMemorySceneRepository();
+        var coordinator = CreateCoordinator([], repository);
+
+        var outcome = await coordinator.SaveObservedAsync(
+            "manual",
+            [CandidateFactory.Normal(@"C:\Apps\.\EDITOR.exe", "Draft")],
+            saveEnabled: true,
+            CancellationToken.None);
+
+        Assert.True(outcome.SnapshotSaved);
+        Assert.Equal(CaptureSkipReason.None, outcome.SkipReason);
+        Assert.Equal(@"C:\Apps\EDITOR.exe", Assert.Single(outcome.WindowExecutablePaths));
+        Assert.Equal("manual", Assert.Single(repository.Snapshots).CaptureReason);
+    }
+
     /// <summary>验证平台返回空候选时跳过保存，避免瞬时捕获失败侵蚀历史。</summary>
     [Fact]
     public async Task EmptyInventorySkipsSave()

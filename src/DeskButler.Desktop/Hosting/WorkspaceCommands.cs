@@ -5,6 +5,7 @@ using DeskButler.Core.Persistence;
 using DeskButler.Core.Restore;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
+using DeskButler.Core.Time;
 using DeskButler.Modules.WorkspaceRecovery.Capture;
 using DeskButler.Modules.WorkspaceRecovery.Restore;
 using DeskButler.Modules.WorkspaceRecovery;
@@ -15,7 +16,7 @@ using System.Runtime.ExceptionServices;
 namespace DeskButler.Desktop.Hosting;
 
 /// <summary>请求立即保存当前工作现场。</summary>
-public sealed record SaveSceneNowCommand : ICommand<bool>;
+public sealed record SaveSceneNowCommand : ICommand<ManualSaveResult>;
 
 /// <summary>请求恢复用户明确选中的场景项目。</summary>
 public sealed record RestoreSceneCommand(
@@ -166,15 +167,124 @@ public sealed class SettingsCoordinator : IDisposable
     }
 }
 
-/// <summary>把“立即保存”命令连接到既有捕获协调器。</summary>
-public sealed class SaveSceneNowCommandHandler(CaptureCoordinator coordinator)
-    : ICommandHandler<SaveSceneNowCommand, bool>
+/// <summary>把用户主动保存连接到同批窗口捕获与一次常驻候选发现。</summary>
+internal sealed class SaveSceneNowCommandHandler : ICommandHandler<SaveSceneNowCommand, ManualSaveResult>
 {
-    /// <inheritdoc />
-    public async Task<bool> HandleAsync(SaveSceneNowCommand command, CancellationToken cancellationToken)
+    private readonly SettingsAwareWindowInventory inventory;
+    private readonly CaptureCoordinator coordinator;
+    private readonly ResidentCandidateCoordinator residentCandidates;
+    private readonly IDiagnosticLog? diagnosticLog;
+    private readonly IClock clock;
+
+    /// <summary>创建不写诊断的手动保存处理器，适合隔离宿主和测试。</summary>
+    internal SaveSceneNowCommandHandler(
+        SettingsAwareWindowInventory inventory,
+        CaptureCoordinator coordinator,
+        ResidentCandidateCoordinator residentCandidates)
+        : this(inventory, coordinator, residentCandidates, null, new ManualCommandClock())
     {
-        await coordinator.SaveNowAsync("manual", cancellationToken).ConfigureAwait(false);
-        return true;
+    }
+
+    /// <summary>使用既有诊断边界记录手动捕获与发现的脱敏系统级故障。</summary>
+    internal SaveSceneNowCommandHandler(
+        SettingsAwareWindowInventory inventory,
+        CaptureCoordinator coordinator,
+        ResidentCandidateCoordinator residentCandidates,
+        IDiagnosticLog? diagnosticLog,
+        IClock clock)
+    {
+        this.inventory = inventory ?? throw new ArgumentNullException(nameof(inventory));
+        this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
+        this.residentCandidates = residentCandidates ?? throw new ArgumentNullException(nameof(residentCandidates));
+        this.diagnosticLog = diagnosticLog;
+        this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
+    }
+
+    /// <inheritdoc />
+    public async Task<ManualSaveResult> HandleAsync(
+        SaveSceneNowCommand command,
+        CancellationToken cancellationToken)
+    {
+        CaptureOutcome capture;
+        try
+        {
+            var observation = await inventory.CaptureForManualAsync(cancellationToken).ConfigureAwait(false);
+            capture = await coordinator.SaveObservedAsync(
+                "manual",
+                observation.Candidates,
+                observation.CaptureEnabled,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (IsRecoverableManualFailure(exception))
+        {
+            // 手动窗口观察或保存失败只清空本次普通路径；常驻发现仍必须执行且不得泄露异常原文。
+            capture = new CaptureOutcome(
+                false,
+                CaptureSkipReason.Failed,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            await ReportFailureAsync("manual-capture", cancellationToken).ConfigureAwait(false);
+        }
+
+        var discovery = await residentCandidates.DiscoverAsync(
+            capture.WindowExecutablePaths,
+            cancellationToken).ConfigureAwait(false);
+        if (discovery.DiscoveryFailed)
+        {
+            // 发现失败独立于已经完成的现场事务，只追加诊断而不改写 capture 结果。
+            await ReportFailureAsync("resident-discovery", cancellationToken).ConfigureAwait(false);
+        }
+
+        return new ManualSaveResult(capture, discovery);
+    }
+
+    /// <summary>尽力写入不含路径和异常文本的分类诊断，日志自身失败不得改写命令结果。</summary>
+    private async Task ReportFailureAsync(string category, CancellationToken cancellationToken)
+    {
+        if (diagnosticLog is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await diagnosticLog.WriteAsync(
+                new DiagnosticEvent(
+                    clock.UtcNow,
+                    DiagnosticLevel.Warning,
+                    category,
+                    category == "manual-capture"
+                        ? "手动现场捕获失败，仍继续查找常驻应用。"
+                        : "常驻应用发现失败，已保留先前的现场保存结果。"),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // 日志实现自己的取消不能伪装成用户取消，也不能阻断仍需执行的手动发现。
+        }
+        catch (Exception exception) when (IsRecoverableManualFailure(exception))
+        {
+            // 诊断是 best-effort；日志故障不影响已保存现场、候选状态或用户命令结果。
+        }
+    }
+
+    /// <summary>识别可在手动工作流内隔离、但不包括取消和进程级致命故障的异常。</summary>
+    private static bool IsRecoverableManualFailure(Exception exception) =>
+        exception is not OperationCanceledException
+            and not OutOfMemoryException
+            and not AccessViolationException
+            and not StackOverflowException
+            and not ThreadAbortException
+            and not System.Runtime.InteropServices.SEHException;
+
+    /// <summary>为不记录诊断的兼容构造入口提供最小系统时钟。</summary>
+    private sealed class ManualCommandClock : IClock
+    {
+        /// <inheritdoc />
+        public DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
+
+        /// <inheritdoc />
+        public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) =>
+            Task.Delay(delay, cancellationToken);
     }
 }
 

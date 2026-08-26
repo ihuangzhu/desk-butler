@@ -5,7 +5,7 @@ using DeskButler.Core.ResidentApps;
 namespace DeskButler.Infrastructure.Windows.ResidentApps;
 
 /// <summary>把当前会话的只读进程与安装目录快照收敛为需要用户确认的常驻候选。</summary>
-internal sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
+public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
 {
     private static readonly string[] HelperTokens = ["helper", "updater", "update", "crash", "reporter", "renderer"];
     private static readonly string[] ExcludedKnownProcessTokens = ["updater", "update", "crash", "reporter"];
@@ -27,6 +27,10 @@ internal sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             Environment.ProcessPath)
     {
     }
+
+    /// <summary>创建只暴露 Core 发现边界的默认 Windows 生产实现。</summary>
+    /// <returns>内部组装只读进程快照、安装目录和可执行策略的发现器。</returns>
+    public static IResidentAppDiscovery CreateDefault() => new WindowsResidentAppDiscovery();
 
     /// <summary>创建使用受控只读边界的发现器，以隔离测试并避免发现阶段写入或启动任何程序。</summary>
     internal WindowsResidentAppDiscovery(

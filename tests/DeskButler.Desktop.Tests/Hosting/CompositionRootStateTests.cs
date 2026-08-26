@@ -1,6 +1,8 @@
 using DeskButler.Application.Events;
 using DeskButler.Application.Modules;
+using DeskButler.Core.Capture;
 using DeskButler.Core.Diagnostics;
+using DeskButler.Core.Scenes;
 using DeskButler.Core.Time;
 using DeskButler.Core.Settings;
 using DeskButler.Desktop.Hosting;
@@ -808,6 +810,76 @@ public sealed class CompositionRootStateTests
         Assert.Equal(enabled, result);
         Assert.Equal(enabled, registration.IsEnabled);
         Assert.Equal(enabled, store.Current.StartupEnabled);
+    }
+
+    /// <summary>手动观察即使捕获暂停也只读取一次最新设置和底层清单，并继续应用永久排除。</summary>
+    [Fact]
+    public async Task ManualWindowObservationIgnoresPauseButAppliesLatestExclusionsOnce()
+    {
+        var settings = ButlerSettings.Default with
+        {
+            CaptureEnabled = false,
+            ExcludedExecutablePaths = new HashSet<string>([@"C:\Apps\excluded.exe"], StringComparer.OrdinalIgnoreCase)
+        };
+        var store = new CountingSettingsStore(settings);
+        var inner = new CountingWindowInventory(
+        [
+            ManualCandidate(1, @"C:\Apps\excluded.exe"),
+            ManualCandidate(2, @"C:\Apps\visible.exe")
+        ]);
+        var inventory = new SettingsAwareWindowInventory(inner, store);
+
+        var observation = await inventory.CaptureForManualAsync(CancellationToken.None);
+
+        Assert.False(observation.CaptureEnabled);
+        Assert.Equal(@"C:\Apps\visible.exe", Assert.Single(observation.Candidates).ExecutablePath);
+        Assert.Equal(1, store.LoadCount);
+        Assert.Equal(1, inner.CaptureCount);
+    }
+
+    /// <summary>构造手动观察使用的稳定普通窗口候选。</summary>
+    private static WindowCandidate ManualCandidate(int handle, string executablePath) => new(
+        handle,
+        10 + handle,
+        executablePath,
+        "WindowClass",
+        "Window title",
+        null,
+        new WindowBounds(10, 10, 800, 600),
+        SceneWindowState.Normal,
+        new MonitorIdentity("DISPLAY1", new WindowBounds(0, 0, 1920, 1080), 96, 96),
+        true,
+        false,
+        false,
+        false,
+        false);
+
+    private sealed class CountingSettingsStore(ButlerSettings current) : ISettingsStore
+    {
+        internal int LoadCount { get; private set; }
+
+        /// <inheritdoc />
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken)
+        {
+            LoadCount++;
+            return Task.FromResult(current);
+        }
+
+        /// <inheritdoc />
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class CountingWindowInventory(IReadOnlyList<WindowCandidate> candidates) : IWindowInventory
+    {
+        internal int CaptureCount { get; private set; }
+
+        /// <inheritdoc />
+        public Task<IReadOnlyList<WindowCandidate>> CaptureAsync(CancellationToken cancellationToken)
+        {
+            CaptureCount++;
+            return Task.FromResult(candidates);
+        }
     }
 
     private sealed class SingleFailureSettingsStore(ButlerSettings initial, Exception failure) : ISettingsStore

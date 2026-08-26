@@ -61,7 +61,7 @@ public sealed class CaptureCoordinator : IDisposable
                 return;
             }
 
-            var items = MapNormalizedItems(candidates);
+            var items = MapNormalizedCapture(candidates).Items;
             if (items.Count == 0)
             {
                 return;
@@ -87,6 +87,60 @@ public sealed class CaptureCoordinator : IDisposable
         }
     }
 
+    /// <summary>保存调用方已经观察的一批窗口，并返回同批普通窗口路径供手动发现复用。</summary>
+    /// <param name="reason">由调用方提供并原样持久化的稳定捕获原因。</param>
+    /// <param name="candidates">本次已经枚举完成且不得再次向平台读取的窗口候选。</param>
+    /// <param name="saveEnabled">本次读取到的最新捕获开关。</param>
+    /// <param name="cancellationToken">取消正规化、比较和保存串行操作的令牌。</param>
+    /// <returns>是否保存、跳过原因和从同一批候选投影出的路径集合。</returns>
+    public async Task<CaptureOutcome> SaveObservedAsync(
+        string reason,
+        IReadOnlyList<WindowCandidate> candidates,
+        bool saveEnabled,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        ArgumentNullException.ThrowIfNull(candidates);
+
+        await saveGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var normalized = MapNormalizedCapture(candidates);
+            if (!saveEnabled)
+            {
+                return new CaptureOutcome(false, CaptureSkipReason.Disabled, normalized.ExecutablePaths);
+            }
+
+            if (candidates.Count == 0)
+            {
+                return new CaptureOutcome(false, CaptureSkipReason.NoCandidates, normalized.ExecutablePaths);
+            }
+            if (normalized.Items.Count == 0)
+            {
+                return new CaptureOutcome(false, CaptureSkipReason.NoItems, normalized.ExecutablePaths);
+            }
+
+            var recent = await repository.GetRecentAsync(1, cancellationToken).ConfigureAwait(false);
+            if (recent.Count > 0 && ScenesEqual(recent[0].Items, normalized.Items))
+            {
+                return new CaptureOutcome(false, CaptureSkipReason.Unchanged, normalized.ExecutablePaths);
+            }
+
+            var snapshot = new SceneSnapshot(
+                Guid.NewGuid(),
+                CurrentFormatVersion,
+                clock.UtcNow,
+                reason,
+                normalized.Items);
+            await repository.SaveAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            return new CaptureOutcome(true, CaptureSkipReason.None, normalized.ExecutablePaths);
+        }
+        finally
+        {
+            saveGate.Release();
+        }
+    }
+
     /// <summary>释放保存串行门；调用方须先停止所有调度和模块回调。</summary>
     public void Dispose()
     {
@@ -96,7 +150,7 @@ public sealed class CaptureCoordinator : IDisposable
     /// <summary>过滤候选并生成与原生枚举顺序无关的正规化场景条目。</summary>
     /// <param name="candidates">平台窗口候选集合。</param>
     /// <returns>按稳定条目标识排序的安全场景条目。</returns>
-    private List<SceneItem> MapNormalizedItems(IReadOnlyList<WindowCandidate> candidates)
+    private NormalizedCapture MapNormalizedCapture(IReadOnlyList<WindowCandidate> candidates)
     {
         var safeIdentities = new List<CandidateIdentity>(candidates.Count);
         foreach (var candidate in candidates)
@@ -157,7 +211,10 @@ public sealed class CaptureCoordinator : IDisposable
             }
         }
 
-        return items;
+        IReadOnlySet<string> executablePaths = items
+            .Select(item => item.ExecutablePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return new NormalizedCapture(items, executablePaths);
     }
 
     /// <summary>隔离单个候选的路径格式错误，并生成后续不会再触发路径解析的安全身份。</summary>
@@ -328,6 +385,11 @@ public sealed class CaptureCoordinator : IDisposable
         string BaseIdentity,
         string ExecutablePath,
         string? ExplorerPath);
+
+    /// <summary>绑定从同一批候选产生的场景条目和普通窗口路径，防止再次平台枚举。</summary>
+    private sealed record NormalizedCapture(
+        List<SceneItem> Items,
+        IReadOnlySet<string> ExecutablePaths);
 
     /// <summary>表示忽略路径显示形式和条目标识后的完整场景比较键。</summary>
     private sealed record SceneComparisonKey(

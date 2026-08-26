@@ -12,6 +12,7 @@ using DeskButler.Desktop.Tray;
 using DeskButler.Desktop.ViewModels;
 using DeskButler.Desktop.Views;
 using DeskButler.Infrastructure.Windows.Restore;
+using DeskButler.Infrastructure.Windows.ResidentApps;
 using DeskButler.Infrastructure.Windows.Session;
 using DeskButler.Infrastructure.Windows.Startup;
 using DeskButler.Infrastructure.Windows.Windows;
@@ -260,6 +261,10 @@ public sealed class CompositionRoot : IAsyncDisposable
                     coordinator.Dispose();
                     return ValueTask.CompletedTask;
                 });
+            var residentCandidates = new ResidentCandidateCoordinator(
+                WindowsResidentAppDiscovery.CreateDefault(),
+                settingsStore,
+                settingsCoordinator);
             var scheduler = ownership.Own(
                 "scheduler",
                 new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync),
@@ -305,7 +310,11 @@ public sealed class CompositionRoot : IAsyncDisposable
                 _ => startup.DisposeSessionAsync());
 
             var commandBus = new InProcessCommandBus();
-            commandBus.Register(new SaveSceneNowCommandHandler(captureCoordinator));
+            commandBus.Register(new SaveSceneNowCommandHandler(
+                captureInventory, captureCoordinator, residentCandidates, diagnosticLog, clock));
+            commandBus.Register(new FindResidentCandidatesCommandHandler(residentCandidates));
+            commandBus.Register(new ConfirmResidentCandidatesCommandHandler(residentCandidates));
+            commandBus.Register(new DismissResidentCandidatesCommandHandler(residentCandidates));
             commandBus.Register(new RestoreSceneCommandHandler(
                 rawInventory,
                 new RestorePlanner(),
