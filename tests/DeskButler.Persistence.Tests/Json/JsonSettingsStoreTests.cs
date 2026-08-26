@@ -1,3 +1,4 @@
+using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Settings;
 using DeskButler.Persistence.Json;
 using DeskButler.Persistence.Paths;
@@ -115,6 +116,104 @@ public sealed class JsonSettingsStoreTests
         Assert.Equal(22, settings.RecoveryCardDismissSeconds);
         Assert.Empty(settings.ExcludedExecutablePaths);
         Assert.True(settings.ExcludedExecutablePaths.IsProperSubsetOf(["C:\\Apps\\Other.exe"]));
+    }
+
+    /// <summary>验证缺少常驻应用字段的旧版设置会启用兼容默认值而不回退其他设置。</summary>
+    [Fact]
+    public async Task LoadAsyncUsesResidentCompatibilityDefaultsForLegacyJson()
+    {
+        await using var fixture = new SettingsFixture();
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """{"captureEnabled":false,"startupEnabled":false,"recoveryCardDismissSeconds":22,"excludedExecutablePaths":["C:\\Apps\\Excluded.exe"]}""",
+            CancellationToken.None);
+
+        var loaded = await fixture.Store.LoadAsync(CancellationToken.None);
+
+        Assert.True(loaded.ResidentApplicationsEnabled);
+        Assert.Empty(loaded.ResidentApplications);
+        Assert.False(loaded.CaptureEnabled);
+        Assert.False(loaded.StartupEnabled);
+        Assert.Equal(22, loaded.RecoveryCardDismissSeconds);
+        Assert.True(loaded.ExcludedExecutablePaths.Contains(@"C:\Apps\Excluded.exe"));
+    }
+
+    /// <summary>验证单个畸形常驻条目被隔离，且同一设置文档中的有效条目和旧字段仍可恢复。</summary>
+    [Fact]
+    public async Task LoadAsyncIsolatesMalformedResidentApplicationWithoutDiscardingSettings()
+    {
+        await using var fixture = new SettingsFixture();
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """
+            {"captureEnabled":false,"startupEnabled":false,"recoveryCardDismissSeconds":33,"excludedExecutablePaths":["C:\\Apps\\Excluded.exe"],"residentApplicationsEnabled":false,"residentApplications":[{"launchPath":"C:\\Apps\\One.exe"},{"launchPath":"C:\\Apps\\Two.exe","knownProcessPaths":["C:\\Apps\\Two.exe"],"displayName":"Two","enabled":true,"launchOrder":4},{"launchPath":"D:\\Apps\\Three.exe","knownProcessPaths":["D:\\Apps\\Three.exe"],"displayName":"Three","enabled":false,"launchOrder":8}]}
+            """,
+            CancellationToken.None);
+
+        var loaded = await fixture.Store.LoadAsync(CancellationToken.None);
+
+        Assert.False(loaded.CaptureEnabled);
+        Assert.False(loaded.StartupEnabled);
+        Assert.Equal(33, loaded.RecoveryCardDismissSeconds);
+        Assert.True(loaded.ExcludedExecutablePaths.Contains(@"C:\Apps\Excluded.exe"));
+        Assert.False(loaded.ResidentApplicationsEnabled);
+        Assert.Collection(
+            loaded.ResidentApplications,
+            first => Assert.Equal(@"C:\Apps\Two.exe", first.LaunchPath),
+            second => Assert.Equal(@"D:\Apps\Three.exe", second.LaunchPath));
+    }
+
+    /// <summary>验证常驻应用完整往返会保留启动、识别、显示、启用和排序字段。</summary>
+    [Fact]
+    public async Task SaveAsyncRoundTripsEveryResidentApplicationField()
+    {
+        await using var fixture = new SettingsFixture();
+        var expected = ButlerSettings.Default with
+        {
+            ResidentApplicationsEnabled = false,
+            ResidentApplications =
+            [
+                new ResidentApplication(
+                    @"C:\Apps\DeskOne.exe",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { @"C:\Apps\DeskOne.exe", @"C:\Apps\DeskOne.Helper.exe" },
+                    "Desk One",
+                    false,
+                    7)
+            ]
+        };
+
+        await fixture.Store.SaveAsync(expected, CancellationToken.None);
+        var loaded = await fixture.Store.LoadAsync(CancellationToken.None);
+
+        Assert.False(loaded.ResidentApplicationsEnabled);
+        var application = Assert.Single(loaded.ResidentApplications);
+        Assert.Equal(@"C:\Apps\DeskOne.exe", application.LaunchPath);
+        Assert.True(application.KnownProcessPaths.SetEquals([@"C:\Apps\DeskOne.exe", @"C:\Apps\DeskOne.Helper.exe"]));
+        Assert.Equal("Desk One", application.DisplayName);
+        Assert.False(application.Enabled);
+        Assert.Equal(0, application.LaunchOrder);
+    }
+
+    /// <summary>验证同一 JSON 内容中的常驻条目诊断只会交付一次，而无时间戳依赖。</summary>
+    [Fact]
+    public async Task LoadAsyncDeduplicatesResidentDiagnosticsForIdenticalJsonBytes()
+    {
+        await using var fixture = new SettingsFixture();
+        var diagnostics = new List<ResidentNormalizationDiagnostic>();
+        var store = new JsonSettingsStore(fixture.Paths, diagnosticSink: diagnostics.Add);
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """{"residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+
+        await store.LoadAsync(CancellationToken.None);
+        await store.LoadAsync(CancellationToken.None);
+
+        var diagnostic = Assert.Single(diagnostics);
+        Assert.Equal(ResidentNormalizationIssue.InvalidPath, diagnostic.Kind);
     }
 
     /// <summary>验证目标设置文件已存在时，原子替换分支会保存最新设置并保持文件可读取。</summary>

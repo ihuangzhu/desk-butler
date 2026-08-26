@@ -26,6 +26,9 @@ public sealed class AppDataPaths
     /// <summary>获取 JSON 用户设置文件的完整路径。</summary>
     public string SettingsFilePath => Path.Combine(RootDirectory, "settings.json");
 
+    /// <summary>获取当前登录批次常驻应用启动计划的完整路径。</summary>
+    public string ResidentLaunchSessionFilePath => Path.Combine(RootDirectory, "resident-launch-session.json");
+
     /// <summary>获取日志和数据库故障证据所在的诊断目录。</summary>
     public string DiagnosticsDirectory => Path.Combine(RootDirectory, "diagnostics");
 
