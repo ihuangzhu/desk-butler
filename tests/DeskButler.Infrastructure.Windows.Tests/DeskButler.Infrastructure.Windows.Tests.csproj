@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DeskButler.Infrastructure.Windows\DeskButler.Infrastructure.Windows.csproj" />
+    <ProjectReference Include="TestApps\DeskButler.ResidentFixture\DeskButler.ResidentFixture.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="TestApps\DeskButler.TestWindow\DeskButler.TestWindow.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 

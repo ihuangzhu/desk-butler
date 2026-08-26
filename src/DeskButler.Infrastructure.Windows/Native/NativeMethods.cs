@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using DeskButler.Core.Scenes;
+using Microsoft.Win32.SafeHandles;
 
 namespace DeskButler.Infrastructure.Windows.Native;
 
@@ -17,6 +18,8 @@ internal static class NativeMethods
     internal const uint SwShowMaximized = 3;
     internal const uint SwpNoZOrder = 0x0004;
     internal const uint SwpNoActivate = 0x0010;
+    internal const uint TokenQuery = 0x0008;
+    internal const int TokenStatisticsInformationClass = 10;
 
     internal delegate bool EnumWindowsProc(nint windowHandle, nint parameter);
     internal delegate bool MonitorEnumProc(nint monitorHandle, nint deviceContext, nint rectangle, nint parameter);
@@ -104,6 +107,61 @@ internal static class NativeMethods
     [DllImport("user32.dll")]
     internal static extern uint GetDpiForWindow(nint windowHandle);
 
+    /// <summary>取得当前进程的借用伪句柄，调用方不得关闭。</summary>
+    [DllImport("kernel32.dll")]
+    internal static extern nint GetCurrentProcess();
+
+    /// <summary>以只读查询权限打开当前进程 token，并把句柄所有权交给 SafeHandle。</summary>
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool OpenProcessToken(
+        nint processHandle,
+        uint desiredAccess,
+        out SafeAccessTokenHandle tokenHandle);
+
+    /// <summary>读取固定大小的 TOKEN_STATISTICS，不提取账号、SID 或 token 内容。</summary>
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetTokenInformation(
+        SafeAccessTokenHandle tokenHandle,
+        int tokenInformationClass,
+        out TokenStatistics tokenInformation,
+        uint tokenInformationLength,
+        out uint returnLength);
+
+    /// <summary>从拒绝删除共享的文件句柄读取最终 DOS 路径。</summary>
+    [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        [Out] char[] path,
+        uint pathLength,
+        uint flags);
+
+    /// <summary>只把 PE 映射为数据文件以读取资源，不执行入口代码。</summary>
+    [DllImport("kernel32.dll", EntryPoint = "LoadLibraryExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern SafeLibraryHandle LoadLibraryEx(string fileName, nint file, uint flags);
+
+    /// <summary>查找 PE 中指定类型和编号的资源。</summary>
+    [DllImport("kernel32.dll", EntryPoint = "FindResourceW", SetLastError = true)]
+    internal static extern nint FindResource(SafeLibraryHandle module, nint name, nint type);
+
+    /// <summary>读取指定 PE 资源的字节长度。</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern uint SizeofResource(SafeLibraryHandle module, nint resource);
+
+    /// <summary>把指定 PE 资源加载到只读内存。</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern nint LoadResource(SafeLibraryHandle module, nint resource);
+
+    /// <summary>取得已加载 PE 资源的只读内存地址。</summary>
+    [DllImport("kernel32.dll")]
+    internal static extern nint LockResource(nint resourceData);
+
+    /// <summary>释放由 LoadLibraryEx 拥有的模块映射句柄。</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool FreeLibrary(nint module);
+
     /// <summary>读取窗口所有者，用于排除 owned window。</summary>
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern nint GetWindow(nint windowHandle, uint command);
@@ -121,6 +179,40 @@ internal static class NativeMethods
     {
         return nint.Size == 8 ? GetWindowLongPtr64(windowHandle, index) : GetWindowLong32(windowHandle, index);
     }
+}
+
+internal sealed class SafeLibraryHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    /// <summary>供 P/Invoke marshaller 创建空模块句柄。</summary>
+    internal SafeLibraryHandle()
+        : base(ownsHandle: true)
+    {
+    }
+
+    /// <summary>释放本对象拥有的 LoadLibraryEx 模块引用。</summary>
+    protected override bool ReleaseHandle() => NativeMethods.FreeLibrary(handle);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeLuid
+{
+    internal uint LowPart;
+    internal int HighPart;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TokenStatistics
+{
+    internal NativeLuid TokenId;
+    internal NativeLuid AuthenticationId;
+    internal long ExpirationTime;
+    internal int TokenType;
+    internal int ImpersonationLevel;
+    internal uint DynamicCharged;
+    internal uint DynamicAvailable;
+    internal uint GroupCount;
+    internal uint PrivilegeCount;
+    internal NativeLuid ModifiedId;
 }
 
 [StructLayout(LayoutKind.Sequential)]
