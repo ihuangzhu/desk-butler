@@ -104,20 +104,36 @@ public sealed class InstallerContractTests
         Assert.Single(deleteDataArguments, argument =>
             string.Equals(argument, "/DELETEUSERDATA=1", StringComparison.OrdinalIgnoreCase));
 
-        var lifecycle = ReadPowerShellFunctionBody(fixture, "Invoke-UninstallContractFixture");
-        var scenarioCalls = lifecycle
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(line => line is
-                "Verify-DefaultUninstallPreservesUserData" or
-                "Verify-DeleteDataUninstallRemovesUserData")
-            .ToArray();
+        var uninstaller = NormalizePowerShellStatements(
+            ReadPowerShellFunctionBody(fixture, "Uninstall-Fixture"));
         Assert.Equal(
-            ["Verify-DefaultUninstallPreservesUserData", "Verify-DeleteDataUninstallRemovesUserData"],
-            scenarioCalls);
-        Assert.Single(Regex.Matches(
-            fixture,
-            @"(?m)^\s*Invoke-UninstallContractFixture\s*$",
-            RegexOptions.CultureInvariant));
+            """
+            param([string[]]$Arguments)
+            $uninstaller = Join-Path $installDirectory 'unins000.exe'
+            Invoke-CheckedProcess $uninstaller $Arguments
+            $script:installed = $false
+            """,
+            uninstaller);
+        Assert.DoesNotContain("$defaultUninstallArguments", uninstaller, StringComparison.Ordinal);
+        Assert.DoesNotContain("$deleteDataUninstallArguments", uninstaller, StringComparison.Ordinal);
+
+        var lifecycle = NormalizePowerShellStatements(
+            ReadPowerShellFunctionBody(fixture, "Invoke-UninstallContractFixture"));
+        Assert.Equal(
+            """
+            Verify-DefaultUninstallPreservesUserData
+            Verify-DeleteDataUninstallRemovesUserData
+            """,
+            lifecycle);
+
+        var topLevelTail = NormalizePowerShellStatements(
+            ReadPowerShellTail(fixture, "# CANONICAL TOP-LEVEL EXECUTION"));
+        Assert.Equal(
+            """
+            Initialize-UninstallFixture
+            Invoke-UninstallContractFixture
+            """,
+            topLevelTail);
 
         var defaultScenario = ReadPowerShellFunctionBody(fixture, "Verify-DefaultUninstallPreservesUserData");
         Assert.Contains("Uninstall-Fixture -Arguments $defaultUninstallArguments", defaultScenario, StringComparison.Ordinal);
@@ -248,5 +264,20 @@ public sealed class InstallerContractTests
 
         throw new Xunit.Sdk.XunitException($"PowerShell function body was not closed: {functionName}");
     }
+
+    /// <summary>读取规范顶层执行标记后的内容，确保最终调用不藏在条件或异常分支中。</summary>
+    private static string ReadPowerShellTail(string script, string marker)
+    {
+        var markerIndex = script.LastIndexOf(marker, StringComparison.Ordinal);
+        Assert.True(markerIndex >= 0, $"PowerShell top-level marker was not found: {marker}");
+        return script[(markerIndex + marker.Length)..];
+    }
+
+    /// <summary>忽略空行、注释与缩进后比较规范 PowerShell 直线控制流。</summary>
+    private static string NormalizePowerShellStatements(string source) =>
+        string.Join(
+            '\n',
+            source.Split('\n', StringSplitOptions.TrimEntries)
+                .Where(line => line.Length > 0 && !line.StartsWith('#')));
 
 }
