@@ -13,7 +13,7 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class ResidentCandidateCoordinatorTests
 {
-    /// <summary>较早开始但迟到的发现结果不得覆盖较新的已发布候选代次。</summary>
+    /// <summary>较早开始但迟到的发现调用只能返回较新的已发布候选代次。</summary>
     [Fact]
     public async Task LatestDiscoveryWinsWhenOlderCompletesLate()
     {
@@ -32,10 +32,57 @@ public sealed class ResidentCandidateCoordinatorTests
             new HashSet<string>([@"C:\Apps\ordinary-new.exe"], StringComparer.OrdinalIgnoreCase),
             CancellationToken.None);
         discovery.ReleaseFirst();
-        await oldTask;
+        var staleCompletion = await oldTask;
+        var current = coordinator.Current;
+
+        Assert.Equal(latest.Generation, staleCompletion.Generation);
+        Assert.Equal(current.Generation, staleCompletion.Generation);
+        Assert.Equal(
+            current.Candidates.Select(candidate => candidate.CandidateId),
+            staleCompletion.Candidates.Select(candidate => candidate.CandidateId));
+        Assert.Equal("New", Assert.Single(staleCompletion.Candidates).DisplayName);
+        Assert.DoesNotContain(staleCompletion.Candidates, candidate => candidate.DisplayName == "Old");
+    }
+
+    /// <summary>新请求已登记但尚未完成时，旧完成只能返回此前已发布批次而不能重新公开旧代次。</summary>
+    [Fact]
+    public async Task OlderCompletionWhileNewerPendingReturnsPreviouslyPublishedBatch()
+    {
+        var discovery = new PendingPairDiscovery(
+            Candidate("seed", "Seed", @"C:\Apps\seed.exe"),
+            Candidate("old", "Old", @"C:\Apps\old.exe"),
+            Candidate("new", "New", @"C:\Apps\new.exe"));
+        var store = new InMemorySettingsStore(ButlerSettings.Default);
+        using var settings = new SettingsCoordinator(store);
+        var coordinator = new ResidentCandidateCoordinator(discovery, store, settings);
+        var previous = await coordinator.DiscoverAsync(
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase), CancellationToken.None);
+
+        var oldTask = coordinator.DiscoverAsync(
+            new HashSet<string>([@"C:\Apps\ordinary-old.exe"], StringComparer.OrdinalIgnoreCase),
+            CancellationToken.None);
+        await discovery.OlderStarted.Task;
+        var newTask = coordinator.DiscoverAsync(
+            new HashSet<string>([@"C:\Apps\ordinary-new.exe"], StringComparer.OrdinalIgnoreCase),
+            CancellationToken.None);
+        await discovery.NewerStarted.Task;
+        discovery.ReleaseOlder();
+        var staleCompletion = await oldTask;
+
+        // 更新请求已取得代次但仍在 I/O 中，旧完成只能观察发布锁内的前一批次。
+        Assert.Equal(previous.Generation, staleCompletion.Generation);
+        Assert.Equal(coordinator.Current.Generation, staleCompletion.Generation);
+        Assert.Equal(
+            coordinator.Current.Candidates.Select(candidate => candidate.CandidateId),
+            staleCompletion.Candidates.Select(candidate => candidate.CandidateId));
+        Assert.Equal("Seed", Assert.Single(staleCompletion.Candidates).DisplayName);
+        Assert.DoesNotContain(staleCompletion.Candidates, candidate => candidate.DisplayName == "Old");
+
+        discovery.ReleaseNewer();
+        var latest = await newTask;
 
         Assert.Equal(latest.Generation, coordinator.Current.Generation);
-        Assert.Equal("New", Assert.Single(coordinator.Current.Candidates).DisplayName);
+        Assert.Equal("New", Assert.Single(latest.Candidates).DisplayName);
     }
 
     /// <summary>旧代次忽略无副作用，当前忽略只清内存且下一轮仍可发现同一候选。</summary>
@@ -650,7 +697,7 @@ public sealed class ResidentCandidateCoordinatorTests
         /// <summary>释放第一次发现，使旧结果在新结果之后到达。</summary>
         internal void ReleaseFirst() => releaseFirst.TrySetResult();
 
-        /// <inheritdoc />
+        /// <summary>阻塞首轮发现，允许第二轮先发布以模拟旧调用迟到。</summary>
         public async Task<ResidentDiscoveryResult> DiscoverAsync(
             IReadOnlySet<string> ordinaryWindowPaths,
             IReadOnlyList<ResidentApplication> existing,
@@ -664,6 +711,47 @@ public sealed class ResidentCandidateCoordinatorTests
             }
 
             return new ResidentDiscoveryResult([second], []);
+        }
+    }
+
+    private sealed class PendingPairDiscovery(
+        ResidentAppCandidate seed,
+        ResidentAppCandidate older,
+        ResidentAppCandidate newer) : IResidentAppDiscovery
+    {
+        private int calls;
+        private readonly TaskCompletionSource releaseOlder = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releaseNewer = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource OlderStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource NewerStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>释放已过期的第二次发现，保持第三次发现仍处于等待。</summary>
+        internal void ReleaseOlder() => releaseOlder.TrySetResult();
+
+        /// <summary>释放最新的第三次发现。</summary>
+        internal void ReleaseNewer() => releaseNewer.TrySetResult();
+
+        /// <summary>首轮立即发布种子，后两轮按测试控制的相反完成顺序返回候选。</summary>
+        public async Task<ResidentDiscoveryResult> DiscoverAsync(
+            IReadOnlySet<string> ordinaryWindowPaths,
+            IReadOnlyList<ResidentApplication> existing,
+            CancellationToken cancellationToken)
+        {
+            switch (Interlocked.Increment(ref calls))
+            {
+                case 1:
+                    return new ResidentDiscoveryResult([seed], []);
+                case 2:
+                    OlderStarted.TrySetResult();
+                    await releaseOlder.Task.WaitAsync(cancellationToken);
+                    return new ResidentDiscoveryResult([older], []);
+                default:
+                    NewerStarted.TrySetResult();
+                    await releaseNewer.Task.WaitAsync(cancellationToken);
+                    return new ResidentDiscoveryResult([newer], []);
+            }
         }
     }
 

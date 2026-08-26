@@ -56,7 +56,7 @@ public sealed class ResidentCandidateCoordinator
         }
     }
 
-    /// <summary>在锁外完成设置读取与平台发现，并仅让最新请求发布结果。</summary>
+    /// <summary>在锁外完成设置读取与平台发现，并让调用方只观察实际发布的最新批次。</summary>
     public async Task<ResidentDiscoveryBatch> DiscoverAsync(
         IReadOnlySet<string> ordinaryWindowPaths,
         CancellationToken cancellationToken)
@@ -87,14 +87,14 @@ public sealed class ResidentCandidateCoordinator
 
         lock (stateSync)
         {
-            // 迟到旧结果不得覆盖更新的进程观察；发布锁只保护内存状态，不覆盖任何 await 或 I/O。
+            // 代次是否仍为最新、发布与返回必须共享同一线性化点；迟到调用返回当时 Current，锁内没有 await 或 I/O。
             if (generation == latestRequestedGeneration)
             {
                 current = batch;
             }
-        }
 
-        return batch;
+            return current;
+        }
     }
 
     /// <summary>深拷贝发现候选的集合字段，防止发布后外部引用改变确认时的可信元数据。</summary>
