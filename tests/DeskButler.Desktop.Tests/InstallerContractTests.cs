@@ -131,11 +131,36 @@ public sealed class InstallerContractTests
         Assert.DoesNotMatch(@"(?im)^[ \t]*function\b", topLevelText);
         var markerIndex = topLevelText.LastIndexOf(topLevelMarker, StringComparison.Ordinal);
         Assert.True(markerIndex >= 0, $"PowerShell top-level marker was not found: {topLevelMarker}");
-        var terminatingStatements = NormalizePowerShellStatements(topLevelText[..markerIndex])
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(IsExplicitPowerShellTermination)
-            .ToArray();
+        var terminatingStatements = ReadExplicitPowerShellTerminations(topLevelText[..markerIndex]);
         Assert.Empty(terminatingStatements);
+        Assert.Equal(
+            ["return"],
+            ReadExplicitPowerShellTerminations("Write-Output x; return"));
+        Assert.Equal(
+            ["exit 0"],
+            ReadExplicitPowerShellTerminations("Write-Output x; exit 0"));
+        Assert.Equal(
+            ["throw 'fixture stopped'", "break", "continue"],
+            ReadExplicitPowerShellTerminations(
+                "Write-Output x; throw 'fixture stopped'; break; continue"));
+        Assert.Equal(
+            ["[Environment]::Exit(0)", "$host.SetShouldExit(0)", "Stop-Process -Id $PID"],
+            ReadExplicitPowerShellTerminations(
+                "Write-Output x; [Environment]::Exit(0); $host.SetShouldExit(0); Stop-Process -Id $PID"));
+
+        const string harmlessNestedTerminations =
+            """
+            Write-Output "return; exit"
+            Write-Output 'Stop-Process $PID; throw'
+            Write-Output "escaped `"return; exit`""
+            Write-Output 'escaped ''return; exit'''
+            # return; exit 0
+            <# $host.SetShouldExit(0); break #>
+            & { Write-Output x; return }
+            function Invoke-Nested { Write-Output x; exit 0 }
+            """;
+        Assert.Empty(ReadExplicitPowerShellTerminations(
+            ReadPowerShellTopLevelText(harmlessNestedTerminations)));
 
         var topLevelTail = NormalizePowerShellStatements(
             ReadPowerShellTail(fixture, topLevelMarker));
@@ -287,6 +312,217 @@ public sealed class InstallerContractTests
 
         return topLevel.ToString();
     }
+
+    /// <summary>按 PowerShell 顶层换行或分号切分语句，同时避开字符串、注释与嵌套结构。</summary>
+    private static string[] SplitPowerShellTopLevelStatements(string source)
+    {
+        var statements = new List<string>();
+        var statement = new System.Text.StringBuilder();
+        var parenthesisDepth = 0;
+        var braceDepth = 0;
+        var bracketDepth = 0;
+        var blockCommentDepth = 0;
+        var inSingleQuotedString = false;
+        var inDoubleQuotedString = false;
+        var inLineComment = false;
+
+        // 提交去除首尾空白的语句，忽略注释留下的纯空白片段。
+        void CompleteStatement()
+        {
+            var normalized = statement.ToString().Trim();
+            if (normalized.Length > 0)
+            {
+                statements.Add(normalized);
+            }
+
+            statement.Clear();
+        }
+
+        // 顶层换行是语句边界；嵌套结构中的换行只是普通空白。
+        void CompleteLine(ref int position)
+        {
+            if (source[position] == '\r' &&
+                position + 1 < source.Length &&
+                source[position + 1] == '\n')
+            {
+                position++;
+            }
+
+            if (parenthesisDepth == 0 && braceDepth == 0 && bracketDepth == 0)
+            {
+                CompleteStatement();
+            }
+            else
+            {
+                statement.Append('\n');
+            }
+        }
+
+        // 反引号后的字符属于当前 token；被转义的 CRLF 也不能形成语句边界。
+        void AppendEscapedCharacter(ref int position)
+        {
+            if (position + 1 >= source.Length)
+            {
+                return;
+            }
+
+            statement.Append(source[++position]);
+            if (source[position] == '\r' &&
+                position + 1 < source.Length &&
+                source[position + 1] == '\n')
+            {
+                statement.Append(source[++position]);
+            }
+        }
+
+        for (var index = 0; index < source.Length; index++)
+        {
+            var current = source[index];
+            var next = index + 1 < source.Length ? source[index + 1] : '\0';
+
+            if (inLineComment)
+            {
+                if (current is '\r' or '\n')
+                {
+                    inLineComment = false;
+                    CompleteLine(ref index);
+                }
+
+                continue;
+            }
+
+            if (blockCommentDepth > 0)
+            {
+                if (current == '<' && next == '#')
+                {
+                    blockCommentDepth++;
+                    index++;
+                }
+                else if (current == '#' && next == '>')
+                {
+                    blockCommentDepth--;
+                    index++;
+                }
+
+                continue;
+            }
+
+            if (inSingleQuotedString)
+            {
+                statement.Append(current);
+                if (current == '\'' && next == '\'')
+                {
+                    statement.Append(next);
+                    index++;
+                }
+                else if (current == '\'')
+                {
+                    inSingleQuotedString = false;
+                }
+
+                continue;
+            }
+
+            if (inDoubleQuotedString)
+            {
+                statement.Append(current);
+                if (current == '`' && next != '\0')
+                {
+                    AppendEscapedCharacter(ref index);
+                }
+                else if (current == '"' && next == '"')
+                {
+                    statement.Append(next);
+                    index++;
+                }
+                else if (current == '"')
+                {
+                    inDoubleQuotedString = false;
+                }
+
+                continue;
+            }
+
+            if (current == '`')
+            {
+                statement.Append(current);
+                AppendEscapedCharacter(ref index);
+                continue;
+            }
+
+            if (current == '#')
+            {
+                inLineComment = true;
+                continue;
+            }
+
+            if (current == '<' && next == '#')
+            {
+                blockCommentDepth = 1;
+                statement.Append(' ');
+                index++;
+                continue;
+            }
+
+            if (current == '\'')
+            {
+                inSingleQuotedString = true;
+                statement.Append(current);
+                continue;
+            }
+
+            if (current == '"')
+            {
+                inDoubleQuotedString = true;
+                statement.Append(current);
+                continue;
+            }
+
+            if (current is '\r' or '\n')
+            {
+                CompleteLine(ref index);
+                continue;
+            }
+
+            if (current == ';' && parenthesisDepth == 0 && braceDepth == 0 && bracketDepth == 0)
+            {
+                CompleteStatement();
+                continue;
+            }
+
+            statement.Append(current);
+            switch (current)
+            {
+                case '(':
+                    parenthesisDepth++;
+                    break;
+                case ')' when parenthesisDepth > 0:
+                    parenthesisDepth--;
+                    break;
+                case '{':
+                    braceDepth++;
+                    break;
+                case '}' when braceDepth > 0:
+                    braceDepth--;
+                    break;
+                case '[':
+                    bracketDepth++;
+                    break;
+                case ']' when bracketDepth > 0:
+                    bracketDepth--;
+                    break;
+            }
+        }
+
+        CompleteStatement();
+        return statements.ToArray();
+    }
+
+    /// <summary>从规范化的顶层语句中筛出会终止当前 PowerShell 脚本的语句。</summary>
+    private static string[] ReadExplicitPowerShellTerminations(string source) =>
+        SplitPowerShellTopLevelStatements(source)
+            .Where(IsExplicitPowerShellTermination)
+            .ToArray();
 
     /// <summary>以既有花括号深度规则找到函数体结尾，供函数读取与顶层剔除共同使用。</summary>
     private static int FindMatchingPowerShellBrace(string script, int openingBrace, string context)
