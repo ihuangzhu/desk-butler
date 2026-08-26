@@ -33,6 +33,7 @@ public sealed class CompositionRoot : IAsyncDisposable
     private readonly CompositionStartupCoordinator startup;
     private readonly SqliteSceneRepository repository;
     private readonly RecoveryCardFocusCoordinator recoveryCardFocus;
+    private readonly ResidentCandidateFocusCoordinator residentCandidateFocus;
     private readonly ResidentLaunchCoordinator residentLaunchCoordinator;
     private readonly BestEffortAsyncCleanup cleanup;
 
@@ -40,6 +41,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         CompositionStartupCoordinator startup,
         SqliteSceneRepository repository,
         RecoveryCardFocusCoordinator recoveryCardFocus,
+        ResidentCandidateFocusCoordinator residentCandidateFocus,
         ResidentLaunchCoordinator residentLaunchCoordinator,
         MainViewModel mainViewModel,
         RecoveryCardViewModel recoveryCardViewModel,
@@ -51,6 +53,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         this.startup = startup;
         this.repository = repository;
         this.recoveryCardFocus = recoveryCardFocus;
+        this.residentCandidateFocus = residentCandidateFocus;
         this.residentLaunchCoordinator = residentLaunchCoordinator;
         MainViewModel = mainViewModel;
         RecoveryCardViewModel = recoveryCardViewModel;
@@ -58,6 +61,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         RecoveryCardWindow = recoveryCardWindow;
         TrayIcon = trayIcon;
         this.cleanup = cleanup;
+        MainViewModel.ResidentCandidatesAvailable += OnResidentCandidatesAvailable;
     }
 
     /// <summary>获取共享主界面模型。</summary>
@@ -194,6 +198,7 @@ public sealed class CompositionRoot : IAsyncDisposable
     /// <summary>停止后台模块并按安全顺序释放托盘、窗口和持久化资源。</summary>
     public async ValueTask DisposeAsync()
     {
+        MainViewModel.ResidentCandidatesAvailable -= OnResidentCandidatesAvailable;
         if (!cleanup.IsComplete)
         {
             await cleanup.RunAsync();
@@ -395,7 +400,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                     automaticCaptureGate,
                     new ResidentViewModelDependencies(
                         new WindowsExecutablePicker(),
-                        new FallbackExecutableIconProvider(),
+                        new WindowsExecutableIconProvider(),
                         residentExecutablePolicy.Validate,
                         residentLaunchCoordinator.LaunchEnabledNowAsync)),
                 static viewModel =>
@@ -429,6 +434,10 @@ public sealed class CompositionRoot : IAsyncDisposable
             var recoveryCardFocus = new RecoveryCardFocusCoordinator(
                 () => root?.ShowRecoveryCardForLatestSceneAsync() ?? Task.FromResult(false),
                 recoveryCardWindow.FocusForKeyboard);
+            var residentCandidateFocus = new ResidentCandidateFocusCoordinator(
+                () => mainWindow.IsVisible,
+                () => root?.ShowMainWindow(),
+                mainWindow.FocusResidentCandidateConfirmation);
             var trayIcon = ownership.Own(
                 "tray",
                 new TrayIconService(
@@ -446,6 +455,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 startup,
                 repository,
                 recoveryCardFocus,
+                residentCandidateFocus,
                 residentLaunchCoordinator,
                 mainViewModel,
                 recoveryCardViewModel,
@@ -456,6 +466,9 @@ public sealed class CompositionRoot : IAsyncDisposable
             return root;
         }).ConfigureAwait(false);
     }
+
+    /// <summary>仅手动保存发布的候选事件触发窗口边界；SceneSaved 和自动刷新不订阅此入口。</summary>
+    private void OnResidentCandidatesAvailable(object? sender, EventArgs eventArgs) => residentCandidateFocus.Focus();
 
     /// <summary>创建共享同一事件总线的模块宿主和可清理诊断观察边界。</summary>
     internal static ModuleStateComposition CreateModuleStateComposition(

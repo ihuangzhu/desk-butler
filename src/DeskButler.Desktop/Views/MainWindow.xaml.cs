@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Input;
 using DeskButler.Desktop.ViewModels;
 
 namespace DeskButler.Desktop.Views;
@@ -21,6 +22,16 @@ public partial class MainWindow : Window
     {
         allowClose = true;
         Close();
+    }
+
+    /// <summary>在 Dispatcher 队列中聚焦具名确认区，确保 Show 完成布局后才移动键盘焦点。</summary>
+    public void FocusResidentCandidateConfirmation()
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            ResidentCandidateConfirmationPanel.Focus();
+            Keyboard.Focus(ResidentCandidateConfirmationPanel);
+        });
     }
 
     /// <summary>普通关闭仅隐藏窗口，维持托盘宿主运行。</summary>

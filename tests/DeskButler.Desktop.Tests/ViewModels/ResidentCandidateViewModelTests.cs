@@ -121,6 +121,24 @@ public sealed class ResidentCandidateViewModelTests
         Assert.False(vm.EnableCommand.CanExecute(true));
     }
 
+    /// <summary>WPF XAML 字符串命令参数必须被解析为布尔值，否则“启用”按钮无法执行。</summary>
+    [Fact]
+    public void ApplicationEnableCommandAcceptsWpfBooleanCommandParameter()
+    {
+        var app = new ResidentApplication(@"C:\Apps\Agent.exe", new HashSet<string>(), "Agent", false, 0);
+        var vm = new ResidentApplicationViewModel(
+            app,
+            new FakeExecutablePicker(),
+            new FakeExecutableIconProvider(),
+            path => new ResidentExecutableValidation(true, path, ResidentExecutableRejection.None),
+            (_, _) => Task.CompletedTask,
+            _ => Task.CompletedTask,
+            (_, _) => Task.CompletedTask,
+            (_, _) => Task.CompletedTask);
+
+        Assert.True(vm.EnableCommand.CanExecute("True"));
+    }
+
     private static ResidentAppCandidate CreateCandidate(
         ResidentCandidateConfidence confidence,
         ResidentCandidateKind kind,

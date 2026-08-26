@@ -33,6 +33,7 @@ public sealed class TrayIconService : IDisposable
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(CreateActionItem("保存当前现场", (_, _) => viewModel.SaveNowCommand.Execute(null)));
+        menu.Items.Add(CreateLaunchResidentsNowItem(viewModel));
         recentScenesItem = new ToolStripMenuItem("最近现场");
         menu.Items.Add(recentScenesItem);
         captureToggleItem = CreateActionItem(viewModel.CaptureToggleText, (_, _) => viewModel.ToggleCaptureCommand.Execute(null));
@@ -79,6 +80,13 @@ public sealed class TrayIconService : IDisposable
         var item = new ToolStripMenuItem(text);
         item.Click += click;
         return item;
+    }
+
+    /// <summary>创建复用 ViewModel 手动批次命令的托盘入口，不建立第二个常驻协调器。</summary>
+    internal static ToolStripMenuItem CreateLaunchResidentsNowItem(MainViewModel viewModel)
+    {
+        ArgumentNullException.ThrowIfNull(viewModel);
+        return CreateActionItem("立即启动常驻应用", (_, _) => viewModel.LaunchResidentsNowCommand.Execute(null));
     }
 
     /// <summary>双击托盘图标时打开主窗口。</summary>

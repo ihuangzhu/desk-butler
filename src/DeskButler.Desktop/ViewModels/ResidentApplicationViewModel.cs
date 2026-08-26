@@ -39,8 +39,8 @@ public sealed class ResidentApplicationViewModel : ObservableObject
         validation = this.validateExecutable(Application.LaunchPath);
         icon = iconProvider.GetIcon(Application.LaunchPath);
         EnableCommand = new AsyncCommand(
-            parameter => parameter is bool enabled ? SetEnabledAsync(enabled) : Task.CompletedTask,
-            parameter => parameter is bool enabled && (enabled ? CanEnable : IsEnabled));
+            parameter => TryGetEnabledState(parameter, out var enabled) ? SetEnabledAsync(enabled) : Task.CompletedTask,
+            parameter => TryGetEnabledState(parameter, out var enabled) && (enabled ? CanEnable : IsEnabled));
         RemoveCommand = new AsyncCommand(RemoveAsync);
         MoveUpCommand = new AsyncCommand(() => MoveAsync(-1));
         MoveDownCommand = new AsyncCommand(() => MoveAsync(1));
@@ -113,5 +113,17 @@ public sealed class ResidentApplicationViewModel : ObservableObject
         {
             await replacePathAsync(this, selected);
         }
+    }
+
+    /// <summary>兼容 WPF 标记中的布尔命令参数，保持 ViewModel 对直接 bool 调用的类型化契约。</summary>
+    private static bool TryGetEnabledState(object? parameter, out bool enabled)
+    {
+        if (parameter is bool boolean)
+        {
+            enabled = boolean;
+            return true;
+        }
+
+        return bool.TryParse(parameter as string, out enabled);
     }
 }
