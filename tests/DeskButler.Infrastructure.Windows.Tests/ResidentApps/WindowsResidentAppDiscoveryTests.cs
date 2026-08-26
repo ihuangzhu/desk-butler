@@ -162,7 +162,7 @@ public sealed class WindowsResidentAppDiscoveryTests
         var replacement = Assert.Single((await discovery.DiscoverAsync(Paths(), replacementExisting, CancellationToken.None)).Candidates);
 
         var differentPid = CreateDiscovery(
-            observations: [Observation(100, @"C:\Apps\Chat\Chat.exe", "Chat", "Vendor", hidden: true)],
+            observations: [Observation(100, @"c:\apps\chat\chat.EXE", "chat", "vendor", hidden: true)],
             catalog: [Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat.exe")]);
         var sameProductDifferentPid = Assert.Single(
             (await differentPid.DiscoverAsync(Paths(), [], CancellationToken.None)).Candidates);

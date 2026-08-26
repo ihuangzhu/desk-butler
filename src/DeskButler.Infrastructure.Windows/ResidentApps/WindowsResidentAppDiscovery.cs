@@ -426,7 +426,8 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         var replacement = TryNormalizePath(replacesLaunchPath) ?? string.Empty;
         static string Encode(string value) => $"{Encoding.UTF8.GetByteCount(value)}:{value}";
         var payload = string.Join("\n", (int)kind, Encode(groupKey.Kind), Encode(groupKey.Root),
-            Encode(groupKey.Product), Encode(groupKey.Publisher), Encode(sortingPath), Encode(replacement));
+            Encode(groupKey.Product), Encode(groupKey.Publisher), Encode(sortingPath.ToUpperInvariant()),
+            Encode(replacement.ToUpperInvariant()));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload)));
     }
 
