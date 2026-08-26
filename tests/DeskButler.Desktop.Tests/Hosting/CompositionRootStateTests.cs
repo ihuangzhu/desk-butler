@@ -19,6 +19,50 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class CompositionRootStateTests
 {
+    /// <summary>常驻自动批次只能在既有三个启动阶段成功后非阻塞建立，阶段失败时不得调用。</summary>
+    [Fact]
+    public async Task ResidentBatchStartsOnlyAfterExistingStartupStagesSucceed()
+    {
+        var calls = new List<string>();
+        var desktopBoundary = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var startup = new CompositionStartupCoordinator(
+            _ =>
+            {
+                calls.Add("module:start");
+                return Task.CompletedTask;
+            },
+            _ => Task.CompletedTask,
+            () => calls.Add("session:start"),
+            () => { },
+            async _ =>
+            {
+                calls.Add("desktop:start");
+                await desktopBoundary.Task;
+            },
+            () => ValueTask.CompletedTask);
+        var cleanup = new BestEffortAsyncCleanup(
+        [
+            new CleanupStep("resident-start-test", () => ValueTask.CompletedTask)
+        ]);
+
+        var start = CompositionRoot.StartCoreAsync(
+            startup,
+            cleanup,
+            () => calls.Add("resident:start"),
+            CancellationToken.None);
+        Assert.Equal(["module:start", "session:start", "desktop:start"], calls);
+        Assert.False(start.IsCompleted);
+        Assert.DoesNotContain("resident:start", calls);
+
+        desktopBoundary.TrySetResult();
+        await start;
+
+        Assert.Equal(
+            ["module:start", "session:start", "desktop:start", "resident:start"],
+            calls);
+    }
+
     /// <summary>生产常驻命令注册集必须让候选确认和所有列表编辑共享唯一设置协调器。</summary>
     [Fact]
     public async Task ResidentCommandRegistrationSharesCoordinatorAndRegistersEveryMutation()

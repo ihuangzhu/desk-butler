@@ -33,12 +33,14 @@ public sealed class CompositionRoot : IAsyncDisposable
     private readonly CompositionStartupCoordinator startup;
     private readonly SqliteSceneRepository repository;
     private readonly RecoveryCardFocusCoordinator recoveryCardFocus;
+    private readonly ResidentLaunchCoordinator residentLaunchCoordinator;
     private readonly BestEffortAsyncCleanup cleanup;
 
     private CompositionRoot(
         CompositionStartupCoordinator startup,
         SqliteSceneRepository repository,
         RecoveryCardFocusCoordinator recoveryCardFocus,
+        ResidentLaunchCoordinator residentLaunchCoordinator,
         MainViewModel mainViewModel,
         RecoveryCardViewModel recoveryCardViewModel,
         MainWindow mainWindow,
@@ -49,6 +51,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         this.startup = startup;
         this.repository = repository;
         this.recoveryCardFocus = recoveryCardFocus;
+        this.residentLaunchCoordinator = residentLaunchCoordinator;
         MainViewModel = mainViewModel;
         RecoveryCardViewModel = recoveryCardViewModel;
         MainWindow = mainWindow;
@@ -99,7 +102,25 @@ public sealed class CompositionRoot : IAsyncDisposable
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(cleanup.IsComplete, this);
+        await StartCoreAsync(
+            startup,
+            cleanup,
+            residentLaunchCoordinator.Start,
+            cancellationToken);
+    }
+
+    /// <summary>在既有启动阶段全部成功后建立非阻塞常驻批次；失败时绝不越过该边界。</summary>
+    internal static async Task StartCoreAsync(
+        CompositionStartupCoordinator startup,
+        BestEffortAsyncCleanup cleanup,
+        Action startResidentBatch,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(startup);
+        ArgumentNullException.ThrowIfNull(cleanup);
+        ArgumentNullException.ThrowIfNull(startResidentBatch);
         await startup.StartAsync(cleanup, cancellationToken);
+        startResidentBatch();
     }
 
     /// <summary>加载最近现场并在存在时展示最新一份恢复卡片。</summary>
@@ -261,6 +282,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                     coordinator.Dispose();
                     return ValueTask.CompletedTask;
                 });
+            var residentExecutablePolicy = new WindowsResidentExecutablePolicy();
             var residentCandidates = new ResidentCandidateCoordinator(
                 WindowsResidentAppDiscovery.CreateDefault(),
                 settingsStore,
@@ -268,7 +290,18 @@ public sealed class CompositionRoot : IAsyncDisposable
             var residentCommands = ResidentAppCommandHandlerSet.Create(
                 residentCandidates,
                 settingsCoordinator,
-                new WindowsResidentExecutablePolicy());
+                residentExecutablePolicy);
+            var residentLaunchCoordinator = ownership.Own(
+                "resident launch coordinator",
+                new ResidentLaunchCoordinator(
+                    settingsStore,
+                    new JsonResidentLaunchSessionStore(paths),
+                    new WindowsLogonSessionIdentityProvider(),
+                    new WindowsResidentProcessRuntime(residentExecutablePolicy),
+                    residentExecutablePolicy,
+                    clock,
+                    diagnosticLog),
+                static coordinator => coordinator.DisposeAsync());
             var scheduler = ownership.Own(
                 "scheduler",
                 new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync),
@@ -408,6 +441,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 startup,
                 repository,
                 recoveryCardFocus,
+                residentLaunchCoordinator,
                 mainViewModel,
                 recoveryCardViewModel,
                 mainWindow,
