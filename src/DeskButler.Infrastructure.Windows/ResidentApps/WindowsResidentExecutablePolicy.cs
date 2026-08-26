@@ -74,6 +74,11 @@ public sealed class WindowsResidentExecutablePolicy : IResidentExecutablePolicy
             return Reject(ResidentExecutableRejection.NetworkPath);
         }
 
+        if (HasNamedDataStream(sourcePath))
+        {
+            return Reject(ResidentExecutableRejection.InvalidPath);
+        }
+
         if (!Path.GetExtension(sourcePath).Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
             Directory.Exists(sourcePath))
         {
@@ -84,8 +89,17 @@ public sealed class WindowsResidentExecutablePolicy : IResidentExecutablePolicy
         {
             var resolution = finalPathResolver.Resolve(sourcePath);
             var finalPath = Path.GetFullPath(resolution.FinalPath);
-            if (!Path.IsPathFullyQualified(finalPath) ||
-                !Path.GetExtension(finalPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            if (!Path.IsPathFullyQualified(finalPath))
+            {
+                return Reject(ResidentExecutableRejection.ValidationFailed);
+            }
+
+            if (HasNamedDataStream(finalPath))
+            {
+                return Reject(ResidentExecutableRejection.InvalidPath);
+            }
+
+            if (!Path.GetExtension(finalPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 return Reject(ResidentExecutableRejection.ValidationFailed);
             }
@@ -132,6 +146,14 @@ public sealed class WindowsResidentExecutablePolicy : IResidentExecutablePolicy
             // 策略依赖异常只暴露稳定分类，不把本地路径或底层异常文本带入诊断。
             return Reject(ResidentExecutableRejection.ValidationFailed);
         }
+    }
+
+    /// <summary>允许卷根自身的盘符冒号，但拒绝卷根之后表示 NTFS 命名数据流的任何冒号。</summary>
+    private static bool HasNamedDataStream(string path)
+    {
+        var root = Path.GetPathRoot(path)
+            ?? throw new IOException("路径没有卷根。");
+        return path.IndexOf(':', root.Length) >= 0;
     }
 
     /// <summary>解析并验证所有固定禁止根；任一系统目录获取失败会由外层 fail-closed。</summary>

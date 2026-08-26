@@ -1,5 +1,7 @@
 using DeskButler.Core.ResidentApps;
 using DeskButler.Infrastructure.Windows.ResidentApps;
+using System.Reflection;
+using System.Text;
 
 namespace DeskButler.Infrastructure.Windows.Tests.ResidentApps;
 
@@ -39,6 +41,36 @@ public sealed class WindowsResidentExecutablePolicyTests
         var result = policy.Validate(@"C:\invalid" + '\0' + "path.exe");
 
         Assert.Equal(ResidentExecutableRejection.InvalidPath, result.Reason);
+    }
+
+    /// <summary>源路径卷根之后的冒号表示 ADS，不得伪装成普通 exe。</summary>
+    [WindowsTheory]
+    [InlineData(":payload.exe")]
+    [InlineData(":payload")]
+    public void ValidateRejectsAlternateDataStreamInSourcePath(string streamSuffix)
+    {
+        using var fixture = ResidentFixtureCopy.Create();
+        var policy = CreatePolicy();
+
+        var result = policy.Validate(fixture.ExecutablePath + streamSuffix);
+
+        Assert.Equal(ResidentExecutableRejection.InvalidPath, result.Reason);
+        Assert.Null(result.NormalizedPath);
+    }
+
+    /// <summary>最终解析路径卷根之后出现 ADS 时也必须拒绝，不能只检查用户输入。</summary>
+    [WindowsTheory]
+    [InlineData(":payload.exe")]
+    [InlineData(":payload")]
+    public void ValidateRejectsAlternateDataStreamInFinalPath(string streamSuffix)
+    {
+        using var fixture = ResidentFixtureCopy.Create();
+        var policy = CreatePolicy(finalPath: fixture.ExecutablePath + streamSuffix);
+
+        var result = policy.Validate(fixture.ExecutablePath);
+
+        Assert.Equal(ResidentExecutableRejection.InvalidPath, result.Reason);
+        Assert.Null(result.NormalizedPath);
     }
 
     /// <summary>目录即使以 exe 结尾也不是普通可执行文件。</summary>
@@ -268,6 +300,163 @@ public sealed class WindowsResidentExecutablePolicyTests
 
         Assert.True(result.IsReliable);
         Assert.Equal(ExecutableElevationLevel.AsInvoker, result.Level);
+    }
+
+    /// <summary>完整的 asm.v2、v2/v3 混合和 asm.v3 UAC 层级都必须可靠解析。</summary>
+    [Fact]
+    public void ElevationInspectorAcceptsSupportedManifestNamespaceStructures()
+    {
+        string[] manifests =
+        [
+            """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+                <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """,
+            """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+                <security><requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3"><requestedExecutionLevel level="asInvoker" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """,
+            """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges><requestedExecutionLevel level="asInvoker" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """
+        ];
+
+        foreach (var manifest in manifests)
+        {
+            var result = ParseManifest(manifest);
+
+            Assert.True(result.IsReliable);
+            Assert.Equal(ExecutableElevationLevel.AsInvoker, result.Level);
+        }
+    }
+
+    /// <summary>同名节点位于未知 namespace 时不得绕过可靠性检查。</summary>
+    [Fact]
+    public void ElevationInspectorRejectsRequestedLevelInWrongNamespace()
+    {
+        const string manifest = """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges><requestedExecutionLevel xmlns="urn:example:wrong" level="asInvoker" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>requestedExecutionLevel 位于规定层级之外时 manifest 必须不可靠。</summary>
+    [Fact]
+    public void ElevationInspectorRejectsRequestedLevelAtWrongHierarchy()
+    {
+        const string manifest = """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <requestedExecutionLevel level="asInvoker" />
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>RT_MANIFEST 存在但没有 requestedExecutionLevel 时不得套用资源缺失默认值。</summary>
+    [Fact]
+    public void ElevationInspectorRejectsManifestWithoutRequestedLevelNode()
+    {
+        const string manifest = """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges /></security>
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>重复 requestedExecutionLevel 无法唯一确定 UAC 行为，必须不可靠。</summary>
+    [Fact]
+    public void ElevationInspectorRejectsDuplicateRequestedLevelNodes()
+    {
+        const string manifest = """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges>
+                  <requestedExecutionLevel level="asInvoker" />
+                  <requestedExecutionLevel level="requireAdministrator" />
+                </requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>节点存在但缺少必需 level 属性时不得默认为 asInvoker。</summary>
+    [Fact]
+    public void ElevationInspectorRejectsRequestedLevelWithoutLevelAttribute()
+    {
+        const string manifest = """
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges><requestedExecutionLevel uiAccess="false" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>非 schema 枚举值或空 level 属性都必须不可靠。</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("unknown")]
+    [InlineData(" asInvoker ")]
+    public void ElevationInspectorRejectsInvalidRequestedLevelValue(string level)
+    {
+        var manifest = $"""
+            <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+              <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+                <security><requestedPrivileges><requestedExecutionLevel level="{level}" /></requestedPrivileges></security>
+              </trustInfo>
+            </assembly>
+            """;
+
+        var result = ParseManifest(manifest);
+
+        Assert.False(result.IsReliable);
+    }
+
+    /// <summary>通过生产 parser 解析测试提供的 manifest 字节，不绕过 XML 安全设置。</summary>
+    private static ExecutableElevationInspection ParseManifest(string manifest)
+    {
+        var parser = typeof(WindowsExecutableElevationInspector).GetMethod(
+            "Parse",
+            BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(parser);
+        return Assert.IsType<ExecutableElevationInspection>(
+            parser.Invoke(null, [Encoding.UTF8.GetBytes(manifest)]));
     }
 
     /// <summary>构造可独立控制最终路径、卷类型和 manifest 的策略。</summary>

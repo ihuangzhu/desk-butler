@@ -72,9 +72,12 @@ internal sealed class WindowsExecutableElevationInspector : IExecutableElevation
         }
     }
 
-    /// <summary>以禁用 DTD 和外部解析器的方式读取 requestedExecutionLevel。</summary>
+    /// <summary>以禁用 DTD 和外部解析器的方式读取唯一且位于 Windows 支持层级中的 requestedExecutionLevel。</summary>
     private static ExecutableElevationInspection Parse(byte[] manifest)
     {
+        XNamespace assemblyV1 = "urn:schemas-microsoft-com:asm.v1";
+        XNamespace assemblyV2 = "urn:schemas-microsoft-com:asm.v2";
+        XNamespace assemblyV3 = "urn:schemas-microsoft-com:asm.v3";
         using var stream = new MemoryStream(manifest, writable: false);
         using var reader = XmlReader.Create(stream, new XmlReaderSettings
         {
@@ -82,22 +85,64 @@ internal sealed class WindowsExecutableElevationInspector : IExecutableElevation
             XmlResolver = null
         });
         var document = XDocument.Load(reader, LoadOptions.None);
-        var requestedLevel = document.Descendants()
-            .FirstOrDefault(element => element.Name.LocalName == "requestedExecutionLevel");
-        var level = requestedLevel?.Attribute("level")?.Value;
-        if (level is null || level.Equals("asInvoker", StringComparison.OrdinalIgnoreCase))
+        var root = document.Root;
+        if (root?.Name != assemblyV1 + "assembly")
+        {
+            return Unreliable();
+        }
+
+        var allRequestedLevels = document.Descendants()
+            .Where(element => element.Name.LocalName == "requestedExecutionLevel")
+            .Take(2)
+            .ToArray();
+        var supportedRequestedLevels = FindSupportedRequestedLevels(root, assemblyV2, assemblyV3)
+            .Take(2)
+            .ToArray();
+        if (allRequestedLevels.Length != 1 ||
+            supportedRequestedLevels.Length != 1 ||
+            !ReferenceEquals(allRequestedLevels[0], supportedRequestedLevels[0]))
+        {
+            // manifest 资源存在时，缺失、重复、错层级或错 namespace 都无法可靠确定 UAC 行为。
+            return Unreliable();
+        }
+
+        var level = supportedRequestedLevels[0].Attribute("level")?.Value;
+        if (level == "asInvoker")
         {
             return Reliable(ExecutableElevationLevel.AsInvoker);
         }
 
-        if (level.Equals("highestAvailable", StringComparison.OrdinalIgnoreCase))
+        if (level == "highestAvailable")
         {
             return Reliable(ExecutableElevationLevel.HighestAvailable);
         }
 
-        return level.Equals("requireAdministrator", StringComparison.OrdinalIgnoreCase)
+        return level == "requireAdministrator"
             ? Reliable(ExecutableElevationLevel.RequireAdministrator)
             : Unreliable();
+    }
+
+    /// <summary>枚举 Windows manifest 明确支持的 asm.v2、v2/v3 混合与 asm.v3 请求权限层级。</summary>
+    private static IEnumerable<XElement> FindSupportedRequestedLevels(
+        XElement root,
+        XNamespace assemblyV2,
+        XNamespace assemblyV3)
+    {
+        return FindRequestedLevels(root, assemblyV2, assemblyV2)
+            .Concat(FindRequestedLevels(root, assemblyV2, assemblyV3))
+            .Concat(FindRequestedLevels(root, assemblyV3, assemblyV3));
+    }
+
+    /// <summary>按指定 trustInfo/security 与 requestedPrivileges 命名空间枚举完整的直接子级链。</summary>
+    private static IEnumerable<XElement> FindRequestedLevels(
+        XElement root,
+        XNamespace trustNamespace,
+        XNamespace privilegesNamespace)
+    {
+        return root.Elements(trustNamespace + "trustInfo")
+            .SelectMany(trustInfo => trustInfo.Elements(trustNamespace + "security"))
+            .SelectMany(security => security.Elements(privilegesNamespace + "requestedPrivileges"))
+            .SelectMany(privileges => privileges.Elements(privilegesNamespace + "requestedExecutionLevel"));
     }
 
     /// <summary>构造可靠的提升级别结果。</summary>
