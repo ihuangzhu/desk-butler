@@ -33,6 +33,22 @@ public sealed class ResidentAppCommandTests
         Assert.Equal(app, Assert.Single(result.Applications));
     }
 
+    /// <summary>总开关已是目标状态时保持幂等，并返回当前设置快照。</summary>
+    [Fact]
+    public async Task TotalSwitchSameValueIsNoOp()
+    {
+        var store = new InMemorySettingsStore(ButlerSettings.Default);
+        using var settings = new SettingsCoordinator(store);
+        var handler = new SetResidentApplicationsEnabledCommandHandler(settings);
+
+        var result = await handler.HandleAsync(
+            new SetResidentApplicationsEnabledCommand(true), CancellationToken.None);
+
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.None, result.Error);
+        Assert.True(result.ResidentApplicationsEnabled);
+    }
+
     /// <summary>移动只接受相邻偏移并把实际持久化顺序连续编号。</summary>
     [Fact]
     public async Task MoveAcceptsOnlyAdjacentOffsetAndRenumbersStableOrder()
@@ -58,6 +74,33 @@ public sealed class ResidentAppCommandTests
         Assert.Equal(ResidentSettingsError.InvalidMoveOffset, invalid.Error);
         Assert.Equal(["Second", "First", "Third"], moved.Applications.Select(app => app.DisplayName));
         Assert.Equal([0, 1, 2], moved.Applications.Select(app => app.LaunchOrder));
+    }
+
+    /// <summary>合法相邻偏移在首尾边界没有目标位置时是幂等 no-op。</summary>
+    [Fact]
+    public async Task MoveAtFirstAndLastBoundaryIsNoOp()
+    {
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications =
+            [
+                App("First", @"C:\Apps\first.exe", true, 0),
+                App("Last", @"C:\Apps\last.exe", true, 1)
+            ]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var handler = new MoveResidentApplicationCommandHandler(settings);
+
+        var first = await handler.HandleAsync(
+            new MoveResidentApplicationCommand(@"C:\Apps\first.exe", -1), CancellationToken.None);
+        var last = await handler.HandleAsync(
+            new MoveResidentApplicationCommand(@"C:\Apps\last.exe", 1), CancellationToken.None);
+
+        Assert.False(first.Changed);
+        Assert.Equal(ResidentSettingsError.None, first.Error);
+        Assert.False(last.Changed);
+        Assert.Equal(ResidentSettingsError.None, last.Error);
+        Assert.Equal(["First", "Last"], store.Current.ResidentApplications.Select(app => app.DisplayName));
     }
 
     /// <summary>重复的删除请求是无副作用且不把幂等结果当作错误。</summary>
@@ -151,6 +194,76 @@ public sealed class ResidentAppCommandTests
         Assert.Equal(ResidentSettingsError.KnownProcessPathConflict, result.Error);
     }
 
+    /// <summary>已启用的同值请求仍重新调用 policy；安全通过后才是 no-op。</summary>
+    [Fact]
+    public async Task AlreadyEnabledSameValueRevalidatesPolicyBeforeNoOp()
+    {
+        const string path = @"C:\Apps\chat.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications = [App("Chat", path, true, 0)]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var policy = new TrackingPolicy();
+        var handler = new SetResidentApplicationEnabledCommandHandler(settings, policy);
+
+        var result = await handler.HandleAsync(
+            new SetResidentApplicationEnabledCommand(path, true), CancellationToken.None);
+
+        Assert.Equal(1, policy.ValidationCount);
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.None, result.Error);
+    }
+
+    /// <summary>已停用的同值请求可短路，不需要重新检查不会启动的入口。</summary>
+    [Fact]
+    public async Task AlreadyDisabledSameValueSkipsExecutablePolicy()
+    {
+        const string path = @"C:\Apps\chat.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications = [App("Chat", path, false, 0)]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var policy = new TrackingPolicy(new(false, null, ResidentExecutableRejection.ProhibitedDirectory));
+        var handler = new SetResidentApplicationEnabledCommandHandler(settings, policy);
+
+        var result = await handler.HandleAsync(
+            new SetResidentApplicationEnabledCommand(path, false), CancellationToken.None);
+
+        Assert.Equal(0, policy.ValidationCount);
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.None, result.Error);
+    }
+
+    /// <summary>遗留的停用条目路径冲突不应阻止目标启用或之后再次停用。</summary>
+    [Fact]
+    public async Task DisabledPeerKnownPathConflictDoesNotBlockEnableOrDisable()
+    {
+        const string shared = @"C:\Apps\shared.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications =
+            [
+                App("Target", @"C:\Apps\target.exe", false, 0, shared),
+                App("Disabled peer", @"C:\Apps\peer.exe", false, 1, shared)
+            ]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var handler = new SetResidentApplicationEnabledCommandHandler(settings, new TrackingPolicy());
+
+        var enabled = await handler.HandleAsync(
+            new SetResidentApplicationEnabledCommand(@"C:\Apps\target.exe", true), CancellationToken.None);
+        var disabled = await handler.HandleAsync(
+            new SetResidentApplicationEnabledCommand(@"C:\Apps\target.exe", false), CancellationToken.None);
+
+        Assert.True(enabled.Changed);
+        Assert.Equal(ResidentSettingsError.None, enabled.Error);
+        Assert.True(disabled.Changed);
+        Assert.Equal(ResidentSettingsError.None, disabled.Error);
+        Assert.False(store.Current.ResidentApplications.Single(app => app.DisplayName == "Target").Enabled);
+    }
+
     /// <summary>添加不能绕过统一的可执行入口安全策略。</summary>
     [Fact]
     public async Task AddRejectsPathDeniedByExecutablePolicy()
@@ -166,6 +279,25 @@ public sealed class ResidentAppCommandTests
         Assert.False(result.Changed);
         Assert.Equal(ResidentSettingsError.ExecutablePathRejected, result.Error);
         Assert.Empty(result.Applications);
+    }
+
+    /// <summary>添加已有启动入口必须返回重复条目的类型化错误。</summary>
+    [Fact]
+    public async Task AddDuplicateLaunchPathReturnsTypedError()
+    {
+        const string path = @"C:\Apps\chat.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications = [App("Chat", path, true, 0)]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var handler = new AddResidentApplicationCommandHandler(settings, new TrackingPolicy());
+
+        var result = await handler.HandleAsync(new AddResidentApplicationCommand(path, "Again"), CancellationToken.None);
+
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.DuplicateLaunchPath, result.Error);
+        Assert.Equal("Chat", Assert.Single(result.Applications).DisplayName);
     }
 
     /// <summary>替换入口保留用户管理字段，但必须清除旧发现得出的识别路径。</summary>
@@ -193,6 +325,49 @@ public sealed class ResidentAppCommandTests
         Assert.False(replaced.Enabled);
         Assert.Equal(0, replaced.LaunchOrder);
         Assert.Equal([@"C:\Apps\new.exe"], replaced.KnownProcessPaths);
+    }
+
+    /// <summary>替换为同一正规化身份时仍先验证策略，成功后不重写用户条目。</summary>
+    [Fact]
+    public async Task ReplaceSameNormalizedIdentityRevalidatesPolicyThenNoOps()
+    {
+        const string path = @"C:\Apps\chat.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications = [App("Chat", path, true, 0, @"C:\Apps\helper.exe")]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var policy = new TrackingPolicy();
+        var handler = new ReplaceResidentApplicationPathCommandHandler(settings, policy);
+
+        var result = await handler.HandleAsync(
+            new ReplaceResidentApplicationPathCommand(path, @"C:\Apps\.\chat.exe"), CancellationToken.None);
+
+        Assert.Equal(1, policy.ValidationCount);
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.None, result.Error);
+        Assert.Contains(@"C:\Apps\helper.exe", Assert.Single(result.Applications).KnownProcessPaths);
+    }
+
+    /// <summary>同一正规化身份的替换也不能绕过策略拒绝。</summary>
+    [Fact]
+    public async Task ReplaceSameNormalizedIdentityReturnsPolicyErrorWhenRejected()
+    {
+        const string path = @"C:\Apps\chat.exe";
+        var store = new InMemorySettingsStore(ButlerSettings.Default with
+        {
+            ResidentApplications = [App("Chat", path, true, 0)]
+        });
+        using var settings = new SettingsCoordinator(store);
+        var policy = new TrackingPolicy(new(false, null, ResidentExecutableRejection.ProhibitedDirectory));
+        var handler = new ReplaceResidentApplicationPathCommandHandler(settings, policy);
+
+        var result = await handler.HandleAsync(
+            new ReplaceResidentApplicationPathCommand(path, @"C:\Apps\.\chat.exe"), CancellationToken.None);
+
+        Assert.Equal(1, policy.ValidationCount);
+        Assert.False(result.Changed);
+        Assert.Equal(ResidentSettingsError.ExecutablePathRejected, result.Error);
     }
 
     /// <summary>共享设置门必须使四种无关字段的并发修改全部保留。</summary>
@@ -264,6 +439,17 @@ public sealed class ResidentAppCommandTests
             denied?.Contains(path) == true
                 ? new(false, null, ResidentExecutableRejection.ProhibitedDirectory)
                 : new(true, Path.GetFullPath(path), ResidentExecutableRejection.None);
+    }
+
+    private sealed class TrackingPolicy(ResidentExecutableValidation? validation = null) : IResidentExecutablePolicy
+    {
+        internal int ValidationCount { get; private set; }
+
+        public ResidentExecutableValidation Validate(string path)
+        {
+            ValidationCount++;
+            return validation ?? new(true, Path.GetFullPath(path), ResidentExecutableRejection.None);
+        }
     }
 
     private sealed class StaticDiscovery(ResidentAppCandidate candidate) : IResidentAppDiscovery

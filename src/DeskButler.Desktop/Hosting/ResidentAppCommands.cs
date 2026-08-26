@@ -251,7 +251,8 @@ internal sealed class SetResidentApplicationEnabledCommandHandler(
 
         var applications = current.ResidentApplications.ToArray();
         applications[index] = target with { Enabled = command.IsEnabled };
-        return Normalize(current, applications);
+        // 启停只改变目标字段；不得用全表正规化器把停用项的历史冲突重新解释为本次错误。
+        return new(current with { ResidentApplications = applications }, true, ResidentSettingsError.None);
     }
 }
 
