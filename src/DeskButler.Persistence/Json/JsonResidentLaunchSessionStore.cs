@@ -41,10 +41,7 @@ public sealed class JsonResidentLaunchSessionStore : IResidentLaunchSessionStore
     /// <inheritdoc />
     public async Task<ResidentLaunchSession?> LoadAsync(CancellationToken cancellationToken)
     {
-        if (!File.Exists(paths.ResidentLaunchSessionFilePath))
-        {
-            return null;
-        }
+        cancellationToken.ThrowIfCancellationRequested();
 
         try
         {
@@ -61,6 +58,14 @@ public sealed class JsonResidentLaunchSessionStore : IResidentLaunchSessionStore
         catch (NotSupportedException)
         {
             throw new InvalidDataException("常驻应用启动会话格式无效。");
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
         }
     }
 

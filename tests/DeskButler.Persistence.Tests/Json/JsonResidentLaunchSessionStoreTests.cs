@@ -17,6 +17,29 @@ public sealed class JsonResidentLaunchSessionStoreTests
         Assert.Null(session);
     }
 
+    /// <summary>验证预取消令牌不会被不存在会话的空值结果掩盖。</summary>
+    [Fact]
+    public async Task LoadAsyncThrowsWhenCancellationWasRequestedBeforeCheckingSessionFile()
+    {
+        await using var fixture = new SessionFixture();
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            fixture.Store.LoadAsync(cancellationSource.Token));
+    }
+
+    /// <summary>验证会话路径指向目录等非不存在 I/O 错误会向调用方传播。</summary>
+    [Fact]
+    public async Task LoadAsyncPropagatesNonMissingIoFailures()
+    {
+        await using var fixture = new SessionFixture();
+        Directory.CreateDirectory(fixture.Paths.ResidentLaunchSessionFilePath);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() =>
+            fixture.Store.LoadAsync(CancellationToken.None));
+    }
+
     /// <summary>验证原子保存后的会话能完整往返固定版本、LUID、完成状态和计划项。</summary>
     [Fact]
     public async Task SaveAsyncRoundTripsResidentLaunchSession()

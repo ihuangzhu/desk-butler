@@ -180,7 +180,7 @@ public sealed class JsonSettingsStoreTests
                     new HashSet<string>(StringComparer.OrdinalIgnoreCase) { @"C:\Apps\DeskOne.exe", @"C:\Apps\DeskOne.Helper.exe" },
                     "Desk One",
                     false,
-                    7)
+                    0)
             ]
         };
 
@@ -211,6 +211,49 @@ public sealed class JsonSettingsStoreTests
 
         await store.LoadAsync(CancellationToken.None);
         await store.LoadAsync(CancellationToken.None);
+
+        var diagnostic = Assert.Single(diagnostics);
+        Assert.Equal(ResidentNormalizationIssue.InvalidPath, diagnostic.Kind);
+    }
+
+    /// <summary>验证 JSON 字节变化即使问题种类相同，也会为新内容重新交付一次诊断。</summary>
+    [Fact]
+    public async Task LoadAsyncReportsResidentDiagnosticsAgainWhenJsonBytesChangeWithSameIssueKind()
+    {
+        await using var fixture = new SettingsFixture();
+        var diagnostics = new List<ResidentNormalizationDiagnostic>();
+        var store = new JsonSettingsStore(fixture.Paths, diagnosticSink: diagnostics.Add);
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """{"captureEnabled":true,"residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+
+        await store.LoadAsync(CancellationToken.None);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """{"captureEnabled":false,"residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+        await store.LoadAsync(CancellationToken.None);
+
+        Assert.Equal(2, diagnostics.Count);
+        Assert.All(diagnostics, item => Assert.Equal(ResidentNormalizationIssue.InvalidPath, item.Kind));
+    }
+
+    /// <summary>验证并发读取相同 JSON 字节时只会有一个调用交付常驻诊断。</summary>
+    [Fact]
+    public async Task LoadAsyncDeduplicatesResidentDiagnosticsAcrossConcurrentReaders()
+    {
+        await using var fixture = new SettingsFixture();
+        var diagnostics = new System.Collections.Concurrent.ConcurrentQueue<ResidentNormalizationDiagnostic>();
+        var store = new JsonSettingsStore(fixture.Paths, diagnostics.Enqueue);
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            """{"startupEnabled":false,"residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => store.LoadAsync(CancellationToken.None)));
 
         var diagnostic = Assert.Single(diagnostics);
         Assert.Equal(ResidentNormalizationIssue.InvalidPath, diagnostic.Kind);
