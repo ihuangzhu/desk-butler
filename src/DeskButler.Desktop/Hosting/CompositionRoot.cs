@@ -297,7 +297,16 @@ public sealed class CompositionRoot : IAsyncDisposable
                 paths.LogDirectory,
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ["deskbutler.jsonl", "deskbutler.1.jsonl", "deskbutler.2.jsonl"]);
-            var settingsStore = new JsonSettingsStore(paths, residentDiagnostics.ReportNormalization);
+            var settingsStore = new JsonSettingsStore(
+                paths,
+                diagnostic =>
+                {
+                    if (!residentDiagnostics.TryReportNormalization(diagnostic))
+                    {
+                        // 仅作为同步拒绝信号令 JsonSettingsStore 回滚本次指纹 reservation。
+                        throw new InvalidOperationException("Resident diagnostics have already been sealed.");
+                    }
+                });
             var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
             var startupRegistration = ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
             var settingsCoordinator = ownership.Own(

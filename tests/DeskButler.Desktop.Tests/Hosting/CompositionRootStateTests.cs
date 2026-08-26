@@ -202,6 +202,66 @@ public sealed class CompositionRootStateTests
         Assert.Single(activeLog.Events);
     }
 
+    /// <summary>封存 tracker 拒绝正规化后必须回滚 store reservation，使后续活动 root 可记录相同字节。</summary>
+    [Fact]
+    public async Task SealedResidentDiagnosticsDoNotConsumeNormalizationFingerprint()
+    {
+        var rootPath = Path.Combine(
+            Path.GetTempPath(), "DeskButler.Tests", Guid.NewGuid().ToString("N"));
+        var paths = new AppDataPaths(rootPath);
+        Directory.CreateDirectory(paths.RootDirectory);
+        var uniqueContent = Guid.NewGuid().ToString("N");
+        await File.WriteAllTextAsync(
+            paths.SettingsFilePath,
+            $$"""{"testNonce":"{{uniqueContent}}","residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+
+        try
+        {
+            var sealedLog = new RecordingDiagnosticLog();
+            var sealedTracker = new ResidentDiagnosticTracker(
+                sealedLog, new FixedClock(DateTimeOffset.UnixEpoch));
+            await sealedTracker.DrainAsync();
+            var sealedStore = new JsonSettingsStore(
+                paths,
+                diagnostic =>
+                {
+                    if (!sealedTracker.TryReportNormalization(diagnostic))
+                    {
+                        throw new InvalidOperationException("resident diagnostics already sealed");
+                    }
+                });
+
+            var sealedResult = await sealedStore.LoadAsync(CancellationToken.None);
+
+            var activeLog = new RecordingDiagnosticLog();
+            var activeTracker = new ResidentDiagnosticTracker(
+                activeLog, new FixedClock(DateTimeOffset.UnixEpoch));
+            var activeStore = new JsonSettingsStore(
+                paths,
+                diagnostic =>
+                {
+                    if (!activeTracker.TryReportNormalization(diagnostic))
+                    {
+                        throw new InvalidOperationException("resident diagnostics already sealed");
+                    }
+                });
+
+            var activeResult = await activeStore.LoadAsync(CancellationToken.None);
+            await activeTracker.DrainAsync();
+
+            Assert.Empty(sealedResult.ResidentApplications);
+            Assert.Empty(activeResult.ResidentApplications);
+            Assert.Empty(sealedLog.Events);
+            var diagnosticEvent = Assert.Single(activeLog.Events);
+            Assert.Equal("resident-normalization", diagnosticEvent.Category);
+        }
+        finally
+        {
+            Directory.Delete(rootPath, recursive: true);
+        }
+    }
+
     /// <summary>真实组合根的自动与 session-ending 捕获不发现常驻应用，只有手动命令会调用一次。</summary>
     [Fact]
     public Task ProductionAutomaticAndSessionCheckpointsDoNotRouteToResidentDiscovery() =>

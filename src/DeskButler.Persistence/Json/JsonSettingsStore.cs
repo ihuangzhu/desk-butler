@@ -10,7 +10,7 @@ namespace DeskButler.Persistence.Json;
 /// <summary>使用原子替换 JSON 文件保存当前用户设置。</summary>
 public sealed class JsonSettingsStore : ISettingsStore
 {
-    private static readonly ConcurrentDictionary<string, byte> ReportedResidentDiagnosticFingerprints = new();
+    private static readonly ConcurrentDictionary<string, object> ReportedResidentDiagnosticFingerprints = new();
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
@@ -164,11 +164,13 @@ public sealed class JsonSettingsStore : ISettingsStore
             .OrderBy(kind => kind)
             .ToArray();
         var fingerprint = $"{Convert.ToHexString(SHA256.HashData(documentBytes))}:{string.Join(',', kinds)}";
-        if (!ReportedResidentDiagnosticFingerprints.TryAdd(fingerprint, 0))
+        var reservation = new object();
+        if (!ReportedResidentDiagnosticFingerprints.TryAdd(fingerprint, reservation))
         {
             return;
         }
 
+        var accepted = true;
         foreach (var diagnostic in diagnostics)
         {
             try
@@ -178,7 +180,16 @@ public sealed class JsonSettingsStore : ISettingsStore
             catch
             {
                 // 诊断是非关键旁路；接收器异常不改变已恢复的设置结果。
+                accepted = false;
+                break;
             }
+        }
+
+        if (!accepted)
+        {
+            // 只回滚本调用自己的 reservation，绝不删除另一线程后来提交的相同指纹。
+            ReportedResidentDiagnosticFingerprints.TryRemove(
+                new KeyValuePair<string, object>(fingerprint, reservation));
         }
     }
 

@@ -216,6 +216,37 @@ public sealed class JsonSettingsStoreTests
         Assert.Equal(ResidentNormalizationIssue.InvalidPath, diagnostic.Kind);
     }
 
+    /// <summary>诊断接收器拒绝本次交付时不得永久消费内容指纹，后续读取仍可重试。</summary>
+    [Fact]
+    public async Task LoadAsyncReleasesResidentDiagnosticReservationWhenSinkThrows()
+    {
+        await using var fixture = new SettingsFixture();
+        var sinkCalls = 0;
+        var store = new JsonSettingsStore(
+            fixture.Paths,
+            diagnostic =>
+            {
+                Assert.Equal(ResidentNormalizationIssue.InvalidPath, diagnostic.Kind);
+                if (Interlocked.Increment(ref sinkCalls) == 1)
+                {
+                    throw new InvalidOperationException("diagnostic sink rejected");
+                }
+            });
+        Directory.CreateDirectory(fixture.Paths.RootDirectory);
+        var uniqueContent = Guid.NewGuid().ToString("N");
+        await File.WriteAllTextAsync(
+            fixture.Paths.SettingsFilePath,
+            $$"""{"testNonce":"{{uniqueContent}}","residentApplications":[{"launchPath":null}]}""",
+            CancellationToken.None);
+
+        var first = await store.LoadAsync(CancellationToken.None);
+        var second = await store.LoadAsync(CancellationToken.None);
+
+        Assert.Empty(first.ResidentApplications);
+        Assert.Empty(second.ResidentApplications);
+        Assert.Equal(2, Volatile.Read(ref sinkCalls));
+    }
+
     /// <summary>验证 JSON 字节变化即使问题种类相同，也会为新内容重新交付一次诊断。</summary>
     [Fact]
     public async Task LoadAsyncReportsResidentDiagnosticsAgainWhenJsonBytesChangeWithSameIssueKind()

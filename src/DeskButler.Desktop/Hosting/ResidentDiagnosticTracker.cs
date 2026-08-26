@@ -25,11 +25,11 @@ internal sealed class ResidentDiagnosticTracker
         this.clock = clock ?? throw new ArgumentNullException(nameof(clock));
     }
 
-    /// <summary>接收已由 JsonSettingsStore 按原始内容指纹去重的单项正规化分类。</summary>
-    internal void ReportNormalization(ResidentNormalizationDiagnostic diagnostic)
+    /// <summary>尝试接收已由 JsonSettingsStore 预留指纹的单项正规化分类；封存后明确拒绝。</summary>
+    internal bool TryReportNormalization(ResidentNormalizationDiagnostic diagnostic)
     {
         ArgumentNullException.ThrowIfNull(diagnostic);
-        StartWrite(new DiagnosticEvent(
+        return TryStartWrite(new DiagnosticEvent(
             clock.UtcNow,
             DiagnosticLevel.Warning,
             "resident-normalization",
@@ -89,23 +89,29 @@ internal sealed class ResidentDiagnosticTracker
         }
     }
 
-    /// <summary>在同一锁内建立并登记日志任务，避免 Drain 漏掉已经开始的异步写入。</summary>
-    private void StartWrite(DiagnosticEvent diagnosticEvent)
+    /// <summary>锁内原子接受并登记 completion，锁外才启动日志，避免封存遗漏已接受事件。</summary>
+    private bool TryStartWrite(DiagnosticEvent diagnosticEvent)
     {
+        TaskCompletionSource completion;
         lock (syncRoot)
         {
             if (sealedForCleanup)
             {
-                return;
+                return false;
             }
 
-            StartWriteCore(diagnosticEvent);
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            pending.Add(completion.Task);
         }
+
+        StartWriteOutsideLock(diagnosticEvent, completion);
+        return true;
     }
 
     /// <summary>线性化封存检查、进程级指纹占用与任务登记，避免迟到报告吞掉未来事件。</summary>
     private void StartDiscoveryWrite(string fingerprint, DiagnosticEvent diagnosticEvent)
     {
+        TaskCompletionSource completion;
         lock (syncRoot)
         {
             if (sealedForCleanup || !ReportedDiscoveryFingerprints.TryAdd(fingerprint, 0))
@@ -113,22 +119,38 @@ internal sealed class ResidentDiagnosticTracker
                 return;
             }
 
-            StartWriteCore(diagnosticEvent);
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            pending.Add(completion.Task);
         }
+
+        StartWriteOutsideLock(diagnosticEvent, completion);
     }
 
-    /// <summary>在调用方持有状态锁时创建并登记一个尽力日志任务。</summary>
-    private void StartWriteCore(DiagnosticEvent diagnosticEvent)
+    /// <summary>在 tracker 状态锁外调度尽力日志，并确保所有终态都完成已登记的 cleanup completion。</summary>
+    private void StartWriteOutsideLock(DiagnosticEvent diagnosticEvent, TaskCompletionSource completion)
     {
         try
         {
-            pending.Add(Task.Run(
-                () => diagnosticLog.WriteAsync(diagnosticEvent, CancellationToken.None),
-                CancellationToken.None));
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await diagnosticLog.WriteAsync(diagnosticEvent, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // 日志是最终旁路；故障必须被观察，但不得反向影响设置或发现结果。
+                }
+                finally
+                {
+                    completion.TrySetResult();
+                }
+            }, CancellationToken.None);
         }
         catch
         {
-            // 任务建立自身也属于非关键诊断边界。
+            // 调度自身失败也必须释放 cleanup 等待，且不得改变调用方产品结果。
+            completion.TrySetResult();
         }
     }
 }
