@@ -9,7 +9,10 @@ using System.Globalization;
 using DeskButler.Infrastructure.Windows.Startup;
 using DeskButler.Application.Events;
 using DeskButler.Application.Modules;
+using DeskButler.Core.ResidentApps;
+using DeskButler.Modules.WorkspaceRecovery.Capture;
 using DeskButler.Modules.WorkspaceRecovery;
+using System.IO;
 
 namespace DeskButler.Desktop.ViewModels;
 
@@ -26,6 +29,28 @@ public sealed class SceneSummaryViewModel(SceneSnapshot scene)
     public string ItemCountText => $"{Scene.Items.Count} 个窗口";
 }
 
+/// <summary>汇总常驻页面的可替换桌面依赖，保持旧 MainViewModel 构造调用兼容。</summary>
+public sealed class ResidentViewModelDependencies(
+    IExecutablePicker picker,
+    IExecutableIconProvider iconProvider,
+    Func<string, ResidentExecutableValidation> validateExecutable,
+    Func<CancellationToken, Task> launchEnabledNowAsync)
+{
+    /// <summary>获取选择可执行文件的 UI 边界。</summary>
+    public IExecutablePicker Picker { get; } = picker ?? throw new ArgumentNullException(nameof(picker));
+
+    /// <summary>获取不持有文件句柄的图标边界。</summary>
+    public IExecutableIconProvider IconProvider { get; } = iconProvider ?? throw new ArgumentNullException(nameof(iconProvider));
+
+    /// <summary>获取用于展示路径健康状态的预检边界；最终策略仍由命令处理器负责。</summary>
+    public Func<string, ResidentExecutableValidation> ValidateExecutable { get; } =
+        validateExecutable ?? throw new ArgumentNullException(nameof(validateExecutable));
+
+    /// <summary>获取 Task 8 已建立协调器的手动启动委托。</summary>
+    public Func<CancellationToken, Task> LaunchEnabledNowAsync { get; } =
+        launchEnabledNowAsync ?? throw new ArgumentNullException(nameof(launchEnabledNowAsync));
+}
+
 /// <summary>管理主窗口、托盘菜单和最近现场的共享状态。</summary>
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
@@ -38,6 +63,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly IStartupRegistration? startupRegistration;
     private readonly IDisposable? moduleStatusSubscription;
     private readonly AutomaticCaptureGate? automaticCaptureGate;
+    private readonly ResidentViewModelDependencies residentDependencies;
     private bool isCapturePaused;
     private string statusText = "就绪";
     private string healthStatusText;
@@ -46,6 +72,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool isStartupToggleEnabled = true;
     private string? startupErrorMessage;
     private string moduleStatusText = "模块状态正在初始化";
+    private bool residentApplicationsEnabled;
+    private long residentCandidateGeneration;
 
     /// <summary>使用实际仓库、命令总线和设置存储创建主界面模型。</summary>
     public MainViewModel(ISceneRepository repository, ICommandBus commands, ISettingsStore settingsStore)
@@ -64,7 +92,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IStartupRegistration? startupRegistration = null,
         IEventBus? eventBus = null,
         ModuleDescriptor? moduleDescriptor = null,
-        AutomaticCaptureGate? automaticCaptureGate = null)
+        AutomaticCaptureGate? automaticCaptureGate = null,
+        ResidentViewModelDependencies? residentDependencies = null)
     {
         this.repository = repository ?? throw new ArgumentNullException(nameof(repository));
         this.commands = commands ?? throw new ArgumentNullException(nameof(commands));
@@ -73,6 +102,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         this.diagnosticPreviewLoader = diagnosticPreviewLoader ?? (_ => Task.FromResult("当前没有可预览的诊断文件。"));
         this.startupRegistration = startupRegistration;
         this.automaticCaptureGate = automaticCaptureGate;
+        this.residentDependencies = residentDependencies ?? new ResidentViewModelDependencies(
+            new NullExecutablePicker(),
+            new FallbackExecutableIconProvider(),
+            path => new ResidentExecutableValidation(false, null, ResidentExecutableRejection.ValidationFailed),
+            _ => Task.CompletedTask);
         if (eventBus is not null && moduleDescriptor is not null)
         {
             ModuleStatusText = $"{moduleDescriptor.DisplayName} {moduleDescriptor.Version} · 正在启动";
@@ -94,6 +128,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         RefreshCommand = new AsyncCommand(LoadAsync);
         LoadDiagnosticsCommand = new AsyncCommand(LoadDiagnosticsAsync);
         ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync, () => IsStartupToggleEnabled);
+        ConfirmResidentCandidatesCommand = new AsyncCommand(
+            ConfirmResidentCandidatesAsync,
+            () => ResidentCandidates.Any(candidate => candidate.CanConfirm));
+        DismissResidentCandidatesCommand = new AsyncCommand(DismissResidentCandidatesAsync, () => HasResidentCandidates);
+        FindResidentCandidatesCommand = new AsyncCommand(FindResidentCandidatesAsync);
+        AddResidentApplicationCommand = new AsyncCommand(AddResidentApplicationAsync);
+        LaunchResidentsNowCommand = new AsyncCommand(LaunchResidentsNowAsync);
+        ToggleResidentApplicationsCommand = new AsyncCommand(
+            () => SetResidentApplicationsEnabledAsync(!ResidentApplicationsEnabled));
     }
 
     /// <summary>获取最新优先且最多三份的现场历史。</summary>
@@ -101,6 +144,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>获取设置中按路径排序的永久排除列表。</summary>
     public ObservableCollection<string> ExcludedExecutablePaths { get; } = [];
+
+    /// <summary>获取等待用户确认的当前发现代候选。</summary>
+    public ObservableCollection<ResidentCandidateViewModel> ResidentCandidates { get; } = [];
+
+    /// <summary>获取按已保存顺序排列的常驻应用管理条目。</summary>
+    public ObservableCollection<ResidentApplicationViewModel> ResidentApplications { get; } = [];
+
+    /// <summary>获取当前是否存在等待确认的候选。</summary>
+    public bool HasResidentCandidates => ResidentCandidates.Count > 0;
+
+    /// <summary>获取登录后自动常驻总开关的当前设置快照。</summary>
+    public bool ResidentApplicationsEnabled
+    {
+        get => residentApplicationsEnabled;
+        private set => SetProperty(ref residentApplicationsEnabled, value);
+    }
+
+    /// <summary>仅由手动保存发现非空当前候选时触发，供后续托盘交互订阅。</summary>
+    public event EventHandler? ResidentCandidatesAvailable;
 
     /// <summary>获取捕获当前是否暂停。</summary>
     public bool IsCapturePaused
@@ -191,6 +253,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>获取切换登录启动的键盘可执行命令。</summary>
     public AsyncCommand ToggleStartupCommand { get; }
 
+    /// <summary>获取确认当前候选代次的命令。</summary>
+    public AsyncCommand ConfirmResidentCandidatesCommand { get; }
+
+    /// <summary>获取忽略当前候选代次的命令。</summary>
+    public AsyncCommand DismissResidentCandidatesCommand { get; }
+
+    /// <summary>获取不保存现场的独立常驻查找命令。</summary>
+    public AsyncCommand FindResidentCandidatesCommand { get; }
+
+    /// <summary>获取浏览并新增常驻应用的命令。</summary>
+    public AsyncCommand AddResidentApplicationCommand { get; }
+
+    /// <summary>获取委托 Task 8 协调器立即启动已启用应用的命令。</summary>
+    public AsyncCommand LaunchResidentsNowCommand { get; }
+
+    /// <summary>获取切换常驻总开关的命令。</summary>
+    public AsyncCommand ToggleResidentApplicationsCommand { get; }
+
     /// <summary>加载设置与最近三份有效现场。</summary>
     public async Task LoadAsync()
     {
@@ -207,6 +287,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             ExcludedExecutablePaths.Add(path);
         }
+        ApplyResidentSettings(settings);
 
         RecentScenes.Clear();
         foreach (var scene in scenes)
@@ -218,9 +299,101 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>要求捕获协调器立即保存现场并刷新历史。</summary>
     public async Task SaveNowAsync()
     {
-        await commands.SendAsync(new SaveSceneNowCommand(), CancellationToken.None);
+        var result = await commands.SendAsync(new SaveSceneNowCommand(), CancellationToken.None);
         await LoadAsync();
-        StatusText = "现场已保存";
+        var publishedCurrentGeneration = PublishResidentCandidates(result.Discovery);
+        StatusText = FormatManualSaveStatus(result);
+        // 只有手动保存的当前代非空候选可以请求托盘引导；后台 SceneSaved 和 Find 都不能触发。
+        if (publishedCurrentGeneration && !result.Discovery.DiscoveryFailed &&
+            result.Discovery.Candidates.Count > 0 && residentCandidateGeneration == result.Discovery.Generation)
+        {
+            ResidentCandidatesAvailable?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    /// <summary>不保存当前现场，直接请求一轮常驻候选发现。</summary>
+    public async Task FindResidentCandidatesAsync()
+    {
+        var batch = await commands.SendAsync(new FindResidentCandidatesCommand(), CancellationToken.None);
+        PublishResidentCandidates(batch);
+        StatusText = batch.DiscoveryFailed ? "常驻应用发现失败" : "已完成常驻应用查找";
+    }
+
+    /// <summary>确认当前 UI 代次；成功仅清空同代候选并重新加载设置。</summary>
+    public Task ConfirmResidentCandidatesAsync() =>
+        ConfirmResidentCandidatesAsync(
+            residentCandidateGeneration,
+            ResidentCandidates.Select(candidate => candidate.ToSelection()).ToArray());
+
+    /// <summary>确认指定代次的选择快照，迟到结果不能污染已经发布的新代候选。</summary>
+    public async Task ConfirmResidentCandidatesAsync(
+        long generation,
+        IReadOnlyList<ResidentCandidateSelection> selections)
+    {
+        ArgumentNullException.ThrowIfNull(selections);
+        if (generation != residentCandidateGeneration)
+        {
+            return;
+        }
+
+        var confirmed = await commands.SendAsync(
+            new ConfirmResidentCandidatesCommand(generation, selections),
+            CancellationToken.None);
+        if (!confirmed || generation != residentCandidateGeneration)
+        {
+            return;
+        }
+
+        ClearResidentCandidates();
+        await LoadAsync();
+        StatusText = "已保存常驻应用设置";
+    }
+
+    /// <summary>忽略当前代候选；过期代次不改写新候选。</summary>
+    public async Task DismissResidentCandidatesAsync()
+    {
+        var generation = residentCandidateGeneration;
+        if (!HasResidentCandidates)
+        {
+            return;
+        }
+
+        var dismissed = await commands.SendAsync(
+            new DismissResidentCandidatesCommand(generation),
+            CancellationToken.None);
+        if (dismissed && generation == residentCandidateGeneration)
+        {
+            ClearResidentCandidates();
+            StatusText = "已忽略本次常驻应用候选";
+        }
+    }
+
+    /// <summary>通过 Windows 选择器新增应用；取消时不发送命令也不改变列表。</summary>
+    public async Task AddResidentApplicationAsync()
+    {
+        var launchPath = await residentDependencies.Picker.PickAsync(CancellationToken.None);
+        if (string.IsNullOrWhiteSpace(launchPath))
+        {
+            return;
+        }
+
+        var displayName = Path.GetFileNameWithoutExtension(launchPath);
+        var result = await commands.SendAsync(
+            new AddResidentApplicationCommand(launchPath, displayName),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
+    }
+
+    /// <summary>只调用复用的 Task 8 手动启动委托；不发送命令且不创建第二协调器。</summary>
+    public Task LaunchResidentsNowAsync() => residentDependencies.LaunchEnabledNowAsync(CancellationToken.None);
+
+    /// <summary>通过类型化命令切换总开关，并以返回快照刷新绑定状态。</summary>
+    public async Task SetResidentApplicationsEnabledAsync(bool enabled)
+    {
+        var result = await commands.SendAsync(
+            new SetResidentApplicationsEnabledCommand(enabled),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
     }
 
     /// <summary>恢复用户明确选中的历史现场。</summary>
@@ -289,6 +462,157 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>将设置中的常驻总开关和条目快照替换为新的可绑定集合。</summary>
+    private void ApplyResidentSettings(ButlerSettings settings)
+    {
+        ResidentApplicationsEnabled = settings.ResidentApplicationsEnabled;
+        ResidentApplications.Clear();
+        foreach (var application in settings.ResidentApplications.OrderBy(application => application.LaunchOrder))
+        {
+            ResidentApplications.Add(new ResidentApplicationViewModel(
+                application,
+                residentDependencies.Picker,
+                residentDependencies.IconProvider,
+                residentDependencies.ValidateExecutable,
+                SetResidentApplicationEnabledAsync,
+                RemoveResidentApplicationAsync,
+                MoveResidentApplicationAsync,
+                ReplaceResidentApplicationPathAsync));
+        }
+    }
+
+    /// <summary>以命令处理器返回的完整快照刷新列表，避免条目 setter 绕开设置事务。</summary>
+    private void ApplyResidentMutation(ResidentSettingsMutationResult result)
+    {
+        ResidentApplicationsEnabled = result.ResidentApplicationsEnabled;
+        ResidentApplications.Clear();
+        foreach (var application in result.Applications.OrderBy(application => application.LaunchOrder))
+        {
+            ResidentApplications.Add(new ResidentApplicationViewModel(
+                application,
+                residentDependencies.Picker,
+                residentDependencies.IconProvider,
+                residentDependencies.ValidateExecutable,
+                SetResidentApplicationEnabledAsync,
+                RemoveResidentApplicationAsync,
+                MoveResidentApplicationAsync,
+                ReplaceResidentApplicationPathAsync));
+        }
+        StatusText = result.Error == ResidentSettingsError.None
+            ? "已更新常驻应用设置"
+            : MapResidentSettingsError(result.Error);
+    }
+
+    /// <summary>把条目启停请求交给父级类型化命令，再应用权威返回快照。</summary>
+    private async Task SetResidentApplicationEnabledAsync(ResidentApplicationViewModel application, bool enabled)
+    {
+        var result = await commands.SendAsync(
+            new SetResidentApplicationEnabledCommand(application.LaunchPath, enabled),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
+    }
+
+    /// <summary>把条目删除请求交给父级类型化命令。</summary>
+    private async Task RemoveResidentApplicationAsync(ResidentApplicationViewModel application)
+    {
+        var result = await commands.SendAsync(
+            new RemoveResidentApplicationCommand(application.LaunchPath),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
+    }
+
+    /// <summary>把相邻移动请求交给父级类型化命令。</summary>
+    private async Task MoveResidentApplicationAsync(ResidentApplicationViewModel application, int offset)
+    {
+        var result = await commands.SendAsync(
+            new MoveResidentApplicationCommand(application.LaunchPath, offset),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
+    }
+
+    /// <summary>把浏览得到的新入口交给最终策略所在的类型化替换命令。</summary>
+    private async Task ReplaceResidentApplicationPathAsync(ResidentApplicationViewModel application, string newLaunchPath)
+    {
+        var result = await commands.SendAsync(
+            new ReplaceResidentApplicationPathCommand(application.LaunchPath, newLaunchPath),
+            CancellationToken.None);
+        ApplyResidentMutation(result);
+    }
+
+    /// <summary>发布新发现代次并更新确认、忽略命令的可执行状态。</summary>
+    private bool PublishResidentCandidates(ResidentDiscoveryBatch batch)
+    {
+        // 发现器 generation 全局单调；迟到的手动结果不得覆盖已显示的新代候选。
+        if (batch.Generation < residentCandidateGeneration)
+        {
+            return false;
+        }
+
+        residentCandidateGeneration = batch.Generation;
+        ResidentCandidates.Clear();
+        if (!batch.DiscoveryFailed)
+        {
+            foreach (var candidate in batch.Candidates)
+            {
+                ResidentCandidates.Add(new ResidentCandidateViewModel(
+                    candidate,
+                    batch.Generation,
+                    residentDependencies.Picker,
+                    residentDependencies.IconProvider,
+                    OnResidentCandidateChanged));
+            }
+        }
+
+        OnPropertyChanged(nameof(HasResidentCandidates));
+        ConfirmResidentCandidatesCommand.RaiseCanExecuteChanged();
+        DismissResidentCandidatesCommand.RaiseCanExecuteChanged();
+        return true;
+    }
+
+    /// <summary>清空当前 UI 代次的候选，但保留代次用于拒绝迟到确认。</summary>
+    private void ClearResidentCandidates()
+    {
+        ResidentCandidates.Clear();
+        OnPropertyChanged(nameof(HasResidentCandidates));
+        ConfirmResidentCandidatesCommand.RaiseCanExecuteChanged();
+        DismissResidentCandidatesCommand.RaiseCanExecuteChanged();
+    }
+
+    /// <summary>候选勾选或入口草稿变化时刷新确认命令状态。</summary>
+    private void OnResidentCandidateChanged() => ConfirmResidentCandidatesCommand.RaiseCanExecuteChanged();
+
+    /// <summary>精确映射手动保存与发现工作流的五种用户可见结果。</summary>
+    private static string FormatManualSaveStatus(ManualSaveResult result)
+    {
+        if (result.Discovery.DiscoveryFailed)
+        {
+            return "常驻应用发现失败";
+        }
+
+        if (result.Capture.SnapshotSaved)
+        {
+            return "现场已保存";
+        }
+
+        return result.Capture.SkipReason switch
+        {
+            CaptureSkipReason.Disabled => "捕获已暂停，仍完成常驻查找",
+            CaptureSkipReason.Failed => "现场保存失败，仍完成常驻查找",
+            _ => "现场未变化"
+        };
+    }
+
+    /// <summary>将列表处理器的稳定错误枚举转换为不含底层异常的 UI 文案。</summary>
+    private static string MapResidentSettingsError(ResidentSettingsError error) => error switch
+    {
+        ResidentSettingsError.ExecutablePathRejected => "启动路径未通过安全验证",
+        ResidentSettingsError.DuplicateLaunchPath => "启动路径已存在",
+        ResidentSettingsError.KnownProcessPathConflict => "识别路径与现有应用冲突",
+        ResidentSettingsError.EntryNotFound => "常驻应用已不存在",
+        ResidentSettingsError.InvalidMoveOffset => "常驻应用移动请求无效",
+        _ => "常驻应用设置更新失败"
+    };
+
     /// <summary>解除自动保存通知，退出后不再排队 UI 工作。</summary>
     public void Dispose()
     {
@@ -334,5 +658,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 StatusText = $"现场列表刷新失败：{exception.Message}";
             }
         });
+    }
+
+    /// <summary>兼容旧构造入口的空选择器；不会打开窗口或产生设置变更。</summary>
+    private sealed class NullExecutablePicker : IExecutablePicker
+    {
+        /// <inheritdoc />
+        public Task<string?> PickAsync(CancellationToken cancellationToken) => Task.FromResult<string?>(null);
     }
 }

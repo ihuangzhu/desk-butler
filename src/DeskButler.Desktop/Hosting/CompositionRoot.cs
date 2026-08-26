@@ -392,7 +392,12 @@ public sealed class CompositionRoot : IAsyncDisposable
                     startupRegistration,
                     moduleState.EventBus,
                     module.Descriptor,
-                    automaticCaptureGate),
+                    automaticCaptureGate,
+                    new ResidentViewModelDependencies(
+                        new WindowsExecutablePicker(),
+                        new FallbackExecutableIconProvider(),
+                        residentExecutablePolicy.Validate,
+                        residentLaunchCoordinator.LaunchEnabledNowAsync)),
                 static viewModel =>
                 {
                     viewModel.Dispose();

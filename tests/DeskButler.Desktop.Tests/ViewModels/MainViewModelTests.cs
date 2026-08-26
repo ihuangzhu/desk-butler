@@ -1,13 +1,194 @@
 using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.ViewModels;
 using DeskButler.Application.Commands;
+using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Restore;
+using DeskButler.Core.Settings;
 using DeskButler.Infrastructure.Windows.Startup;
+using DeskButler.Modules.WorkspaceRecovery.Capture;
+using System.Windows.Media;
 
 namespace DeskButler.Desktop.Tests.ViewModels;
 
 public sealed class MainViewModelTests
 {
+    /// <summary>手动保存必须准确投影捕获与发现的五类稳定结果文案。</summary>
+    [Theory]
+    [MemberData(nameof(ManualSaveCases))]
+    public async Task SaveNowAsyncMapsManualCaptureAndDiscoveryResults(
+        CaptureSkipReason reason,
+        bool snapshotSaved,
+        bool discoveryFailed,
+        string expectedStatus)
+    {
+        var batch = new ResidentDiscoveryBatch(41, [], discoveryFailed);
+        var commands = new ResidentCommandBus(new ManualSaveResult(
+            new CaptureOutcome(snapshotSaved, reason, new HashSet<string>(StringComparer.OrdinalIgnoreCase)), batch));
+        var vm = CreateResidentViewModel(commands);
+
+        await vm.SaveNowAsync();
+
+        Assert.Equal(expectedStatus, vm.StatusText);
+    }
+
+    /// <summary>手动保存发现当前代候选时才发出可被托盘消费的事件。</summary>
+    [Fact]
+    public async Task SaveNowAsyncPublishesCandidatesAndRaisesManualAvailabilityEvent()
+    {
+        var batch = new ResidentDiscoveryBatch(42, [CreateCandidate("candidate-manual")], false);
+        var commands = new ResidentCommandBus(new ManualSaveResult(
+            new CaptureOutcome(true, CaptureSkipReason.None, new HashSet<string>(StringComparer.OrdinalIgnoreCase)), batch));
+        var vm = CreateResidentViewModel(commands);
+        var events = 0;
+        vm.ResidentCandidatesAvailable += (_, _) => events++;
+
+        await vm.SaveNowAsync();
+
+        Assert.Equal(1, events);
+        Assert.Single(vm.ResidentCandidates);
+        Assert.True(vm.HasResidentCandidates);
+        Assert.True(vm.ConfirmResidentCandidatesCommand.CanExecute(null));
+    }
+
+    /// <summary>较旧的手动保存结果不能覆盖已经发布的更新发现代次或触发托盘事件。</summary>
+    [Fact]
+    public async Task SaveNowAsyncDoesNotPublishStaleManualCandidateGeneration()
+    {
+        var commands = new ResidentCommandBus(
+            manualSaveResult: new ManualSaveResult(
+                new CaptureOutcome(true, CaptureSkipReason.None, new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
+                new ResidentDiscoveryBatch(47, [CreateCandidate("stale-manual")], false)),
+            findResult: new ResidentDiscoveryBatch(48, [CreateCandidate("new-find")], false));
+        var vm = CreateResidentViewModel(commands);
+        var events = 0;
+        vm.ResidentCandidatesAvailable += (_, _) => events++;
+        await vm.FindResidentCandidatesAsync();
+
+        await vm.SaveNowAsync();
+
+        Assert.Equal("new-find", Assert.Single(vm.ResidentCandidates).CandidateId);
+        Assert.Equal(0, events);
+    }
+
+    /// <summary>独立查找只发送查找命令，不能把它误接到保存现场的工作流或托盘事件。</summary>
+    [Fact]
+    public async Task FindResidentCandidatesAsyncDoesNotSaveSceneOrRaiseManualEvent()
+    {
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(43, [CreateCandidate("candidate-find")], false));
+        var vm = CreateResidentViewModel(commands);
+        var events = 0;
+        vm.ResidentCandidatesAvailable += (_, _) => events++;
+
+        await vm.FindResidentCandidatesAsync();
+
+        Assert.DoesNotContain(commands.SentCommands, command => command is SaveSceneNowCommand);
+        Assert.Contains(commands.SentCommands, command => command is FindResidentCandidatesCommand);
+        Assert.Equal(0, events);
+        Assert.Single(vm.ResidentCandidates);
+    }
+
+    /// <summary>旧代确认即使返回成功也不能清掉新代候选或重新加载设置。</summary>
+    [Fact]
+    public async Task ConfirmResidentCandidatesAsyncIgnoresExpiredGeneration()
+    {
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(44, [CreateCandidate("old")], false),
+            confirmResult: true);
+        var settings = new CountingSettingsStore(ButlerSettings.Default);
+        var vm = CreateResidentViewModel(commands, settingsStore: settings);
+        await vm.FindResidentCandidatesAsync();
+        var oldCandidate = Assert.Single(vm.ResidentCandidates);
+        oldCandidate.IsSelected = true;
+        commands.FindResult = new ResidentDiscoveryBatch(45, [CreateCandidate("new")], false);
+        await vm.FindResidentCandidatesAsync();
+
+        await vm.ConfirmResidentCandidatesAsync(44, [oldCandidate.ToSelection()]);
+
+        Assert.Equal("new", Assert.Single(vm.ResidentCandidates).CandidateId);
+        Assert.Equal(0, settings.LoadCount);
+    }
+
+    /// <summary>同代确认成功清空候选并使用最新设置重新投影常驻列表。</summary>
+    [Fact]
+    public async Task ConfirmResidentCandidatesAsyncClearsSameGenerationAndReloadsSettings()
+    {
+        var application = new ResidentApplication(@"C:\Apps\Persisted.exe", new HashSet<string>(), "Persisted", true, 0);
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(46, [CreateCandidate("same")], false),
+            confirmResult: true);
+        var settings = new CountingSettingsStore(ButlerSettings.Default with { ResidentApplications = [application] });
+        var vm = CreateResidentViewModel(commands, settingsStore: settings);
+        await vm.FindResidentCandidatesAsync();
+
+        await vm.ConfirmResidentCandidatesAsync();
+
+        Assert.Empty(vm.ResidentCandidates);
+        Assert.Single(vm.ResidentApplications);
+        Assert.Equal(1, settings.LoadCount);
+    }
+
+    /// <summary>立即启动只委托给任务八的手动启动边界，不发送其他命令。</summary>
+    [Fact]
+    public async Task LaunchResidentsNowAsyncOnlyInvokesManualLaunchDelegate()
+    {
+        var commands = new ResidentCommandBus();
+        var launchCalls = 0;
+        var vm = CreateResidentViewModel(commands, launch: _ =>
+        {
+            launchCalls++;
+            return Task.CompletedTask;
+        });
+
+        await vm.LaunchResidentsNowAsync();
+
+        Assert.Equal(1, launchCalls);
+        Assert.Empty(commands.SentCommands);
+    }
+
+    /// <summary>浏览取消时不得发送新增命令或修改常驻列表。</summary>
+    [Fact]
+    public async Task AddResidentApplicationAsyncCancellationDoesNotMutate()
+    {
+        var commands = new ResidentCommandBus();
+        var vm = CreateResidentViewModel(commands, picker: new FakeExecutablePicker());
+
+        await vm.AddResidentApplicationAsync();
+
+        Assert.DoesNotContain(commands.SentCommands, command => command is AddResidentApplicationCommand);
+        Assert.Empty(vm.ResidentApplications);
+    }
+
+    /// <summary>条目开关、删除和移动只能走父级的类型化命令，再由返回快照更新列表。</summary>
+    [Fact]
+    public async Task ResidentApplicationActionsSendTypedCommandsThroughParent()
+    {
+        var app = new ResidentApplication(@"C:\Apps\Managed.exe", new HashSet<string>(), "Managed", true, 0);
+        var commands = new ResidentCommandBus(
+            mutationResult: new ResidentSettingsMutationResult(
+                true, ResidentSettingsError.None, [app with { Enabled = false }], false));
+        var vm = CreateResidentViewModel(commands, ButlerSettings.Default with { ResidentApplications = [app] });
+        await vm.LoadAsync();
+        var item = Assert.Single(vm.ResidentApplications);
+
+        await item.SetEnabledAsync(false);
+        await item.RemoveAsync();
+        await item.MoveAsync(1);
+
+        Assert.Contains(commands.SentCommands, command => command is SetResidentApplicationEnabledCommand);
+        Assert.Contains(commands.SentCommands, command => command is RemoveResidentApplicationCommand);
+        Assert.Contains(commands.SentCommands, command => command is MoveResidentApplicationCommand);
+    }
+
+    public static IEnumerable<object[]> ManualSaveCases =>
+    [
+        [CaptureSkipReason.None, true, false, "现场已保存"],
+        [CaptureSkipReason.Disabled, false, false, "捕获已暂停，仍完成常驻查找"],
+        [CaptureSkipReason.Unchanged, false, false, "现场未变化"],
+        [CaptureSkipReason.Failed, false, false, "现场保存失败，仍完成常驻查找"],
+        [CaptureSkipReason.None, true, true, "常驻应用发现失败"]
+    ];
+
     /// <summary>登录启动、捕获与排除并发修改时必须保留三个字段的最终提交值。</summary>
     [Fact]
     public async Task ConcurrentStartupCaptureAndExclusionPreserveAllFields()
@@ -500,5 +681,87 @@ public sealed class MainViewModelTests
 
         Assert.Equal(1, calls);
         Assert.Equal("[deskbutler.jsonl] 已脱敏预览", vm.DiagnosticPreviewText);
+    }
+
+    private static MainViewModel CreateResidentViewModel(
+        ResidentCommandBus commands,
+        ButlerSettings? settings = null,
+        IExecutablePicker? picker = null,
+        Func<CancellationToken, Task>? launch = null,
+        CountingSettingsStore? settingsStore = null) =>
+        new(
+            new InMemorySceneRepository(),
+            commands,
+            settingsStore ?? new CountingSettingsStore(settings ?? ButlerSettings.Default),
+            new InlineUiDispatcher(),
+            residentDependencies: new ResidentViewModelDependencies(
+                picker ?? new FakeExecutablePicker(),
+                new FakeExecutableIconProvider(),
+                _ => new ResidentExecutableValidation(true, @"C:\Apps\Allowed.exe", ResidentExecutableRejection.None),
+                launch ?? (_ => Task.CompletedTask)));
+
+    private static ResidentAppCandidate CreateCandidate(string id) =>
+        new(
+            id,
+            "Agent",
+            @"C:\Apps\Agent.exe",
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            ResidentCandidateConfidence.High,
+            ResidentCandidateKind.NewApplication,
+            null);
+
+    private sealed class FakeExecutablePicker(string? result = null) : IExecutablePicker
+    {
+        public Task<string?> PickAsync(CancellationToken cancellationToken) => Task.FromResult(result);
+    }
+
+    private sealed class FakeExecutableIconProvider : IExecutableIconProvider
+    {
+        public ImageSource? GetIcon(string? executablePath) => null;
+    }
+
+    private sealed class CountingSettingsStore(ButlerSettings current) : ISettingsStore
+    {
+        internal int LoadCount { get; private set; }
+
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken)
+        {
+            LoadCount++;
+            return Task.FromResult(current);
+        }
+
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken)
+        {
+            current = settings;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ResidentCommandBus(
+        ManualSaveResult? manualSaveResult = null,
+        ResidentDiscoveryBatch? findResult = null,
+        bool confirmResult = false,
+        ResidentSettingsMutationResult? mutationResult = null) : ICommandBus
+    {
+        internal List<object> SentCommands { get; } = [];
+
+        internal ResidentDiscoveryBatch? FindResult { get; set; } = findResult;
+
+        public Task<TResponse> SendAsync<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken)
+        {
+            SentCommands.Add(command);
+            object? response = command switch
+            {
+                SaveSceneNowCommand => manualSaveResult,
+                FindResidentCandidatesCommand => FindResult,
+                ConfirmResidentCandidatesCommand => confirmResult,
+                DismissResidentCandidatesCommand => true,
+                SetResidentApplicationsEnabledCommand or SetResidentApplicationEnabledCommand or
+                    RemoveResidentApplicationCommand or MoveResidentApplicationCommand or
+                    AddResidentApplicationCommand or ReplaceResidentApplicationPathCommand => mutationResult,
+                _ => throw new InvalidOperationException($"未预期的命令类型：{command.GetType().Name}")
+            };
+            return Task.FromResult((TResponse)response!);
+        }
     }
 }
