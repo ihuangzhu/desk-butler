@@ -166,16 +166,55 @@ public sealed class WindowsResidentAppDiscoveryTests
         Assert.DoesNotContain(@"C:\Apps\Chat\Old.exe", replacement.CandidateId, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>验证单一路径的策略失败只追加无敏感分类诊断，不能丢弃其它可安全发现的候选。</summary>
+    [Fact]
+    public async Task DiscoverAsync策略拒绝以外的单项异常被隔离为SourceFailure()
+    {
+        var discovery = CreateDiscovery(
+            observations:
+            [
+                Observation(1, @"C:\Apps\Broken\Broken.exe", "Broken", "Vendor", hidden: true),
+                Observation(2, @"C:\Apps\Chat\Chat.exe", "Chat", "Vendor", hidden: true)
+            ],
+            catalog: [Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat.exe")],
+            policyValidation: path => path.Equals(@"C:\Apps\Broken\Broken.exe", StringComparison.OrdinalIgnoreCase)
+                ? throw new InvalidOperationException("测试策略失败")
+                : new ResidentExecutableValidation(true, Path.GetFullPath(path), ResidentExecutableRejection.None));
+
+        var result = await discovery.DiscoverAsync(Paths(), [], CancellationToken.None);
+
+        var candidate = Assert.Single(result.Candidates);
+        Assert.Equal(@"C:\Apps\Chat\Chat.exe", candidate.LaunchPath);
+        Assert.Equal([ResidentDiscoveryIssue.SourceFailure], result.Diagnostics.Select(item => item.Kind));
+    }
+
+    /// <summary>验证策略边界报告调用方取消时必须传播原令牌，不能被单项故障隔离逻辑吞掉。</summary>
+    [Fact]
+    public async Task DiscoverAsync策略取消必须传播原取消令牌()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var discovery = CreateDiscovery(
+            observations: [Observation(1, @"C:\Apps\Chat\Chat.exe", "Chat", "Vendor", hidden: true)],
+            catalog: [Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat.exe")],
+            policyValidation: _ => throw new OperationCanceledException(cancellation.Token));
+
+        var exception = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => discovery.DiscoverAsync(Paths(), [], cancellation.Token));
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+    }
+
     /// <summary>构造只使用 fake snapshot、目录、策略和文件状态的发现器，不访问真实系统资源。</summary>
     private static WindowsResidentAppDiscovery CreateDiscovery(
         IReadOnlyList<ResidentProcessObservation> observations,
         IReadOnlyList<InstalledApplicationEntry> catalog,
         HashSet<string>? rejectedPaths = null,
-        HashSet<string>? missingPaths = null) =>
+        HashSet<string>? missingPaths = null,
+        Func<string, ResidentExecutableValidation>? policyValidation = null) =>
         new(
             new FakeSnapshotSource(observations),
             new FakeCatalog(catalog),
-            new FakePolicy(rejectedPaths ?? Paths()),
+            new FakePolicy(rejectedPaths ?? Paths(), policyValidation),
             path => !(missingPaths ?? Paths()).Contains(path),
             @"C:\DeskButler\DeskButler.exe");
 
@@ -221,11 +260,14 @@ public sealed class WindowsResidentAppDiscoveryTests
         }
     }
 
-    private sealed class FakePolicy(IReadOnlySet<string> rejectedPaths) : IResidentExecutablePolicy
+    private sealed class FakePolicy(
+        IReadOnlySet<string> rejectedPaths,
+        Func<string, ResidentExecutableValidation>? policyValidation) : IResidentExecutablePolicy
     {
         /// <summary>只按测试提供的拒绝路径决定候选是否可启动。</summary>
-        public ResidentExecutableValidation Validate(string path) => rejectedPaths.Contains(path)
-            ? new ResidentExecutableValidation(false, null, ResidentExecutableRejection.ProhibitedDirectory)
-            : new ResidentExecutableValidation(true, Path.GetFullPath(path), ResidentExecutableRejection.None);
+        public ResidentExecutableValidation Validate(string path) => policyValidation?.Invoke(path) ??
+            (rejectedPaths.Contains(path)
+                ? new ResidentExecutableValidation(false, null, ResidentExecutableRejection.ProhibitedDirectory)
+                : new ResidentExecutableValidation(true, Path.GetFullPath(path), ResidentExecutableRejection.None));
     }
 }

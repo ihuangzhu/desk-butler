@@ -54,11 +54,13 @@ internal sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         var catalogSnapshot = await installedApplicationCatalog.ReadAsync(cancellationToken);
         var ordinary = NormalizePaths(ordinaryWindowPaths);
         var knownExisting = CollectExistingPaths(existing);
+        var discoveryDiagnostics = new List<ResidentDiscoveryDiagnostic>();
         var observations = FilterObservations(
             processSnapshot.Observations,
             catalogSnapshot.Entries,
             ordinary,
             knownExisting,
+            discoveryDiagnostics,
             cancellationToken);
         var candidates = observations
             .GroupBy(observation => observation.GroupKey, StringComparer.Ordinal)
@@ -75,6 +77,7 @@ internal sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             candidates,
             processSnapshot.Diagnostics
                 .Concat(catalogSnapshot.Diagnostics)
+                .Concat(discoveryDiagnostics)
                 .OrderBy(diagnostic => diagnostic.Kind)
                 .ToArray());
     }
@@ -85,13 +88,29 @@ internal sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         IReadOnlyList<InstalledApplicationEntry> catalog,
         HashSet<string> ordinaryWindowPaths,
         HashSet<string> existingPaths,
+        List<ResidentDiscoveryDiagnostic> diagnostics,
         CancellationToken cancellationToken)
     {
         var result = new List<EligibleObservation>();
         foreach (var observation in observations)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var validation = executablePolicy.Validate(observation.ExecutablePath);
+            ResidentExecutableValidation validation;
+            try
+            {
+                validation = executablePolicy.Validate(observation.ExecutablePath);
+            }
+            catch (OperationCanceledException)
+            {
+                // 取消是调用方控制流，绝不能被单项观察隔离逻辑吞掉。
+                throw;
+            }
+            catch
+            {
+                // 策略不应泄露路径或异常；单项失败降级后仍帮助用户缩小其它候选范围。
+                diagnostics.Add(new ResidentDiscoveryDiagnostic(ResidentDiscoveryIssue.SourceFailure));
+                continue;
+            }
             if (!validation.IsAllowed || validation.NormalizedPath is null)
             {
                 continue;
