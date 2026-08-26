@@ -126,8 +126,19 @@ public sealed class InstallerContractTests
             """,
             lifecycle);
 
+        const string topLevelMarker = "# CANONICAL TOP-LEVEL EXECUTION";
+        var topLevelText = ReadPowerShellTopLevelText(fixture);
+        Assert.DoesNotMatch(@"(?im)^[ \t]*function\b", topLevelText);
+        var markerIndex = topLevelText.LastIndexOf(topLevelMarker, StringComparison.Ordinal);
+        Assert.True(markerIndex >= 0, $"PowerShell top-level marker was not found: {topLevelMarker}");
+        var terminatingStatements = NormalizePowerShellStatements(topLevelText[..markerIndex])
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(IsExplicitPowerShellTermination)
+            .ToArray();
+        Assert.Empty(terminatingStatements);
+
         var topLevelTail = NormalizePowerShellStatements(
-            ReadPowerShellTail(fixture, "# CANONICAL TOP-LEVEL EXECUTION"));
+            ReadPowerShellTail(fixture, topLevelMarker));
         Assert.Equal(
             """
             Initialize-UninstallFixture
@@ -247,6 +258,39 @@ public sealed class InstallerContractTests
         var openingBrace = script.IndexOf('{', declarationIndex + declaration.Length);
         Assert.True(openingBrace >= 0, $"PowerShell function has no body: {functionName}");
 
+        var closingBrace = FindMatchingPowerShellBrace(script, openingBrace, $"function {functionName}");
+        return script[(openingBrace + 1)..closingBrace];
+    }
+
+    /// <summary>剔除全部函数定义及其配对函数体，仅保留真正的 PowerShell 顶层文本。</summary>
+    private static string ReadPowerShellTopLevelText(string script)
+    {
+        var functionDeclaration = new Regex(
+            @"(?m)^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_:-]*[ \t\r\n]*\{",
+            RegexOptions.CultureInvariant);
+        var topLevel = new System.Text.StringBuilder(script.Length);
+        var cursor = 0;
+        while (cursor < script.Length)
+        {
+            var match = functionDeclaration.Match(script, cursor);
+            if (!match.Success)
+            {
+                topLevel.Append(script, cursor, script.Length - cursor);
+                break;
+            }
+
+            topLevel.Append(script, cursor, match.Index - cursor);
+            var openingBrace = match.Index + match.Value.LastIndexOf('{');
+            cursor = FindMatchingPowerShellBrace(script, openingBrace, match.Value.Trim()) + 1;
+            topLevel.AppendLine();
+        }
+
+        return topLevel.ToString();
+    }
+
+    /// <summary>以既有花括号深度规则找到函数体结尾，供函数读取与顶层剔除共同使用。</summary>
+    private static int FindMatchingPowerShellBrace(string script, int openingBrace, string context)
+    {
         var depth = 0;
         for (var index = openingBrace; index < script.Length; index++)
         {
@@ -258,11 +302,11 @@ public sealed class InstallerContractTests
             };
             if (depth == 0)
             {
-                return script[(openingBrace + 1)..index];
+                return index;
             }
         }
 
-        throw new Xunit.Sdk.XunitException($"PowerShell function body was not closed: {functionName}");
+        throw new Xunit.Sdk.XunitException($"PowerShell body was not closed: {context}");
     }
 
     /// <summary>读取规范顶层执行标记后的内容，确保最终调用不藏在条件或异常分支中。</summary>
@@ -279,5 +323,12 @@ public sealed class InstallerContractTests
             '\n',
             source.Split('\n', StringSplitOptions.TrimEntries)
                 .Where(line => line.Length > 0 && !line.StartsWith('#')));
+
+    /// <summary>识别顶层会明确终止当前脚本的直线语句。</summary>
+    private static bool IsExplicitPowerShellTermination(string statement) =>
+        Regex.IsMatch(
+            statement,
+            @"^(?:(?:return|exit|throw|break|continue)(?:\s|;|$)|\[(?:System\.)?Environment\]::Exit\s*\(|\$host\.SetShouldExit\s*\(|Stop-Process\b.*(?:-Id\s+)?\$PID\b)",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
 }
