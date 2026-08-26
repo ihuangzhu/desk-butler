@@ -25,8 +25,7 @@ public partial class App : System.Windows.Application, IDisposable
     {
         base.OnStartup(e);
 #if DEBUG
-        var isSmokeRequest = e.Args.Any(argument =>
-            StringComparer.OrdinalIgnoreCase.Equals(argument, "--smoke"));
+        var isSmokeRequest = e.Args.Any(IsDebugSmokeArgument);
 #else
         const bool isSmokeRequest = false;
 #endif
@@ -66,7 +65,7 @@ public partial class App : System.Windows.Application, IDisposable
             crashSentinel = new CrashSentinel(paths.RootDirectory);
 #if DEBUG
             composition = await CompositionRoot.CreateDebugAsync(
-                paths, () => _ = RequestExitAsync(), createFixture,
+                paths, () => _ = RequestExitAsync(), createFixture, runSmoke,
                 crashSentinel.IsPreviousRunUnclean, CancellationToken.None);
 #else
             composition = await CompositionRoot.CreateAsync(
@@ -205,7 +204,7 @@ public partial class App : System.Windows.Application, IDisposable
             {
                 createFixture = true;
             }
-            else if (StringComparer.OrdinalIgnoreCase.Equals(args[index], "--smoke"))
+            else if (IsDebugSmokeArgument(args[index]))
             {
                 runSmoke = true;
             }
@@ -230,6 +229,13 @@ public partial class App : System.Windows.Application, IDisposable
         return new AppDataPaths();
 #endif
     }
+
+#if DEBUG
+    /// <summary>同时保留旧 smoke 参数并识别自动验收使用的 UI 别名。</summary>
+    private static bool IsDebugSmokeArgument(string argument) =>
+        StringComparer.OrdinalIgnoreCase.Equals(argument, "--smoke") ||
+        StringComparer.OrdinalIgnoreCase.Equals(argument, "--smoke-ui");
+#endif
 
     /// <summary>验证 smoke 使用全新隔离根，并在启动对象图前清除唯一固定成功标记。</summary>
     internal static string PrepareSmokeRoot(AppDataPaths paths, string[] args)

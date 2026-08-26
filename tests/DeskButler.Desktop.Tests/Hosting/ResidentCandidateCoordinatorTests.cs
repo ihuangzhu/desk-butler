@@ -577,28 +577,6 @@ public sealed class ResidentCandidateCoordinatorTests
         Assert.Empty(coordinator.Current.Candidates);
     }
 
-    /// <summary>自动捕获直接使用既有入口，成功保存也绝不调用常驻发现器。</summary>
-    [Fact]
-    public async Task AutomaticCaptureNeverInvokesResidentDiscovery()
-    {
-        var settingsStore = new InMemorySettingsStore(ButlerSettings.Default);
-        var inventory = new SettingsAwareWindowInventory(
-            new StaticWindowInventory(ManualCandidate(@"C:\Apps\ordinary.exe")), settingsStore);
-        var repository = new InMemorySceneRepository();
-        using var capture = new CaptureCoordinator(
-            ButlerSettings.Default,
-            inventory,
-            new SceneFilter(ButlerSettings.Default),
-            repository,
-            new FakeClock());
-        var discovery = new RecordingDiscovery();
-
-        await capture.SaveNowAsync("automatic", CancellationToken.None);
-
-        Assert.Equal(0, discovery.CallCount);
-        Assert.Single(await repository.GetRecentAsync(1, CancellationToken.None));
-    }
-
     /// <summary>诊断日志自身的非用户取消故障不得阻断捕获失败后的常驻发现。</summary>
     [Fact]
     public async Task DiagnosticCancellationUnrelatedToRequestDoesNotBlockDiscovery()

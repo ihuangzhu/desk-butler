@@ -3,8 +3,21 @@ using System.Windows.Threading;
 
 namespace DeskButler.Desktop.Hosting;
 
+/// <summary>定义组合资源跨类型清理阶段；同一阶段仍严格按登记逆序释放。</summary>
+internal enum CleanupPhase
+{
+    /// <summary>先取消并等待会影响其它资源安全性的后台生命周期。</summary>
+    Early,
+
+    /// <summary>保持既有组合资源的默认逆构造清理行为。</summary>
+    Normal
+}
+
 /// <summary>表示一个可独立重试的异步清理步骤。</summary>
-internal sealed record CleanupStep(string Name, Func<ValueTask> RunAsync);
+internal sealed record CleanupStep(
+    string Name,
+    Func<ValueTask> RunAsync,
+    CleanupPhase Phase = CleanupPhase.Normal);
 
 /// <summary>原子协调清理步骤状态、live pass 共享与最终结果发布。</summary>
 internal sealed class CleanupPassCoordinator(IEnumerable<CleanupStep> steps)
@@ -258,20 +271,30 @@ internal sealed class CompositionResourceOwner
     }
 
     /// <summary>创建资源后立即登记其清理动作，并返回同一实例供后续组合。</summary>
-    internal T Own<T>(string name, T resource, Func<T, ValueTask> disposeAsync)
+    internal T Own<T>(
+        string name,
+        T resource,
+        Func<T, ValueTask> disposeAsync,
+        CleanupPhase phase = CleanupPhase.Normal)
         where T : notnull
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(disposeAsync);
         ThrowIfSealed();
-        ownedSteps.Add(new CleanupStep(name, () => disposeAsync(resource)));
+        ownedSteps.Add(new CleanupStep(name, () => disposeAsync(resource), phase));
         return resource;
     }
 
-    /// <summary>封存当前资源栈并生成按逆构造顺序执行的幂等清理器。</summary>
+    /// <summary>封存资源栈；early 先于 normal，各阶段内部仍按逆构造顺序执行。</summary>
     internal BestEffortAsyncCleanup PrepareCleanup()
     {
-        preparedCleanup ??= new BestEffortAsyncCleanup(ownedSteps.AsEnumerable().Reverse());
+        preparedCleanup ??= new BestEffortAsyncCleanup(
+            ownedSteps
+                .Where(step => step.Phase == CleanupPhase.Early)
+                .Reverse()
+                .Concat(ownedSteps
+                    .Where(step => step.Phase == CleanupPhase.Normal)
+                    .Reverse()));
         return preparedCleanup;
     }
 

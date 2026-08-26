@@ -29,6 +29,7 @@ public sealed class ResidentCandidateCoordinator
     private readonly IResidentAppDiscovery discovery;
     private readonly ISettingsStore settingsStore;
     private readonly SettingsCoordinator settings;
+    private readonly Action<ResidentDiscoveryResult>? reportDiscovery;
     private readonly object stateSync = new();
     private long latestRequestedGeneration;
     private ResidentDiscoveryBatch current = new(0, [], false);
@@ -38,10 +39,21 @@ public sealed class ResidentCandidateCoordinator
         IResidentAppDiscovery discovery,
         ISettingsStore settingsStore,
         SettingsCoordinator settings)
+        : this(discovery, settingsStore, settings, reportDiscovery: null)
+    {
+    }
+
+    /// <summary>使用共享设置门和尽力发现摘要接收器创建生产候选协调器。</summary>
+    internal ResidentCandidateCoordinator(
+        IResidentAppDiscovery discovery,
+        ISettingsStore settingsStore,
+        SettingsCoordinator settings,
+        Action<ResidentDiscoveryResult>? reportDiscovery)
     {
         this.discovery = discovery ?? throw new ArgumentNullException(nameof(discovery));
         this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        this.reportDiscovery = reportDiscovery;
     }
 
     /// <summary>供组合根验证候选确认和列表编辑共用同一个设置事务协调器。</summary>
@@ -79,6 +91,7 @@ public sealed class ResidentCandidateCoordinator
                 .ResidentApplications
                 .ToArray();
             var discovered = await discovery.DiscoverAsync(paths, existing, cancellationToken).ConfigureAwait(false);
+            ReportDiscoveryBestEffort(discovered);
             var candidates = Array.AsReadOnly(discovered.Candidates.Select(CloneCandidate).ToArray());
             batch = new ResidentDiscoveryBatch(generation, candidates, false);
         }
@@ -97,6 +110,19 @@ public sealed class ResidentCandidateCoordinator
             }
 
             return current;
+        }
+    }
+
+    /// <summary>发现摘要故障不得把已经成功的平台发现伪装为系统失败。</summary>
+    private void ReportDiscoveryBestEffort(ResidentDiscoveryResult result)
+    {
+        try
+        {
+            reportDiscovery?.Invoke(result);
+        }
+        catch
+        {
+            // 接收器是最终旁路，不能改变候选发布、代次或取消语义。
         }
     }
 

@@ -404,6 +404,9 @@ internal sealed class FindResidentCandidatesCommandHandler(ResidentCandidateCoor
         coordinator.DiscoverAsync(
             new HashSet<string>(StringComparer.OrdinalIgnoreCase),
             cancellationToken);
+
+    /// <summary>供组合根验证查找命令与其它常驻命令共享同一设置门。</summary>
+    internal SettingsCoordinator SettingsCoordinator => coordinator.SettingsCoordinator;
 }
 
 /// <summary>把候选确认命令路由到共享候选协调器。</summary>

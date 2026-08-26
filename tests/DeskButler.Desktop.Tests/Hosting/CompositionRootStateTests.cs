@@ -11,7 +11,10 @@ using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.ViewModels;
 using DeskButler.Desktop.Tests.ViewModels;
 using DeskButler.Infrastructure.Windows.Startup;
+using DeskButler.Persistence.Json;
+using DeskButler.Persistence.Paths;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -19,6 +22,233 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class CompositionRootStateTests
 {
+    /// <summary>真实组合入口必须让全部常驻命令共享唯一设置门，并让 UI 委托指向唯一启动协调器。</summary>
+    [Fact]
+    public Task InjectedResidentPlatformBuildsOneSettingsAndLaunchObjectGraph() =>
+        RunOnStaDispatcherAsync(async _ =>
+        {
+            var rootPath = Path.Combine(
+                Path.GetTempPath(), "DeskButler.Tests", Guid.NewGuid().ToString("N"));
+            var paths = new AppDataPaths(rootPath);
+            var platform = new ResidentPlatformServices(
+                new AllowingResidentExecutablePolicy(),
+                new FixedLogonIdentityProvider(),
+                new RecordingResidentProcessRuntime(),
+                new EmptyResidentDiscovery(),
+                new InMemoryResidentLaunchSessionStore());
+            CompositionRoot? root = null;
+            try
+            {
+                root = await CompositionRoot.CreateForTestsAsync(
+                    paths,
+                    static () => { },
+                    platform,
+                    pauseAutomaticCapture: false,
+                    CancellationToken.None);
+
+                var settings = root.ResidentCandidates.SettingsCoordinator;
+                Assert.Same(settings, root.ResidentCommands.Find.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Confirm.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Dismiss.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.SetApplicationsEnabled.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.SetApplicationEnabled.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Remove.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Move.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Add.SettingsCoordinator);
+                Assert.Same(settings, root.ResidentCommands.Replace.SettingsCoordinator);
+                Assert.Same(
+                    root.ResidentLaunch,
+                    root.MainViewModel.ResidentDependencies.LaunchEnabledNowAsync.Target);
+            }
+            finally
+            {
+                if (root is not null)
+                {
+                    await root.DisposeAsync();
+                }
+
+                if (Directory.Exists(rootPath))
+                {
+                    Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                    Directory.Delete(rootPath, recursive: true);
+                }
+            }
+        });
+
+    /// <summary>正规化与发现摘要必须按内容去重、退出前排空，并且绝不写入原始用户路径。</summary>
+    [Fact]
+    public Task ResidentDiagnosticsAreDeduplicatedRedactedAndDrainedByComposition() =>
+        RunOnStaDispatcherAsync(async _ =>
+        {
+            var rootPath = Path.Combine(
+                Path.GetTempPath(), "DeskButler.Tests", Guid.NewGuid().ToString("N"));
+            var paths = new AppDataPaths(rootPath);
+            var sensitivePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Private",
+                Guid.NewGuid().ToString("N"),
+                "resident.exe");
+            var store = new JsonSettingsStore(paths);
+            await store.SaveAsync(
+                ButlerSettings.Default with
+                {
+                    ResidentApplications =
+                    [
+                        ResidentApplicationForDiagnostics(sensitivePath, 0),
+                        ResidentApplicationForDiagnostics(sensitivePath, 1)
+                    ]
+                },
+                CancellationToken.None);
+            var discovery = new DiagnosticResidentDiscovery(sensitivePath);
+            var platform = new ResidentPlatformServices(
+                new AllowingResidentExecutablePolicy(),
+                new FixedLogonIdentityProvider(),
+                new RecordingResidentProcessRuntime(),
+                discovery,
+                new InMemoryResidentLaunchSessionStore());
+            CompositionRoot? root = null;
+            try
+            {
+                root = await CompositionRoot.CreateForTestsAsync(
+                    paths,
+                    static () => { },
+                    platform,
+                    pauseAutomaticCapture: false,
+                    CancellationToken.None);
+
+                await root.MainViewModel.FindResidentCandidatesAsync();
+                await root.MainViewModel.FindResidentCandidatesAsync();
+                await root.DisposeAsync();
+                root = null;
+
+                var events = Directory.EnumerateFiles(paths.LogDirectory, "deskbutler*.jsonl")
+                    .SelectMany(File.ReadAllLines)
+                    .Select(line => JsonDocument.Parse(line))
+                    .ToArray();
+                try
+                {
+                    var normalization = Assert.Single(events, document =>
+                        document.RootElement.GetProperty("category").GetString() == "resident-normalization");
+                    var normalizationProperties = normalization.RootElement.GetProperty("properties");
+                    Assert.Equal("DuplicateLaunchPath", normalizationProperties.GetProperty("issue").GetString());
+                    Assert.Equal(1, normalizationProperties.GetProperty("count").GetInt32());
+
+                    var discoverySummary = Assert.Single(events, document =>
+                        document.RootElement.GetProperty("category").GetString() == "resident-discovery-summary");
+                    var discoveryProperties = discoverySummary.RootElement.GetProperty("properties");
+                    Assert.Equal(1, discoveryProperties.GetProperty("candidateCount").GetInt32());
+                    Assert.Equal(3, discoveryProperties.GetProperty("diagnosticCount").GetInt32());
+                    Assert.Equal(
+                        "AccessDenied=2;MetadataUnavailable=1",
+                        discoveryProperties.GetProperty("issueCounts").GetString());
+
+                    var allLogText = string.Join(Environment.NewLine, events.Select(item => item.RootElement.GetRawText()));
+                    Assert.DoesNotContain(sensitivePath, allLogText, StringComparison.OrdinalIgnoreCase);
+                }
+                finally
+                {
+                    foreach (var document in events)
+                    {
+                        document.Dispose();
+                    }
+                }
+            }
+            finally
+            {
+                if (root is not null)
+                {
+                    await root.DisposeAsync();
+                }
+
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                if (Directory.Exists(rootPath))
+                {
+                    Directory.Delete(rootPath, recursive: true);
+                }
+            }
+        });
+
+    /// <summary>封存后到达的摘要不得消费全局指纹，后续活动 root 仍必须能记录同一内容。</summary>
+    [Fact]
+    public async Task SealedResidentDiagnosticsDoNotConsumeDiscoveryFingerprint()
+    {
+        var result = new ResidentDiscoveryResult(
+        [
+            new ResidentAppCandidate(
+                Guid.NewGuid().ToString("N"),
+                "Late",
+                @"C:\Apps\late.exe",
+                new HashSet<string>([@"C:\Apps\late.exe"], StringComparer.OrdinalIgnoreCase),
+                ResidentCandidateConfidence.Low,
+                ResidentCandidateKind.NewApplication,
+                null)
+        ],
+        [
+            new ResidentDiscoveryDiagnostic(ResidentDiscoveryIssue.AccessDenied)
+        ]);
+        var sealedLog = new RecordingDiagnosticLog();
+        var sealedTracker = new ResidentDiagnosticTracker(
+            sealedLog, new FixedClock(DateTimeOffset.UnixEpoch));
+        await sealedTracker.DrainAsync();
+
+        sealedTracker.ReportDiscovery(result);
+        var activeLog = new RecordingDiagnosticLog();
+        var activeTracker = new ResidentDiagnosticTracker(
+            activeLog, new FixedClock(DateTimeOffset.UnixEpoch));
+        activeTracker.ReportDiscovery(result);
+        await activeTracker.DrainAsync();
+
+        Assert.Empty(sealedLog.Events);
+        Assert.Single(activeLog.Events);
+    }
+
+    /// <summary>真实组合根的自动与 session-ending 捕获不发现常驻应用，只有手动命令会调用一次。</summary>
+    [Fact]
+    public Task ProductionAutomaticAndSessionCheckpointsDoNotRouteToResidentDiscovery() =>
+        RunOnStaDispatcherAsync(async _ =>
+        {
+            var rootPath = Path.Combine(
+                Path.GetTempPath(), "DeskButler.Tests", Guid.NewGuid().ToString("N"));
+            var paths = new AppDataPaths(rootPath);
+            var discovery = new CountingResidentDiscovery();
+            var platform = new ResidentPlatformServices(
+                new AllowingResidentExecutablePolicy(),
+                new FixedLogonIdentityProvider(),
+                new RecordingResidentProcessRuntime(),
+                discovery,
+                new InMemoryResidentLaunchSessionStore());
+            CompositionRoot? root = null;
+            try
+            {
+                root = await CompositionRoot.CreateForTestsAsync(
+                    paths,
+                    static () => { },
+                    platform,
+                    pauseAutomaticCapture: false,
+                    CancellationToken.None);
+
+                await root.RunAutomaticCaptureForTestsAsync("automatic", CancellationToken.None);
+                await root.RunSessionEndingCaptureForTestsAsync(CancellationToken.None);
+                Assert.Equal(0, discovery.CallCount);
+
+                await root.MainViewModel.SaveNowAsync();
+                Assert.Equal(1, discovery.CallCount);
+            }
+            finally
+            {
+                if (root is not null)
+                {
+                    await root.DisposeAsync();
+                }
+
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+                if (Directory.Exists(rootPath))
+                {
+                    Directory.Delete(rootPath, recursive: true);
+                }
+            }
+        });
+
     /// <summary>常驻自动批次只能在既有三个启动阶段成功后非阻塞建立，阶段失败时不得调用。</summary>
     [Fact]
     public async Task ResidentBatchStartsOnlyAfterExistingStartupStagesSucceed()
@@ -60,6 +290,95 @@ public sealed class CompositionRootStateTests
 
         Assert.Equal(
             ["module:start", "session:start", "desktop:start", "resident:start"],
+            calls);
+    }
+
+    /// <summary>模块、会话或桌面任一既有阶段失败时，常驻启动委托都必须保持零调用。</summary>
+    [Theory]
+    [InlineData("module")]
+    [InlineData("session")]
+    [InlineData("desktop")]
+    public async Task ExistingStartupStageFailureNeverCallsResidentBatch(string failingStage)
+    {
+        var residentStartCallCount = 0;
+        var startup = new CompositionStartupCoordinator(
+            _ => failingStage == "module"
+                ? Task.FromException(new IOException("module start failed"))
+                : Task.CompletedTask,
+            _ => Task.CompletedTask,
+            () =>
+            {
+                if (failingStage == "session")
+                {
+                    throw new IOException("session start failed");
+                }
+            },
+            static () => { },
+            _ => failingStage == "desktop"
+                ? Task.FromException(new IOException("desktop start failed"))
+                : Task.CompletedTask,
+            static () => ValueTask.CompletedTask);
+        var cleanup = new BestEffortAsyncCleanup(
+        [
+            new CleanupStep("startup failure", static () => ValueTask.CompletedTask)
+        ]);
+
+        await Assert.ThrowsAsync<IOException>(() => CompositionRoot.StartCoreAsync(
+            startup,
+            cleanup,
+            () => Interlocked.Increment(ref residentStartCallCount),
+            CancellationToken.None));
+
+        Assert.Equal(0, Volatile.Read(ref residentStartCallCount));
+    }
+
+    /// <summary>主模块已启动后的失败必须先清理已拥有 resident，再释放窗口、设置和日志。</summary>
+    [Fact]
+    public async Task StartupFailureAfterModuleCleansResidentBeforeWindowSettingsAndLog()
+    {
+        var calls = new List<string>();
+        var residentStartCallCount = 0;
+        var runtime = await CompositionResourceOwner.BuildAsync(owner =>
+        {
+            owner.Own("diagnostic", "diagnostic", resource => RecordCleanupAsync(calls, resource));
+            owner.Own("settings", "settings", resource => RecordCleanupAsync(calls, resource));
+            owner.Own(
+                "resident launch",
+                "resident",
+                resource => RecordCleanupAsync(calls, resource),
+                CleanupPhase.Early);
+            var startup = new CompositionStartupCoordinator(
+                _ =>
+                {
+                    calls.Add("module:start");
+                    return Task.CompletedTask;
+                },
+                _ =>
+                {
+                    calls.Add("module:stop");
+                    return Task.CompletedTask;
+                },
+                () => throw new IOException("session start failed"),
+                static () => { },
+                static _ => Task.CompletedTask,
+                static () => ValueTask.CompletedTask);
+            owner.Own(
+                "module host",
+                startup,
+                static coordinator => coordinator.StopModuleIfStartedAsync());
+            owner.Own("window", "window", resource => RecordCleanupAsync(calls, resource));
+            return Task.FromResult((Startup: startup, Cleanup: owner.PrepareCleanup()));
+        });
+
+        await Assert.ThrowsAsync<IOException>(() => CompositionRoot.StartCoreAsync(
+            runtime.Startup,
+            runtime.Cleanup,
+            () => Interlocked.Increment(ref residentStartCallCount),
+            CancellationToken.None));
+
+        Assert.Equal(0, Volatile.Read(ref residentStartCallCount));
+        Assert.Equal(
+            ["module:start", "resident", "window", "module:stop", "settings", "diagnostic"],
             calls);
     }
 
@@ -121,6 +440,107 @@ public sealed class CompositionRootStateTests
 
         Assert.Same(constructionFailure, thrown);
         Assert.Equal(["view-model", "repository", "diagnostic"], calls);
+    }
+
+    /// <summary>early 常驻清理必须完成取消等待后，才允许释放更晚登记的窗口、设置和日志。</summary>
+    [Fact]
+    public async Task EarlyResidentCleanupCompletesBeforeAllNormalResources()
+    {
+        var calls = new List<string>();
+        var residentStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseResident = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanup = await CompositionResourceOwner.BuildAsync(owner =>
+        {
+            owner.Own(
+                "resident launch",
+                "resident",
+                async resource =>
+                {
+                    calls.Add($"{resource}:cancel");
+                    residentStarted.TrySetResult();
+                    await releaseResident.Task;
+                    calls.Add($"{resource}:complete");
+                },
+                CleanupPhase.Early);
+            owner.Own("diagnostic", "diagnostic", resource => RecordCleanupAsync(calls, resource));
+            owner.Own("settings", "settings", resource => RecordCleanupAsync(calls, resource));
+            owner.Own("window", "window", resource => RecordCleanupAsync(calls, resource));
+            return Task.FromResult(owner.PrepareCleanup());
+        });
+
+        var disposing = cleanup.RunAsync().AsTask();
+        await residentStarted.Task;
+
+        Assert.Equal(["resident:cancel"], calls);
+        releaseResident.TrySetResult();
+        await disposing;
+
+        Assert.Equal(
+            ["resident:cancel", "resident:complete", "window", "settings", "diagnostic"],
+            calls);
+    }
+
+    /// <summary>early 故障不得阻断 normal 清理，聚合异常必须保持实际执行顺序。</summary>
+    [Fact]
+    public async Task EarlyCleanupFailureContinuesNormalPhaseAndPreservesFailureOrder()
+    {
+        var calls = new List<string>();
+        var residentFailure = new IOException("resident cleanup failed");
+        var logFailure = new IOException("log cleanup failed");
+        var cleanup = await CompositionResourceOwner.BuildAsync(owner =>
+        {
+            owner.Own(
+                "diagnostic",
+                "diagnostic",
+                resource => RecordFailingCleanupAsync(calls, resource, logFailure));
+            owner.Own(
+                "resident launch",
+                "resident",
+                resource => RecordFailingCleanupAsync(calls, resource, residentFailure),
+                CleanupPhase.Early);
+            owner.Own("window", "window", resource => RecordCleanupAsync(calls, resource));
+            return Task.FromResult(owner.PrepareCleanup());
+        });
+
+        var thrown = await Assert.ThrowsAsync<AggregateException>(() => cleanup.RunAsync().AsTask());
+
+        Assert.Equal(["resident", "window", "diagnostic"], calls);
+        Assert.Collection(
+            thrown.InnerExceptions,
+            failure => Assert.Same(residentFailure, failure.InnerException),
+            failure => Assert.Same(logFailure, failure.InnerException));
+    }
+
+    /// <summary>对象图后续构造失败时，已拥有的 early resident 仍须先行且仅释放一次。</summary>
+    [Fact]
+    public async Task ConstructionFailureDisposesOwnedEarlyResidentExactlyOnce()
+    {
+        var calls = new List<string>();
+        var residentDisposeCount = 0;
+        var constructionFailure = new IOException("window construction failed");
+
+        var thrown = await Assert.ThrowsAsync<IOException>(() =>
+            CompositionResourceOwner.BuildAsync<object>(owner =>
+            {
+                owner.Own("diagnostic", "diagnostic", resource => RecordCleanupAsync(calls, resource));
+                owner.Own(
+                    "resident launch",
+                    "resident",
+                    resource =>
+                    {
+                        Interlocked.Increment(ref residentDisposeCount);
+                        return RecordCleanupAsync(calls, resource);
+                    },
+                    CleanupPhase.Early);
+                owner.Own("window", "window", resource => RecordCleanupAsync(calls, resource));
+                return Task.FromException<object>(constructionFailure);
+            }));
+
+        Assert.Same(constructionFailure, thrown);
+        Assert.Equal(1, Volatile.Read(ref residentDisposeCount));
+        Assert.Equal(["resident", "window", "diagnostic"], calls);
     }
 
     /// <summary>异步构造失败的回滚必须回到发起构造的 WPF Dispatcher，并且仅清理一次。</summary>
@@ -1326,6 +1746,20 @@ public sealed class CompositionRootStateTests
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>记录清理调用后返回指定故障，供异常顺序契约测试使用。</summary>
+    private static ValueTask RecordFailingCleanupAsync(
+        List<string> calls,
+        string resource,
+        Exception failure)
+    {
+        calls.Add(resource);
+        return ValueTask.FromException(failure);
+    }
+
+    /// <summary>构造包含唯一敏感路径的设置条目，仅供日志隐私测试使用。</summary>
+    private static ResidentApplication ResidentApplicationForDiagnostics(string path, int order) =>
+        new(path, new HashSet<string>([path], StringComparer.OrdinalIgnoreCase), "Sensitive", true, order);
+
     /// <summary>在专用 STA 线程上运行真实 WPF Dispatcher，完成后确定性停止消息循环。</summary>
     private static async Task RunOnStaDispatcherAsync(Func<Dispatcher, Task> test)
     {
@@ -1444,6 +1878,17 @@ public sealed class CompositionRootStateTests
         }
     }
 
+    private sealed class RecordingDiagnosticLog : IDiagnosticLog
+    {
+        internal List<DiagnosticEvent> Events { get; } = [];
+
+        public Task WriteAsync(DiagnosticEvent diagnosticEvent, CancellationToken cancellationToken)
+        {
+            Events.Add(diagnosticEvent);
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class FailingDiagnosticLog : IDiagnosticLog
     {
         /// <inheritdoc />
@@ -1484,6 +1929,94 @@ public sealed class CompositionRootStateTests
             IReadOnlyList<ResidentApplication> existing,
             CancellationToken cancellationToken) =>
             Task.FromResult(new ResidentDiscoveryResult([], []));
+    }
+
+    /// <summary>返回稳定候选和重复分类，供摘要计数与内容去重测试使用。</summary>
+    private sealed class DiagnosticResidentDiscovery(string sensitivePath) : IResidentAppDiscovery
+    {
+        public Task<ResidentDiscoveryResult> DiscoverAsync(
+            IReadOnlySet<string> ordinaryWindowPaths,
+            IReadOnlyList<ResidentApplication> existing,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new ResidentDiscoveryResult(
+            [
+                new ResidentAppCandidate(
+                    "diagnostic-candidate",
+                    "Diagnostic Candidate",
+                    sensitivePath,
+                    new HashSet<string>([sensitivePath], StringComparer.OrdinalIgnoreCase),
+                    ResidentCandidateConfidence.Low,
+                    ResidentCandidateKind.NewApplication,
+                    null)
+            ],
+            [
+                new ResidentDiscoveryDiagnostic(ResidentDiscoveryIssue.AccessDenied),
+                new ResidentDiscoveryDiagnostic(ResidentDiscoveryIssue.AccessDenied),
+                new ResidentDiscoveryDiagnostic(ResidentDiscoveryIssue.MetadataUnavailable)
+            ]));
+    }
+
+    /// <summary>记录真实组合根是否越过常驻发现接口。</summary>
+    private sealed class CountingResidentDiscovery : IResidentAppDiscovery
+    {
+        private int callCount;
+
+        internal int CallCount => Volatile.Read(ref callCount);
+
+        public Task<ResidentDiscoveryResult> DiscoverAsync(
+            IReadOnlySet<string> ordinaryWindowPaths,
+            IReadOnlyList<ResidentApplication> existing,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref callCount);
+            return Task.FromResult(new ResidentDiscoveryResult([], []));
+        }
+    }
+
+    /// <summary>提供不含用户身份的固定登录会话标识。</summary>
+    private sealed class FixedLogonIdentityProvider : ILogonSessionIdentityProvider
+    {
+        public string GetCurrent() => "test-logon";
+    }
+
+    /// <summary>只记录边界调用且永不创建外部进程。</summary>
+    private sealed class RecordingResidentProcessRuntime : IResidentProcessRuntime
+    {
+        internal int StartCallCount { get; private set; }
+
+        public Task<ResidentRunningCheck> CheckRunningAsync(
+            IReadOnlySet<string> knownProcessPaths,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new ResidentRunningCheck(ResidentRunningState.NotRunning, null));
+
+        public Task StartAsync(string executablePath, CancellationToken cancellationToken)
+        {
+            StartCallCount++;
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>以内存保存唯一测试登录计划，避免触碰真实用户会话文件。</summary>
+    private sealed class InMemoryResidentLaunchSessionStore : IResidentLaunchSessionStore
+    {
+        private ResidentLaunchSession? current;
+
+        public Task<ResidentLaunchSession?> LoadAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(current);
+
+        public Task SaveAsync(ResidentLaunchSession session, CancellationToken cancellationToken)
+        {
+            current = session;
+            return Task.CompletedTask;
+        }
+
+        public Task<ResidentLaunchRecoveryResult> RecoverCorruptAsync(
+            string currentLogonSessionId,
+            CancellationToken cancellationToken)
+        {
+            current = new ResidentLaunchSession(1, currentLogonSessionId, true, []);
+            return Task.FromResult(ResidentLaunchRecoveryResult.RecoveredWithEmptyPlan);
+        }
     }
 
     /// <summary>测试中只验证命令对象图，不触碰文件系统或真实第三方应用。</summary>

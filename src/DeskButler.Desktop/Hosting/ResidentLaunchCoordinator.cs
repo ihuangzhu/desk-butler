@@ -62,6 +62,9 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         }
     }
 
+    /// <summary>供组合测试验证 Debug smoke 或 fake 平台 runtime 的真实引用。</summary>
+    internal IResidentProcessRuntime ProcessRuntime => runtime;
+
     /// <summary>只在首次调用时建立后台批次并立即返回。</summary>
     internal void Start()
     {

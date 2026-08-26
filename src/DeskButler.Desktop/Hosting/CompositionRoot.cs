@@ -35,6 +35,10 @@ public sealed class CompositionRoot : IAsyncDisposable
     private readonly RecoveryCardFocusCoordinator recoveryCardFocus;
     private readonly ResidentCandidateFocusCoordinator residentCandidateFocus;
     private readonly ResidentLaunchCoordinator residentLaunchCoordinator;
+    private readonly ResidentCandidateCoordinator residentCandidates;
+    private readonly ResidentAppCommandHandlerSet residentCommands;
+    private readonly Func<string, CancellationToken, Task> automaticCapture;
+    private readonly Func<CancellationToken, Task> sessionEndingCapture;
     private readonly BestEffortAsyncCleanup cleanup;
 
     private CompositionRoot(
@@ -43,6 +47,10 @@ public sealed class CompositionRoot : IAsyncDisposable
         RecoveryCardFocusCoordinator recoveryCardFocus,
         ResidentCandidateFocusCoordinator residentCandidateFocus,
         ResidentLaunchCoordinator residentLaunchCoordinator,
+        ResidentCandidateCoordinator residentCandidates,
+        ResidentAppCommandHandlerSet residentCommands,
+        Func<string, CancellationToken, Task> automaticCapture,
+        Func<CancellationToken, Task> sessionEndingCapture,
         MainViewModel mainViewModel,
         RecoveryCardViewModel recoveryCardViewModel,
         MainWindow mainWindow,
@@ -55,6 +63,10 @@ public sealed class CompositionRoot : IAsyncDisposable
         this.recoveryCardFocus = recoveryCardFocus;
         this.residentCandidateFocus = residentCandidateFocus;
         this.residentLaunchCoordinator = residentLaunchCoordinator;
+        this.residentCandidates = residentCandidates;
+        this.residentCommands = residentCommands;
+        this.automaticCapture = automaticCapture;
+        this.sessionEndingCapture = sessionEndingCapture;
         MainViewModel = mainViewModel;
         RecoveryCardViewModel = recoveryCardViewModel;
         MainWindow = mainWindow;
@@ -79,6 +91,23 @@ public sealed class CompositionRoot : IAsyncDisposable
     /// <summary>获取唯一托盘图标所有者。</summary>
     public TrayIconService TrayIcon { get; }
 
+    /// <summary>供组合测试验证真实命令接线共用的候选协调器。</summary>
+    internal ResidentCandidateCoordinator ResidentCandidates => residentCandidates;
+
+    /// <summary>供组合测试验证实际注册的完整常驻命令集合。</summary>
+    internal ResidentAppCommandHandlerSet ResidentCommands => residentCommands;
+
+    /// <summary>供组合测试验证自动与手动启动只引用唯一协调器。</summary>
+    internal ResidentLaunchCoordinator ResidentLaunch => residentLaunchCoordinator;
+
+    /// <summary>调用生产 scheduler 使用的同一自动捕获委托，供组合测试验证常驻发现隔离。</summary>
+    internal Task RunAutomaticCaptureForTestsAsync(string reason, CancellationToken cancellationToken) =>
+        automaticCapture(reason, cancellationToken);
+
+    /// <summary>调用生产 session-ending 使用的同一检查点委托，供组合测试验证常驻发现隔离。</summary>
+    internal Task RunSessionEndingCaptureForTestsAsync(CancellationToken cancellationToken) =>
+        sessionEndingCapture(cancellationToken);
+
     /// <summary>使用正式当前用户数据目录创建真实服务图。</summary>
     public static Task<CompositionRoot> CreateAsync(
         AppDataPaths paths,
@@ -87,7 +116,7 @@ public sealed class CompositionRoot : IAsyncDisposable
         CancellationToken cancellationToken) =>
         CreateCoreAsync(
             paths, requestExit, createFixture: false, applyStartupRegistration: true,
-            pauseAutomaticCapture, cancellationToken);
+            pauseAutomaticCapture, CreateResidentPlatformServices, cancellationToken);
 
 #if DEBUG
     /// <summary>Debug 构建可在隔离数据根创建一份无敏感内容的冒烟现场。</summary>
@@ -95,12 +124,29 @@ public sealed class CompositionRoot : IAsyncDisposable
         AppDataPaths paths,
         Action requestExit,
         bool createFixture,
+        bool runSmoke,
         bool pauseAutomaticCapture,
         CancellationToken cancellationToken) =>
         CreateCoreAsync(
             paths, requestExit, createFixture, applyStartupRegistration: false,
-            pauseAutomaticCapture, cancellationToken);
+            pauseAutomaticCapture,
+            path => CreateResidentPlatformServices(path, disableProcessRuntime: runSmoke),
+            cancellationToken);
 #endif
+
+    /// <summary>在隔离数据根注入完整 fake 平台包，同时保留真实组合根、命令和所有权接线。</summary>
+    internal static Task<CompositionRoot> CreateForTestsAsync(
+        AppDataPaths paths,
+        Action requestExit,
+        ResidentPlatformServices resident,
+        bool pauseAutomaticCapture,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(resident);
+        return CreateCoreAsync(
+            paths, requestExit, createFixture: false, applyStartupRegistration: false,
+            pauseAutomaticCapture, _ => resident, cancellationToken);
+    }
 
     /// <summary>启动工作区模块、会话关机检查点与轮询变化源。</summary>
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -212,10 +258,12 @@ public sealed class CompositionRoot : IAsyncDisposable
         bool createFixture,
         bool applyStartupRegistration,
         bool pauseAutomaticCapture,
+        Func<AppDataPaths, ResidentPlatformServices> createResidentPlatformServices,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(paths);
         ArgumentNullException.ThrowIfNull(requestExit);
+        ArgumentNullException.ThrowIfNull(createResidentPlatformServices);
         paths.EnsureRootDirectoryExists();
 
         return await CompositionResourceOwner.BuildAsync(async ownership =>
@@ -225,6 +273,10 @@ public sealed class CompositionRoot : IAsyncDisposable
                 "diagnostic log",
                 new RollingJsonLog(paths.LogDirectory),
                 static log => log.DisposeAsync());
+            var residentDiagnostics = ownership.Own(
+                "resident diagnostics",
+                new ResidentDiagnosticTracker(diagnosticLog, clock),
+                static tracker => tracker.DrainAsync());
             var databaseRecovery = new DatabaseRecovery(
                 paths, new SqliteConnectionLifecycle(), new DatabaseMigrator(paths));
             var databaseHealth = await databaseRecovery.InitializeAsync(cancellationToken);
@@ -245,7 +297,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 paths.LogDirectory,
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
                 ["deskbutler.jsonl", "deskbutler.1.jsonl", "deskbutler.2.jsonl"]);
-            var settingsStore = new JsonSettingsStore(paths);
+            var settingsStore = new JsonSettingsStore(paths, residentDiagnostics.ReportNormalization);
             var persistedSettings = await settingsStore.LoadAsync(cancellationToken);
             var startupRegistration = ApplyStartupRegistration(persistedSettings, applyStartupRegistration);
             var settingsCoordinator = ownership.Own(
@@ -256,6 +308,28 @@ public sealed class CompositionRoot : IAsyncDisposable
                     settings.Dispose();
                     return ValueTask.CompletedTask;
                 });
+            var resident = createResidentPlatformServices(paths);
+            var residentCandidates = new ResidentCandidateCoordinator(
+                resident.Discovery,
+                settingsStore,
+                settingsCoordinator,
+                residentDiagnostics.ReportDiscovery);
+            var residentCommands = ResidentAppCommandHandlerSet.Create(
+                residentCandidates,
+                settingsCoordinator,
+                resident.ExecutablePolicy);
+            var residentLaunchCoordinator = ownership.Own(
+                "resident launch",
+                new ResidentLaunchCoordinator(
+                    settingsStore,
+                    resident.LaunchSessionStore,
+                    resident.LogonIdentity,
+                    resident.ProcessRuntime,
+                    resident.ExecutablePolicy,
+                    clock,
+                    diagnosticLog),
+                static coordinator => coordinator.DisposeAsync(),
+                CleanupPhase.Early);
             var repository = ownership.Own(
                 "repository",
                 new SqliteSceneRepository(paths),
@@ -287,29 +361,10 @@ public sealed class CompositionRoot : IAsyncDisposable
                     coordinator.Dispose();
                     return ValueTask.CompletedTask;
                 });
-            var residentExecutablePolicy = new WindowsResidentExecutablePolicy();
-            var residentCandidates = new ResidentCandidateCoordinator(
-                WindowsResidentAppDiscovery.CreateDefault(),
-                settingsStore,
-                settingsCoordinator);
-            var residentCommands = ResidentAppCommandHandlerSet.Create(
-                residentCandidates,
-                settingsCoordinator,
-                residentExecutablePolicy);
-            var residentLaunchCoordinator = ownership.Own(
-                "resident launch coordinator",
-                new ResidentLaunchCoordinator(
-                    settingsStore,
-                    new JsonResidentLaunchSessionStore(paths),
-                    new WindowsLogonSessionIdentityProvider(),
-                    new WindowsResidentProcessRuntime(residentExecutablePolicy),
-                    residentExecutablePolicy,
-                    clock,
-                    diagnosticLog),
-                static coordinator => coordinator.DisposeAsync());
+            Func<string, CancellationToken, Task> automaticCapture = captureCoordinator.SaveNowAsync;
             var scheduler = ownership.Own(
                 "scheduler",
-                new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync),
+                new SnapshotScheduler(clock, automaticCapture),
                 static scheduler => scheduler.DisposeAsync());
             var automaticCaptureGate = new AutomaticCaptureGate(
                 pauseAutomaticCapture,
@@ -343,12 +398,12 @@ public sealed class CompositionRoot : IAsyncDisposable
                 "module host",
                 startup,
                 static coordinator => coordinator.StopModuleIfStartedAsync());
+            Func<CancellationToken, Task> sessionEndingCapture = token => automaticCaptureGate.IsPaused
+                ? Task.CompletedTask
+                : captureCoordinator.SaveNowAsync("session-ending", token);
             sessionEvents = ownership.Own(
                 "session events",
-                new WindowsSessionEvents(
-                    token => automaticCaptureGate.IsPaused
-                        ? Task.CompletedTask
-                        : captureCoordinator.SaveNowAsync("session-ending", token)),
+                new WindowsSessionEvents(sessionEndingCapture),
                 _ => startup.DisposeSessionAsync());
 
             var commandBus = new InProcessCommandBus();
@@ -381,7 +436,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 "main view model",
                 new MainViewModel(
                     notifyingRepository, commandBus, settingsStore,
-                    new WpfUiDispatcher(System.Windows.Application.Current.Dispatcher),
+                    new WpfUiDispatcher(System.Windows.Threading.Dispatcher.CurrentDispatcher),
                     databaseHealth.HealthWarning,
                     async token =>
                     {
@@ -401,7 +456,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                     new ResidentViewModelDependencies(
                         new WindowsExecutablePicker(),
                         new WindowsExecutableIconProvider(),
-                        residentExecutablePolicy.Validate,
+                        resident.ExecutablePolicy.Validate,
                         residentLaunchCoordinator.LaunchEnabledNowAsync)),
                 static viewModel =>
                 {
@@ -457,6 +512,10 @@ public sealed class CompositionRoot : IAsyncDisposable
                 recoveryCardFocus,
                 residentCandidateFocus,
                 residentLaunchCoordinator,
+                residentCandidates,
+                residentCommands,
+                automaticCapture,
+                sessionEndingCapture,
                 mainViewModel,
                 recoveryCardViewModel,
                 mainWindow,
@@ -465,6 +524,27 @@ public sealed class CompositionRoot : IAsyncDisposable
                 cleanup);
             return root;
         }).ConfigureAwait(false);
+    }
+
+    /// <summary>只在 settings/diagnostic 已建立后创建正式 Windows 平台边界。</summary>
+    private static ResidentPlatformServices CreateResidentPlatformServices(AppDataPaths paths)
+        => CreateResidentPlatformServices(paths, disableProcessRuntime: false);
+
+    /// <summary>创建正式平台边界；仅 Debug smoke 可替换为零外部调用的禁用 runtime。</summary>
+    private static ResidentPlatformServices CreateResidentPlatformServices(
+        AppDataPaths paths,
+        bool disableProcessRuntime)
+    {
+        ArgumentNullException.ThrowIfNull(paths);
+        var executablePolicy = new WindowsResidentExecutablePolicy();
+        return new ResidentPlatformServices(
+            executablePolicy,
+            new WindowsLogonSessionIdentityProvider(),
+            disableProcessRuntime
+                ? new DisabledResidentProcessRuntime()
+                : new WindowsResidentProcessRuntime(executablePolicy),
+            WindowsResidentAppDiscovery.CreateDefault(),
+            new JsonResidentLaunchSessionStore(paths));
     }
 
     /// <summary>仅手动保存发布的候选事件触发窗口边界；SceneSaved 和自动刷新不订阅此入口。</summary>

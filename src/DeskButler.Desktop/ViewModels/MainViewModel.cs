@@ -75,6 +75,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool residentApplicationsEnabled;
     private long residentCandidateGeneration;
 
+    /// <summary>供组合测试验证手动启动委托与唯一常驻启动协调器的引用关系。</summary>
+    internal ResidentViewModelDependencies ResidentDependencies => residentDependencies;
+
     /// <summary>使用实际仓库、命令总线和设置存储创建主界面模型。</summary>
     public MainViewModel(ISceneRepository repository, ICommandBus commands, ISettingsStore settingsStore)
         : this(repository, commands, settingsStore, new InlineUiDispatcher(), null, null)
