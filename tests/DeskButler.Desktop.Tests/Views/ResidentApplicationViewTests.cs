@@ -1,5 +1,8 @@
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
 using System.Xml.Linq;
 using DeskButler.Application.Commands;
 using DeskButler.Core.Persistence;
@@ -23,6 +26,7 @@ public sealed class ResidentApplicationViewTests
         var document = LoadMainWindow();
         var confirmation = document.Descendants(Presentation + "Border")
             .Single(element => (string?)element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml")) == "ResidentCandidateConfirmationPanel");
+        Assert.NotEqual("Cycle", (string?)confirmation.Attribute("KeyboardNavigation.TabNavigation"));
         var candidates = confirmation.Descendants(Presentation + "ItemsControl")
             .Single(element => (string?)element.Attribute("ItemsSource") == "{Binding ResidentCandidates}");
 
@@ -47,6 +51,10 @@ public sealed class ResidentApplicationViewTests
         Assert.Contains(document.Descendants(Presentation + "TextBlock"), element => (string?)element.Attribute("Text") == "低可信，默认不添加");
         Assert.Contains(document.Descendants(Presentation + "TextBlock"), element => (string?)element.Attribute("Text") == "请选择主程序 .exe");
         Assert.Contains(document.Descendants(Presentation + "TextBlock"), element => (string?)element.Attribute("Text") == "发现可能的新路径，需要你确认");
+        var missingPathTrigger = document.Descendants(Presentation + "DataTrigger")
+            .Single(element => (string?)element.Attribute("Value") == "True" &&
+                (string?)element.Attribute("Binding") == "{Binding NeedsLaunchPath}");
+        Assert.NotNull(missingPathTrigger);
     }
 
     /// <summary>移除设置滚动或项目命令会使大量条目无法管理，此测试保护所有受支持操作且不暴露命令行。</summary>
@@ -57,8 +65,10 @@ public sealed class ResidentApplicationViewTests
         var settings = document.Descendants(Presentation + "TabItem")
             .Single(element => (string?)element.Attribute("Header") == "设置");
         Assert.NotEmpty(settings.Descendants(Presentation + "ScrollViewer"));
-        Assert.Contains(settings.Descendants(Presentation + "Button"), element =>
-            (string?)element.Attribute("Command") == "{Binding ToggleResidentApplicationsCommand}");
+        var residentToggle = settings.Descendants(Presentation + "CheckBox")
+            .Single(element => (string?)element.Attribute("Command") == "{Binding ToggleResidentApplicationsCommand}");
+        Assert.Equal("{Binding ResidentApplicationsEnabled, Mode=OneWay}", (string?)residentToggle.Attribute("IsChecked"));
+        Assert.Contains("常驻", (string?)residentToggle.Attribute("AutomationProperties.Name"), StringComparison.Ordinal);
         Assert.Contains(settings.Descendants(Presentation + "Button"), element =>
             (string?)element.Attribute("Command") == "{Binding FindResidentCandidatesCommand}");
         Assert.Contains(settings.Descendants(Presentation + "Button"), element =>
@@ -138,6 +148,56 @@ public sealed class ResidentApplicationViewTests
         Assert.Equal(["focus"], calls);
     }
 
+    /// <summary>若候选到达时仍停在其他页，用户会看不到确认区；此测试使用真实 WPF 窗口验证显示、首页选择和键盘焦点。</summary>
+    [Fact]
+    public void CandidateFocusSelectsHomeAndPlacesKeyboardFocusForHiddenAndVisibleWindows()
+    {
+        foreach (var (initiallyVisible, previousTab) in new[]
+                 {
+                     (false, "设置"),
+                     (true, "现场"),
+                     (true, "诊断")
+                 })
+        {
+            RunOnStaThread(() =>
+            {
+                var window = new DeskButler.Desktop.Views.MainWindow(CreateViewModel(_ => Task.CompletedTask));
+                try
+                {
+                    var tabs = Assert.IsType<TabControl>(window.FindName("MainTabControl"));
+                    var home = Assert.IsType<TabItem>(window.FindName("HomeTabItem"));
+                    var before = tabs.Items.OfType<TabItem>().Single(tab => Equals(tab.Header, previousTab));
+                    tabs.SelectedItem = before;
+                    if (initiallyVisible)
+                    {
+                        window.Show();
+                        window.Activate();
+                    }
+
+                    var coordinator = new ResidentCandidateFocusCoordinator(
+                        () => window.IsVisible,
+                        () =>
+                        {
+                            window.Show();
+                            window.Activate();
+                        },
+                        window.FocusResidentCandidateConfirmation);
+                    coordinator.Focus();
+                    DrainDispatcher(window.Dispatcher);
+
+                    var confirmation = Assert.IsType<Border>(window.FindName("ResidentCandidateConfirmationPanel"));
+                    Assert.True(window.IsVisible);
+                    Assert.Same(home, tabs.SelectedItem);
+                    Assert.Same(confirmation, Keyboard.FocusedElement);
+                }
+                finally
+                {
+                    window.CloseForExit();
+                }
+            });
+        }
+    }
+
     /// <summary>托盘“立即启动”只能复用 ViewModel 的手动命令，不能创建额外持续守护。</summary>
     [Fact]
     public async Task TrayLaunchResidentItemExecutesViewModelManualLaunchCommand()
@@ -173,5 +233,42 @@ public sealed class ResidentApplicationViewTests
     private sealed class NullExecutablePicker : IExecutablePicker
     {
         public Task<string?> PickAsync(CancellationToken cancellationToken) => Task.FromResult<string?>(null);
+    }
+
+    private static void RunOnStaThread(Action action)
+    {
+        Exception? failure = null;
+        using var completed = new ManualResetEventSlim();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                Dispatcher.CurrentDispatcher.InvokeShutdown();
+                completed.Set();
+            }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(completed.Wait(TimeSpan.FromSeconds(15)), "WPF 焦点测试未在时限内完成。");
+        if (failure is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    private static void DrainDispatcher(Dispatcher dispatcher)
+    {
+        var frame = new DispatcherFrame();
+        dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(() => frame.Continue = false));
+        Dispatcher.PushFrame(frame);
     }
 }

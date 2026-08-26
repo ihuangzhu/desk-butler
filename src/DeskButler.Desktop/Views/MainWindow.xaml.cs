@@ -29,6 +29,8 @@ public partial class MainWindow : Window
     {
         Dispatcher.BeginInvoke(() =>
         {
+            MainTabControl.SelectedItem = HomeTabItem;
+            MainTabControl.UpdateLayout();
             ResidentCandidateConfirmationPanel.Focus();
             Keyboard.Focus(ResidentCandidateConfirmationPanel);
         });

@@ -82,6 +82,41 @@ public sealed class ResidentCandidateViewModelTests
         Assert.Contains(@"C:\Chosen\Agent.exe", vm.PathReplacementText, StringComparison.Ordinal);
     }
 
+    /// <summary>空白启动入口必须与空值同样提示用户选择主程序，避免只靠 XAML 空值触发器漏掉空字符串。</summary>
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("", true)]
+    [InlineData("   ", true)]
+    [InlineData(@"C:\Apps\Agent.exe", false)]
+    public void NeedsLaunchPathTreatsNullEmptyAndWhitespaceAsMissing(string? launchPath, bool expected)
+    {
+        var vm = new ResidentCandidateViewModel(
+            CreateCandidate(ResidentCandidateConfidence.Low, ResidentCandidateKind.NewApplication, launchPath),
+            24,
+            new FakeExecutablePicker(),
+            new FakeExecutableIconProvider());
+
+        Assert.Equal(expected, vm.NeedsLaunchPath);
+    }
+
+    /// <summary>路径草稿从有效变为空白时必须通知绑定层重新评估提示可见性。</summary>
+    [Fact]
+    public void ChangingLaunchPathRaisesNeedsLaunchPathNotification()
+    {
+        var vm = new ResidentCandidateViewModel(
+            CreateCandidate(ResidentCandidateConfidence.Low, ResidentCandidateKind.NewApplication, @"C:\Apps\Agent.exe"),
+            25,
+            new FakeExecutablePicker(),
+            new FakeExecutableIconProvider());
+        var changed = new List<string?>();
+        vm.PropertyChanged += (_, eventArgs) => changed.Add(eventArgs.PropertyName);
+
+        vm.FinalLaunchPath = " ";
+
+        Assert.True(vm.NeedsLaunchPath);
+        Assert.Contains(nameof(ResidentCandidateViewModel.NeedsLaunchPath), changed);
+    }
+
     /// <summary>浏览取消不能改写候选入口、选择状态或确认能力。</summary>
     [Fact]
     public async Task BrowseCancellationLeavesCandidateUntouched()

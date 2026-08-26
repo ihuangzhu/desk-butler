@@ -62,6 +62,7 @@ public sealed class ResidentCandidateViewModel : ObservableObject
             {
                 Icon = iconProvider.GetIcon(value);
                 OnPropertyChanged(nameof(CanConfirm));
+                OnPropertyChanged(nameof(NeedsLaunchPath));
                 OnPropertyChanged(nameof(PathReplacementText));
                 stateChanged();
             }
@@ -84,6 +85,9 @@ public sealed class ResidentCandidateViewModel : ObservableObject
 
     /// <summary>获取已选择候选是否有可交给命令处理器验证的非空入口。</summary>
     public bool CanConfirm => IsSelected && !string.IsNullOrWhiteSpace(FinalLaunchPath);
+
+    /// <summary>获取当前入口是否为空白，供 XAML 以同一语义显示主程序选择提示。</summary>
+    public bool NeedsLaunchPath => string.IsNullOrWhiteSpace(FinalLaunchPath);
 
     /// <summary>获取路径替换时展示的旧、新入口文本。</summary>
     public string PathReplacementText => Kind == ResidentCandidateKind.PathReplacement

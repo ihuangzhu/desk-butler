@@ -19,8 +19,8 @@
                        HorizontalAlignment="Right" />
         </DockPanel>
 
-        <TabControl Grid.Row="2" Background="White" Padding="8">
-            <TabItem Header="首页">
+        <TabControl x:Name="MainTabControl" Grid.Row="2" Background="White" Padding="8">
+            <TabItem x:Name="HomeTabItem" Header="首页">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="18">
                         <TextBlock Text="你的现场由本机保存，重启后可由你手动恢复。" FontSize="16" TextWrapping="Wrap" />
@@ -28,7 +28,7 @@
                             <Button Content="立即保存现场" Command="{Binding SaveNowCommand}" Padding="16,8" Margin="0,0,10,0" />
                             <Button Content="{Binding CaptureToggleText}" AutomationProperties.Name="切换捕获" Command="{Binding ToggleCaptureCommand}" Padding="16,8" />
                         </StackPanel>
-                        <Border x:Name="ResidentCandidateConfirmationPanel" Focusable="True" KeyboardNavigation.TabNavigation="Cycle"
+                        <Border x:Name="ResidentCandidateConfirmationPanel" Focusable="True" KeyboardNavigation.IsTabStop="True"
                                 BorderBrush="#FFBFDBFE" BorderThickness="1" CornerRadius="8" Padding="14" Margin="0,20,0,0">
                             <StackPanel>
                                 <TextBlock Text="发现的常驻应用" FontSize="18" FontWeight="SemiBold" />
@@ -47,7 +47,7 @@
                                                         <TextBlock Text="低可信，默认不添加" Foreground="#FFB45309" Margin="0,4,0,0"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding Confidence}" Value="Low"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
                                                         <TextBlock Text="发现可能的新路径，需要你确认" Foreground="#FFB45309" Margin="0,4,0,0"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding Kind}" Value="PathReplacement"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
                                                         <TextBlock Text="{Binding PathReplacementText}" TextWrapping="Wrap" Foreground="#FF66666F" />
-                                                        <TextBlock Text="请选择主程序 .exe" Foreground="#FFB42318" Margin="0,4,0,0"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding FinalLaunchPath}" Value="{x:Null}"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
+                                                        <TextBlock Text="请选择主程序 .exe" Foreground="#FFB42318" Margin="0,4,0,0"><TextBlock.Style><Style TargetType="TextBlock"><Setter Property="Visibility" Value="Collapsed" /><Style.Triggers><DataTrigger Binding="{Binding NeedsLaunchPath}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger></Style.Triggers></Style></TextBlock.Style></TextBlock>
                                                         <DockPanel Margin="0,6,0,0">
                                                             <Button DockPanel.Dock="Right" Content="浏览修正" Command="{Binding BrowsePathCommand}" Margin="8,0,0,0" />
                                                             <TextBox Text="{Binding FinalLaunchPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsTabStop="True" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled" ToolTip="可修改为主程序 .exe 路径" />
@@ -108,7 +108,9 @@
                         <TextBlock Text="{Binding StartupErrorMessage}" Margin="0,6,0,0" Foreground="#FFB42318" TextWrapping="Wrap" />
                         <TextBlock Text="常驻应用" FontWeight="SemiBold" Margin="0,18,0,8" />
                         <StackPanel Orientation="Horizontal">
-                            <Button Content="启用或停用常驻应用" Command="{Binding ToggleResidentApplicationsCommand}" Margin="0,0,8,0" />
+                            <CheckBox Content="启用常驻应用" AutomationProperties.Name="启用或停用常驻应用"
+                                      IsChecked="{Binding ResidentApplicationsEnabled, Mode=OneWay}"
+                                      Command="{Binding ToggleResidentApplicationsCommand}" Margin="0,0,8,0" />
                             <Button Content="查找常驻应用" Command="{Binding FindResidentCandidatesCommand}" Margin="0,0,8,0" />
                             <Button Content="浏览添加应用" Command="{Binding AddResidentApplicationCommand}" Margin="0,0,8,0" />
                             <Button Content="立即启动常驻应用" Command="{Binding LaunchResidentsNowCommand}" />

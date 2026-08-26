@@ -269,6 +269,24 @@ public sealed class MainViewModelTests
         Assert.Empty(vm.ResidentApplications);
     }
 
+    /// <summary>常驻总开关的 UI 交互必须经类型化命令返回权威快照，而不是通过属性 setter 直接持久化。</summary>
+    [Fact]
+    public async Task ToggleResidentApplicationsCommandAppliesTypedMutationSnapshot()
+    {
+        var commands = new ResidentCommandBus(
+            mutationResult: new ResidentSettingsMutationResult(true, ResidentSettingsError.None, [], false));
+        var vm = CreateResidentViewModel(
+            commands,
+            ButlerSettings.Default with { ResidentApplicationsEnabled = true });
+        await vm.LoadAsync();
+
+        await vm.SetResidentApplicationsEnabledAsync(false);
+
+        var command = Assert.IsType<SetResidentApplicationsEnabledCommand>(Assert.Single(commands.SentCommands));
+        Assert.False(command.IsEnabled);
+        Assert.False(vm.ResidentApplicationsEnabled);
+    }
+
     /// <summary>条目开关、删除和移动只能走父级的类型化命令，再由返回快照更新列表。</summary>
     [Fact]
     public async Task ResidentApplicationActionsSendTypedCommandsThroughParent()
