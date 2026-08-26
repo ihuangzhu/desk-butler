@@ -139,18 +139,14 @@ public sealed class InstallerContractTests
         Assert.Equal(
             ["exit 0"],
             ReadExplicitPowerShellTerminations("Write-Output x; exit 0"));
-        Assert.Equal(
-            ["return"],
-            ReadExplicitPowerShellTerminations("Write-Output x#harmless; return"));
-        Assert.Equal(
-            ["return"],
-            ReadExplicitPowerShellTerminations("Write-Output x<#plain; return"));
-        Assert.Equal(
-            ["return"],
-            ReadExplicitPowerShellTerminations("<# outer <# inner #>; return"));
-        Assert.Equal(
-            ["exit 0"],
-            ReadExplicitPowerShellTerminations("Write-Output x#harmless; exit 0"));
+        Assert.Empty(ReadExplicitPowerShellTerminations("Write-Output x#harmless; return"));
+        Assert.Empty(ReadExplicitPowerShellTerminations("Write-Output x<#plain; return"));
+        Assert.Equal(["return"], ReadExplicitPowerShellTerminations("<# outer <# inner #>; return"));
+        Assert.Empty(ReadExplicitPowerShellTerminations("Write-Output x#harmless; exit 0"));
+        Assert.Equal(["exit 0"], ReadExplicitPowerShellTerminations("x\"y\"# comment\nexit 0"));
+        Assert.Equal(["exit 0"], ReadExplicitPowerShellTerminations("x'y'<# comment #> 1; exit 0"));
+        Assert.Equal(["exit 0"], ReadExplicitPowerShellTerminations("x$(1)# comment\nexit 0"));
+        Assert.Equal(["exit 0"], ReadExplicitPowerShellTerminations("$x=<# comment #>1; exit 0"));
         Assert.Equal(
             ["throw 'fixture stopped'", "break", "continue"],
             ReadExplicitPowerShellTerminations(
@@ -549,13 +545,13 @@ public sealed class InstallerContractTests
                 continue;
             }
 
-            if (canStartComment && current == '#')
+            if (current == '#')
             {
                 inLineComment = true;
                 continue;
             }
 
-            if (canStartComment && current == '<' && next == '#')
+            if (current == '<' && next == '#')
             {
                 inBlockComment = true;
                 statement.Append(' ');

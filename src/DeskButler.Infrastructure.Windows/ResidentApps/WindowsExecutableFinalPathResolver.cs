@@ -19,7 +19,7 @@ internal sealed class WindowsExecutableFinalPathResolver : IExecutableFinalPathR
     /// <summary>拒绝删除共享地持有文件，解析句柄最终路径后检查 source 路径链。</summary>
     public ExecutableFinalPathResolution Resolve(string path)
     {
-        // 句柄不共享删除，防止验证期间入口被原子替换；启动前仍会再次验证以缩小 TOCTOU 窗口。
+        // 解析期间不共享删除；句柄在本方法返回即释放，调用方仍须在启动前重新验证以缩小 TOCTOU 窗口。
         using var handle = File.OpenHandle(
             path,
             FileMode.Open,

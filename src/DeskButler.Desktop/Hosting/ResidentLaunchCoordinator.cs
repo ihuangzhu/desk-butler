@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.IO;
+using System.Collections.Concurrent;
 using DeskButler.Core.Diagnostics;
 using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Settings;
@@ -24,6 +25,7 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
     private readonly IDiagnosticLog diagnosticLog;
     private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim startAttemptGate = new(1, 1);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> applicationFlights = new(StringComparer.Ordinal);
     private Task? automaticCompletion;
     private Task? manualCompletion;
     private Task? disposeCompletion;
@@ -311,6 +313,27 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         Func<Task> markAttemptedAsync,
         CancellationToken cancellationToken)
     {
+        var flight = applicationFlights.GetOrAdd(
+            CreateLaunchIdentity(application.LaunchPath),
+            static _ => new SemaphoreSlim(1, 1));
+        await flight.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await ProcessApplicationWithinFlightAsync(application, markAttemptedAsync, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            flight.Release();
+        }
+    }
+
+    /// <summary>在同一应用身份的 single-flight 内完成检查、验证、登记、复查与启动。</summary>
+    private async Task ProcessApplicationWithinFlightAsync(
+        ResidentApplication application,
+        Func<Task> markAttemptedAsync,
+        CancellationToken cancellationToken)
+    {
         var knownPaths = new HashSet<string>(
             application.KnownProcessPaths,
             StringComparer.OrdinalIgnoreCase)
@@ -379,6 +402,17 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         await markAttemptedAsync().ConfigureAwait(false);
         try
         {
+            var finalRunning = await runtime.CheckRunningAsync(knownPaths, cancellationToken).ConfigureAwait(false);
+            if (finalRunning.State != ResidentRunningState.NotRunning)
+            {
+                await ReportApplicationResultAsync(
+                    application,
+                    finalRunning.State == ResidentRunningState.Running ? "already-running" : "running-unknown",
+                    exception: null,
+                    cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
             await StartWithPacingAsync(validation.NormalizedPath, cancellationToken).ConfigureAwait(false);
             await ReportApplicationResultAsync(
                 application,
@@ -529,6 +563,10 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         }
 
         startAttemptGate.Dispose();
+        foreach (var flight in applicationFlights.Values)
+        {
+            flight.Dispose();
+        }
         lifetime.Dispose();
     }
 }

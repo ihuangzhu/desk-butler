@@ -14,7 +14,7 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
     private readonly IResidentProcessSnapshotSource processSnapshotSource;
     private readonly IInstalledApplicationCatalog installedApplicationCatalog;
     private readonly IResidentExecutablePolicy executablePolicy;
-    private readonly Func<string, bool> fileExists;
+    private readonly Func<string, PathAvailability> pathAvailability;
     private readonly string? currentExecutablePath;
 
     /// <summary>创建使用真实只读 Windows 观察源、目录和安全策略的发现器。</summary>
@@ -23,7 +23,7 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             new WindowsResidentProcessSnapshotSource(),
             new InstalledApplicationCatalog(),
             new WindowsResidentExecutablePolicy(),
-            File.Exists,
+            ProbePathAvailability,
             Environment.ProcessPath)
     {
     }
@@ -39,11 +39,26 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         IResidentExecutablePolicy executablePolicy,
         Func<string, bool> fileExists,
         string? currentExecutablePath)
+        : this(
+            processSnapshotSource,
+            installedApplicationCatalog,
+            executablePolicy,
+            path => fileExists(path) ? PathAvailability.Exists : PathAvailability.Missing,
+            currentExecutablePath)
+    {
+    }
+
+    internal WindowsResidentAppDiscovery(
+        IResidentProcessSnapshotSource processSnapshotSource,
+        IInstalledApplicationCatalog installedApplicationCatalog,
+        IResidentExecutablePolicy executablePolicy,
+        Func<string, PathAvailability> pathAvailability,
+        string? currentExecutablePath)
     {
         this.processSnapshotSource = processSnapshotSource;
         this.installedApplicationCatalog = installedApplicationCatalog;
         this.executablePolicy = executablePolicy;
-        this.fileExists = fileExists;
+        this.pathAvailability = pathAvailability;
         this.currentExecutablePath = TryNormalizePath(currentExecutablePath);
     }
 
@@ -67,7 +82,7 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             discoveryDiagnostics,
             cancellationToken);
         var candidates = observations
-            .GroupBy(observation => observation.GroupKey, StringComparer.Ordinal)
+            .GroupBy(observation => observation.GroupKey)
             .Select(group => BuildCandidate(group.Key, group.ToArray(), existing, cancellationToken))
             .Where(candidate => candidate is not null)
             .Cast<ResidentAppCandidate>()
@@ -123,6 +138,7 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             var path = validation.NormalizedPath;
             if ((currentExecutablePath is not null && PathEquals(path, currentExecutablePath)) ||
                 ordinaryWindowPaths.Contains(path) ||
+                observation.WindowTraits.HasOrdinaryVisibleTopLevelWindow ||
                 existingPaths.Contains(path))
             {
                 continue;
@@ -131,13 +147,40 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
             var productName = NormalizeText(observation.ProductName);
             var companyName = NormalizeText(observation.CompanyName);
             var installed = FindInstalledEntry(path, productName, companyName, catalog);
-            var groupKey = installed is not null && productName is not null && companyName is not null
-                ? $"product|{installed.InstallRoot}|{productName}|{companyName}"
-                : $"path|{path}";
+            var groupKey = installed is not null
+                ? ProductGroupKey.ForProduct(
+                    installed.InstallRoot ?? string.Empty,
+                    installed.DisplayName,
+                    installed.Publisher ?? string.Empty)
+                : ProductGroupKey.ForPath(path);
             result.Add(new EligibleObservation(path, observation, installed, groupKey));
         }
 
+        var ordinaryProductGroups = observations
+            .Where(observation => observation.WindowTraits.HasOrdinaryVisibleTopLevelWindow)
+            .Select(observation =>
+            {
+                var normalized = TryNormalizePath(observation.ExecutablePath);
+                var installed = normalized is null
+                    ? null
+                    : FindInstalledEntry(
+                        normalized,
+                        NormalizeText(observation.ProductName),
+                        NormalizeText(observation.CompanyName),
+                        catalog);
+                return installed is null
+                    ? (ProductGroupKey?)null
+                    : ProductGroupKey.ForProduct(
+                        installed.InstallRoot ?? string.Empty,
+                        installed.DisplayName,
+                        installed.Publisher ?? string.Empty);
+            })
+            .Where(key => key.HasValue)
+            .Select(key => key!.Value)
+            .ToHashSet();
+
         return result
+            .Where(item => !ordinaryProductGroups.Contains(item.GroupKey))
             .GroupBy(item => item.Path, StringComparer.OrdinalIgnoreCase)
             .Select(MergeDuplicatePathObservations)
             .OrderBy(item => item.Path, StringComparer.Ordinal)
@@ -162,12 +205,17 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
                 current.HasOwnedTopLevelWindow || item.Observation.WindowTraits.HasOwnedTopLevelWindow,
                 current.HasToolWindow || item.Observation.WindowTraits.HasToolWindow,
                 current.HasCloakedWindow || item.Observation.WindowTraits.HasCloakedWindow));
+        traits = traits with
+        {
+            HasOrdinaryVisibleTopLevelWindow = ordered.Any(item =>
+                item.Observation.WindowTraits.HasOrdinaryVisibleTopLevelWindow)
+        };
         return first with { Observation = first.Observation with { WindowTraits = traits } };
     }
 
     /// <summary>为一组观察选择唯一入口、收集可识别进程路径，并在严格同产品条件下改为路径替换建议。</summary>
     private ResidentAppCandidate? BuildCandidate(
-        string groupKey,
+        ProductGroupKey groupKey,
         IReadOnlyList<EligibleObservation> observations,
         IReadOnlyList<ResidentApplication> existing,
         CancellationToken cancellationToken)
@@ -295,7 +343,7 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         {
             cancellationToken.ThrowIfCancellationRequested();
             var oldPath = TryNormalizePath(application.LaunchPath);
-            if (oldPath is null || fileExists(oldPath) ||
+            if (oldPath is null || pathAvailability(oldPath) != PathAvailability.Missing ||
                 !TextEquals(application.DisplayName, displayName) ||
                 !IsWithinDirectory(oldPath, installed.InstallRoot))
             {
@@ -371,12 +419,14 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
     /// <summary>生成不含 PID 或明文旧路径的稳定 SHA-256 身份，并以候选种类隔离新增与替换。</summary>
     private static string CreateCandidateId(
         ResidentCandidateKind kind,
-        string groupKey,
+        ProductGroupKey groupKey,
         string sortingPath,
         string? replacesLaunchPath)
     {
         var replacement = TryNormalizePath(replacesLaunchPath) ?? string.Empty;
-        var payload = string.Join("\n", (int)kind, groupKey, sortingPath, replacement);
+        static string Encode(string value) => $"{Encoding.UTF8.GetByteCount(value)}:{value}";
+        var payload = string.Join("\n", (int)kind, Encode(groupKey.Kind), Encode(groupKey.Root),
+            Encode(groupKey.Product), Encode(groupKey.Publisher), Encode(sortingPath), Encode(replacement));
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload)));
     }
 
@@ -440,7 +490,44 @@ public sealed class WindowsResidentAppDiscovery : IResidentAppDiscovery
         string Path,
         ResidentProcessObservation Observation,
         InstalledApplicationEntry? Installed,
-        string GroupKey);
+        ProductGroupKey GroupKey);
+
+    private readonly record struct ProductGroupKey(string Kind, string Root, string Product, string Publisher)
+    {
+        internal static ProductGroupKey ForProduct(string root, string product, string publisher) =>
+            new("product", root.ToUpperInvariant(), product.ToUpperInvariant(), publisher.ToUpperInvariant());
+
+        internal static ProductGroupKey ForPath(string path) =>
+            new("path", path.ToUpperInvariant(), string.Empty, string.Empty);
+    }
+
+    internal enum PathAvailability
+    {
+        Exists,
+        Missing,
+        Inaccessible
+    }
+
+    private static PathAvailability ProbePathAvailability(string path)
+    {
+        try
+        {
+            _ = File.GetAttributes(path);
+            return PathAvailability.Exists;
+        }
+        catch (FileNotFoundException)
+        {
+            return PathAvailability.Missing;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return PathAvailability.Missing;
+        }
+        catch
+        {
+            return PathAvailability.Inaccessible;
+        }
+    }
 
     /// <summary>保存固定入口评分及原始观察，以确保并列时不猜测启动路径。</summary>
     private sealed record RankedObservation(EligibleObservation Observation, int Score);

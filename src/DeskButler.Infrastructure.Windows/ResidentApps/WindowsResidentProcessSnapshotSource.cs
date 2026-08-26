@@ -269,17 +269,27 @@ internal sealed class WindowsResidentProcessSnapshotSource : IResidentProcessSna
         var observations = ImmutableArray.CreateBuilder<ResidentProcessObservation>();
         var diagnostics = ImmutableArray.CreateBuilder<ResidentDiscoveryDiagnostic>();
         var processes = processReader.GetProcesses();
-        foreach (var process in processes)
+        try
         {
-            try
+            foreach (var process in processes)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 CaptureProcess(process, currentSessionId, traitsByProcess, observations, diagnostics, cancellationToken);
             }
-            finally
+        }
+        finally
+        {
+            foreach (var process in processes)
             {
-                // 仅释放 Process.GetProcesses 返回、由本 source 持有的包装；不操作第三方进程。
-                process.Dispose();
+                try
+                {
+                    // 外层 finally 释放完整快照，即使中途取消、异常或某个包装释放失败。
+                    process.Dispose();
+                }
+                catch
+                {
+                    // 继续释放其余包装；不操作任何第三方进程生命周期。
+                }
             }
         }
 

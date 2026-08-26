@@ -161,9 +161,89 @@ public sealed class WindowsResidentAppDiscoveryTests
         var newCandidate = Assert.Single((await discovery.DiscoverAsync(Paths(), [], CancellationToken.None)).Candidates);
         var replacement = Assert.Single((await discovery.DiscoverAsync(Paths(), replacementExisting, CancellationToken.None)).Candidates);
 
+        var differentPid = CreateDiscovery(
+            observations: [Observation(100, @"C:\Apps\Chat\Chat.exe", "Chat", "Vendor", hidden: true)],
+            catalog: [Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat.exe")]);
+        var sameProductDifferentPid = Assert.Single(
+            (await differentPid.DiscoverAsync(Paths(), [], CancellationToken.None)).Candidates);
+        var otherReplacement = new[]
+        {
+            new ResidentApplication(@"C:\Apps\Chat\OtherOld.exe", Paths(@"C:\Apps\Chat\OtherOld.exe"), "Chat", true, 0)
+        };
+        var replacementOtherPath = Assert.Single(
+            (await discovery.DiscoverAsync(Paths(), otherReplacement, CancellationToken.None)).Candidates);
+
+        Assert.Equal(newCandidate.CandidateId, sameProductDifferentPid.CandidateId);
         Assert.NotEqual(newCandidate.CandidateId, replacement.CandidateId);
-        Assert.DoesNotContain("99", newCandidate.CandidateId, StringComparison.Ordinal);
-        Assert.DoesNotContain(@"C:\Apps\Chat\Old.exe", replacement.CandidateId, StringComparison.OrdinalIgnoreCase);
+        Assert.NotEqual(replacement.CandidateId, replacementOtherPath.CandidateId);
+    }
+
+    [Fact]
+    public async Task DiscoverAsync普通可见成员抑制整个产品组而隐藏工具窗口仍可候选()
+    {
+        var ordinaryTraits = new ResidentWindowTraits(true, false, false, false, false)
+        {
+            HasOrdinaryVisibleTopLevelWindow = true
+        };
+        var discovery = CreateDiscovery(
+            observations:
+            [
+                new ResidentProcessObservation(1, @"C:\Apps\Chat\Chat.exe", "Chat", "Vendor", null, ordinaryTraits),
+                Observation(2, @"C:\Apps\Chat\helper.exe", "Chat", "Vendor", hidden: true),
+                Observation(3, @"C:\Apps\Tray\Tray.exe", "Tray", "Vendor", hidden: true)
+            ],
+            catalog:
+            [
+                Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat.exe"),
+                Catalog("Tray", "Vendor", @"C:\Apps\Tray", @"C:\Apps\Tray\Tray.exe")
+            ]);
+
+        var candidates = (await discovery.DiscoverAsync(Paths(), [], CancellationToken.None)).Candidates;
+
+        var candidate = Assert.Single(candidates);
+        Assert.Equal("Tray", candidate.DisplayName);
+    }
+
+    [Fact]
+    public async Task DiscoverAsync产品键忽略大小写且分隔符文本不碰撞()
+    {
+        var discovery = CreateDiscovery(
+            observations:
+            [
+                Observation(1, @"C:\Apps\One\a.exe", "A|B", "Vendor", hidden: true),
+                Observation(2, @"c:\apps\one\b.exe", "a|b", "vendor", hidden: true),
+                Observation(3, @"C:\Apps\Two\c.exe", "A", "B|Vendor", hidden: true)
+            ],
+            catalog:
+            [
+                Catalog("A|B", "Vendor", @"C:\Apps\One", @"C:\Apps\One\a.exe"),
+                Catalog("A", "B|Vendor", @"C:\Apps\Two", @"C:\Apps\Two\c.exe")
+            ]);
+
+        var candidates = (await discovery.DiscoverAsync(Paths(), [], CancellationToken.None)).Candidates;
+
+        Assert.Equal(2, candidates.Count);
+        Assert.Contains(candidates, candidate => candidate.KnownProcessPaths.Count == 2);
+    }
+
+    [Fact]
+    public async Task DiscoverAsync无法访问旧路径不建议替换()
+    {
+        var observations = new[] { Observation(1, @"C:\Apps\Chat\Chat2.exe", "Chat", "Vendor", hidden: true) };
+        var discovery = new WindowsResidentAppDiscovery(
+            new FakeSnapshotSource(observations),
+            new FakeCatalog([Catalog("Chat", "Vendor", @"C:\Apps\Chat", @"C:\Apps\Chat\Chat2.exe")]),
+            new FakePolicy(Paths(), null),
+            _ => WindowsResidentAppDiscovery.PathAvailability.Inaccessible,
+            @"C:\DeskButler\DeskButler.exe");
+        var existing = new[]
+        {
+            new ResidentApplication(@"C:\Apps\Chat\Chat.exe", Paths(@"C:\Apps\Chat\Chat.exe"), "Chat", true, 0)
+        };
+
+        var candidate = Assert.Single((await discovery.DiscoverAsync(Paths(), existing, CancellationToken.None)).Candidates);
+
+        Assert.Equal(ResidentCandidateKind.NewApplication, candidate.Kind);
     }
 
     /// <summary>验证单一路径的策略失败只追加无敏感分类诊断，不能丢弃其它可安全发现的候选。</summary>

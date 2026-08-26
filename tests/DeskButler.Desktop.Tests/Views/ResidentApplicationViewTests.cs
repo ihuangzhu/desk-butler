@@ -7,6 +7,7 @@ using System.Xml.Linq;
 using DeskButler.Application.Commands;
 using DeskButler.Core.Persistence;
 using DeskButler.Core.Settings;
+using DeskButler.Core.ResidentApps;
 using DeskButler.Desktop.Hosting;
 using DeskButler.Desktop.Tests.ViewModels;
 using DeskButler.Desktop.Tray;
@@ -152,16 +153,29 @@ public sealed class ResidentApplicationViewTests
     [Fact]
     public void CandidateFocusSelectsHomeAndPlacesKeyboardFocusForHiddenAndVisibleWindows()
     {
-        foreach (var (initiallyVisible, previousTab) in new[]
-                 {
-                     (false, "设置"),
-                     (true, "现场"),
-                     (true, "诊断")
-                 })
+        RunOnStaThread(() =>
         {
-            RunOnStaThread(() =>
+            foreach (var (initiallyVisible, previousTab) in new[]
+                     {
+                         (false, "设置"),
+                         (true, "现场"),
+                         (true, "诊断")
+                     })
             {
-                var window = new DeskButler.Desktop.Views.MainWindow(CreateViewModel(_ => Task.CompletedTask));
+                var viewModel = CreateViewModel(_ => Task.CompletedTask);
+                viewModel.ResidentCandidates.Add(new ResidentCandidateViewModel(
+                    new ResidentAppCandidate(
+                        "focus-candidate",
+                        "Focus",
+                        null,
+                        new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                        ResidentCandidateConfidence.Low,
+                        ResidentCandidateKind.NewApplication,
+                        null),
+                    1,
+                    new NullExecutablePicker(),
+                    new FallbackExecutableIconProvider()));
+                var window = new DeskButler.Desktop.Views.MainWindow(viewModel);
                 try
                 {
                     var tabs = Assert.IsType<TabControl>(window.FindName("MainTabControl"));
@@ -194,8 +208,8 @@ public sealed class ResidentApplicationViewTests
                 {
                     window.CloseForExit();
                 }
-            });
-        }
+            }
+        });
     }
 
     /// <summary>托盘“立即启动”只能复用 ViewModel 的手动命令，不能创建额外持续守护。</summary>

@@ -29,6 +29,7 @@ public sealed class ResidentCandidateCoordinator
     private readonly IResidentAppDiscovery discovery;
     private readonly ISettingsStore settingsStore;
     private readonly SettingsCoordinator settings;
+    private readonly IResidentExecutablePolicy executablePolicy;
     private readonly Action<ResidentDiscoveryResult>? reportDiscovery;
     private readonly object stateSync = new();
     private long latestRequestedGeneration;
@@ -38,8 +39,9 @@ public sealed class ResidentCandidateCoordinator
     public ResidentCandidateCoordinator(
         IResidentAppDiscovery discovery,
         ISettingsStore settingsStore,
-        SettingsCoordinator settings)
-        : this(discovery, settingsStore, settings, reportDiscovery: null)
+        SettingsCoordinator settings,
+        IResidentExecutablePolicy? executablePolicy = null)
+        : this(discovery, settingsStore, settings, executablePolicy ?? new NormalizingExecutablePolicy(), reportDiscovery: null)
     {
     }
 
@@ -48,11 +50,13 @@ public sealed class ResidentCandidateCoordinator
         IResidentAppDiscovery discovery,
         ISettingsStore settingsStore,
         SettingsCoordinator settings,
+        IResidentExecutablePolicy executablePolicy,
         Action<ResidentDiscoveryResult>? reportDiscovery)
     {
         this.discovery = discovery ?? throw new ArgumentNullException(nameof(discovery));
         this.settingsStore = settingsStore ?? throw new ArgumentNullException(nameof(settingsStore));
         this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        this.executablePolicy = executablePolicy ?? throw new ArgumentNullException(nameof(executablePolicy));
         this.reportDiscovery = reportDiscovery;
     }
 
@@ -156,13 +160,55 @@ public sealed class ResidentCandidateCoordinator
                 selection.IsSelected))
             .ToArray();
 
+        Dictionary<string, string> validatedPaths;
+        try
+        {
+            lock (stateSync)
+            {
+                if (current.Generation != generation)
+                {
+                    return false;
+                }
+
+                foreach (var selection in selectionSnapshot.Where(selection => selection.IsSelected))
+                {
+                    if (!current.Candidates.Any(candidate =>
+                        StringComparer.Ordinal.Equals(candidate.CandidateId, selection.CandidateId)))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            validatedPaths = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var selection in selectionSnapshot.Where(selection => selection.IsSelected))
+            {
+                if (string.IsNullOrWhiteSpace(selection.FinalLaunchPath))
+                {
+                    return false;
+                }
+
+                var validation = executablePolicy.Validate(selection.FinalLaunchPath);
+                if (!validation.IsAllowed || string.IsNullOrWhiteSpace(validation.NormalizedPath) ||
+                    !validatedPaths.TryAdd(selection.CandidateId, validation.NormalizedPath))
+                {
+                    return false;
+                }
+            }
+        }
+        catch (Exception exception) when (IsRecoverableConfirmationFailure(exception))
+        {
+            return false;
+        }
+
         try
         {
             await settings.UpdateAsync(
                 persisted => BuildConfirmedSettings(
                     persisted,
                     generation,
-                    selectionSnapshot),
+                    selectionSnapshot,
+                    validatedPaths),
                 cancellationToken).ConfigureAwait(false);
         }
         catch (CandidateConfirmationRejectedException)
@@ -200,7 +246,8 @@ public sealed class ResidentCandidateCoordinator
     private ButlerSettings BuildConfirmedSettings(
         ButlerSettings persisted,
         long generation,
-        IReadOnlyList<ResidentCandidateSelection> selections)
+        IReadOnlyList<ResidentCandidateSelection> selections,
+        Dictionary<string, string> validatedPaths)
     {
         lock (stateSync)
         {
@@ -236,19 +283,19 @@ public sealed class ResidentCandidateCoordinator
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(selection.FinalLaunchPath))
+                if (!validatedPaths.TryGetValue(selection.CandidateId, out var normalizedPath))
                 {
                     throw new CandidateConfirmationRejectedException();
                 }
 
                 var knownPaths = new HashSet<string>(candidate.KnownProcessPaths, StringComparer.OrdinalIgnoreCase)
                 {
-                    selection.FinalLaunchPath
+                    normalizedPath
                 };
                 if (candidate.Kind == ResidentCandidateKind.NewApplication)
                 {
                     applications.Add(new ResidentApplication(
-                        selection.FinalLaunchPath,
+                        normalizedPath,
                         knownPaths,
                         candidate.DisplayName,
                         true,
@@ -272,7 +319,7 @@ public sealed class ResidentCandidateCoordinator
                 var replaced = applications[replacementIndex];
                 applications[replacementIndex] = replaced with
                 {
-                    LaunchPath = selection.FinalLaunchPath,
+                    LaunchPath = normalizedPath,
                     KnownProcessPaths = knownPaths,
                     DisplayName = candidate.DisplayName
                 };
@@ -323,6 +370,26 @@ public sealed class ResidentCandidateCoordinator
     {
         internal CandidateConfirmationRejectedException()
         {
+        }
+    }
+
+    private sealed class NormalizingExecutablePolicy : IResidentExecutablePolicy
+    {
+        public ResidentExecutableValidation Validate(string executablePath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(executablePath) || !Path.IsPathFullyQualified(executablePath))
+                {
+                    return new(false, null, ResidentExecutableRejection.InvalidPath);
+                }
+
+                return new(true, Path.GetFullPath(executablePath), ResidentExecutableRejection.None);
+            }
+            catch
+            {
+                return new(false, null, ResidentExecutableRejection.InvalidPath);
+            }
         }
     }
 }

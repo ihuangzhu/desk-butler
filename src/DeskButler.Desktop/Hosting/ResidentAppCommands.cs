@@ -187,7 +187,7 @@ internal sealed class SetResidentApplicationsEnabledCommandHandler(SettingsCoord
     : ResidentSettingsCommandHandlerBase(settings),
         ICommandHandler<SetResidentApplicationsEnabledCommand, ResidentSettingsMutationResult>
 {
-    /// <inheritdoc />
+    /// <summary>在共享设置事务内幂等更新常驻应用总开关。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         SetResidentApplicationsEnabledCommand command,
         CancellationToken cancellationToken) =>
@@ -208,7 +208,7 @@ internal sealed class SetResidentApplicationEnabledCommandHandler(
     private readonly IResidentExecutablePolicy executablePolicy = executablePolicy ??
         throw new ArgumentNullException(nameof(executablePolicy));
 
-    /// <inheritdoc />
+    /// <summary>启用前重新验证入口与识别路径冲突，并原子更新目标条目。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         SetResidentApplicationEnabledCommand command,
         CancellationToken cancellationToken) =>
@@ -261,7 +261,7 @@ internal sealed class RemoveResidentApplicationCommandHandler(SettingsCoordinato
     : ResidentSettingsCommandHandlerBase(settings),
         ICommandHandler<RemoveResidentApplicationCommand, ResidentSettingsMutationResult>
 {
-    /// <inheritdoc />
+    /// <summary>按启动路径幂等删除条目并重新编号剩余顺序。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         RemoveResidentApplicationCommand command,
         CancellationToken cancellationToken) =>
@@ -283,7 +283,7 @@ internal sealed class MoveResidentApplicationCommandHandler(SettingsCoordinator 
     : ResidentSettingsCommandHandlerBase(settings),
         ICommandHandler<MoveResidentApplicationCommand, ResidentSettingsMutationResult>
 {
-    /// <inheritdoc />
+    /// <summary>只允许相邻移动，并在共享事务内保持连续启动顺序。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         MoveResidentApplicationCommand command,
         CancellationToken cancellationToken) =>
@@ -326,7 +326,7 @@ internal sealed class AddResidentApplicationCommandHandler(
     private readonly IResidentExecutablePolicy executablePolicy = executablePolicy ??
         throw new ArgumentNullException(nameof(executablePolicy));
 
-    /// <inheritdoc />
+    /// <summary>通过统一可执行策略验证后原子新增常驻应用。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         AddResidentApplicationCommand command,
         CancellationToken cancellationToken) =>
@@ -358,7 +358,7 @@ internal sealed class ReplaceResidentApplicationPathCommandHandler(
     private readonly IResidentExecutablePolicy executablePolicy = executablePolicy ??
         throw new ArgumentNullException(nameof(executablePolicy));
 
-    /// <inheritdoc />
+    /// <summary>验证新入口后原子替换路径并清除旧识别路径。</summary>
     public Task<ResidentSettingsMutationResult> HandleAsync(
         ReplaceResidentApplicationPathCommand command,
         CancellationToken cancellationToken) =>
@@ -397,7 +397,7 @@ internal sealed class ReplaceResidentApplicationPathCommandHandler(
 internal sealed class FindResidentCandidatesCommandHandler(ResidentCandidateCoordinator coordinator)
     : ICommandHandler<FindResidentCandidatesCommand, ResidentDiscoveryBatch>
 {
-    /// <inheritdoc />
+    /// <summary>不保存现场，以空普通路径集合启动独立候选发现。</summary>
     public Task<ResidentDiscoveryBatch> HandleAsync(
         FindResidentCandidatesCommand command,
         CancellationToken cancellationToken) =>
@@ -413,7 +413,7 @@ internal sealed class FindResidentCandidatesCommandHandler(ResidentCandidateCoor
 internal sealed class ConfirmResidentCandidatesCommandHandler(ResidentCandidateCoordinator coordinator)
     : ICommandHandler<ConfirmResidentCandidatesCommand, bool>
 {
-    /// <inheritdoc />
+    /// <summary>把候选选择提交给共享 latest-wins 确认事务。</summary>
     public Task<bool> HandleAsync(
         ConfirmResidentCandidatesCommand command,
         CancellationToken cancellationToken) =>
@@ -427,7 +427,7 @@ internal sealed class ConfirmResidentCandidatesCommandHandler(ResidentCandidateC
 internal sealed class DismissResidentCandidatesCommandHandler(ResidentCandidateCoordinator coordinator)
     : ICommandHandler<DismissResidentCandidatesCommand, bool>
 {
-    /// <inheritdoc />
+    /// <summary>仅清空匹配代次的候选，不写入永久排除规则。</summary>
     public Task<bool> HandleAsync(
         DismissResidentCandidatesCommand command,
         CancellationToken cancellationToken) =>

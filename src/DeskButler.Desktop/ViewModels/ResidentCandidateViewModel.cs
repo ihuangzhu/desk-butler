@@ -1,6 +1,7 @@
 using System.Windows.Media;
 using DeskButler.Core.ResidentApps;
 using DeskButler.Desktop.Hosting;
+using System.IO;
 
 namespace DeskButler.Desktop.ViewModels;
 
@@ -11,6 +12,7 @@ public sealed class ResidentCandidateViewModel : ObservableObject
     private readonly IExecutablePicker picker;
     private readonly IExecutableIconProvider iconProvider;
     private readonly Action stateChanged;
+    private readonly Func<string, ResidentExecutableValidation> validateExecutable;
     private bool isSelected;
     private string? finalLaunchPath;
     private ImageSource? icon;
@@ -21,19 +23,21 @@ public sealed class ResidentCandidateViewModel : ObservableObject
         long generation,
         IExecutablePicker picker,
         IExecutableIconProvider iconProvider,
-        Action? stateChanged = null)
+        Action? stateChanged = null,
+        Func<string, ResidentExecutableValidation>? validateExecutable = null)
     {
         this.candidate = candidate ?? throw new ArgumentNullException(nameof(candidate));
         Generation = generation;
         this.picker = picker ?? throw new ArgumentNullException(nameof(picker));
         this.iconProvider = iconProvider ?? throw new ArgumentNullException(nameof(iconProvider));
         this.stateChanged = stateChanged ?? (() => { });
+        this.validateExecutable = validateExecutable ?? ValidateAbsolutePath;
         finalLaunchPath = candidate.LaunchPath;
         // 路径替换必须经过显式用户确认，不能因高可信度自动覆盖已有入口。
         isSelected = candidate.Confidence == ResidentCandidateConfidence.High &&
             candidate.Kind == ResidentCandidateKind.NewApplication &&
             !string.IsNullOrWhiteSpace(candidate.LaunchPath);
-        icon = iconProvider.GetIcon(finalLaunchPath);
+        icon = GetValidatedIcon(finalLaunchPath);
         BrowsePathCommand = new AsyncCommand(BrowsePathAsync);
     }
 
@@ -60,7 +64,6 @@ public sealed class ResidentCandidateViewModel : ObservableObject
         {
             if (SetProperty(ref finalLaunchPath, value))
             {
-                Icon = iconProvider.GetIcon(value);
                 OnPropertyChanged(nameof(CanConfirm));
                 OnPropertyChanged(nameof(NeedsLaunchPath));
                 OnPropertyChanged(nameof(PathReplacementText));
@@ -111,9 +114,37 @@ public sealed class ResidentCandidateViewModel : ObservableObject
         if (!string.IsNullOrWhiteSpace(selected))
         {
             FinalLaunchPath = selected;
+            Icon = GetValidatedIcon(selected);
         }
     }
 
     /// <summary>只生成允许 UI 回传的候选选择快照。</summary>
     public ResidentCandidateSelection ToSelection() => new(CandidateId, FinalLaunchPath, IsSelected);
+
+    private ImageSource? GetValidatedIcon(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        var validation = validateExecutable(path);
+        return validation.IsAllowed && !string.IsNullOrWhiteSpace(validation.NormalizedPath)
+            ? iconProvider.GetIcon(validation.NormalizedPath)
+            : null;
+    }
+
+    private static ResidentExecutableValidation ValidateAbsolutePath(string path)
+    {
+        try
+        {
+            return Path.IsPathFullyQualified(path)
+                ? new(true, Path.GetFullPath(path), ResidentExecutableRejection.None)
+                : new(false, null, ResidentExecutableRejection.NotAbsolutePath);
+        }
+        catch
+        {
+            return new(false, null, ResidentExecutableRejection.InvalidPath);
+        }
+    }
 }

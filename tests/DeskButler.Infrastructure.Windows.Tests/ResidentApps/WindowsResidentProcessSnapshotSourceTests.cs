@@ -93,15 +93,23 @@ public sealed class WindowsResidentProcessSnapshotSourceTests
     public async Task CaptureAsync非访问拒绝Win32错误必须传播()
     {
         var original = new Win32Exception(87, "测试用无效参数错误。");
+        var first = Process(1, 7, @"C:\Apps\First.exe", "First", "Co", "First");
+        var failing = new FakeResidentProcess(2, 7, () => throw original, () => null);
+        var unvisited = Process(3, 7, @"C:\Apps\Third.exe", "Third", "Co", "Third");
         var source = CreateSource(
             7,
             [],
-            new FakeResidentProcess(1, 7, () => throw original, () => null));
+            first,
+            failing,
+            unvisited);
 
         var exception = await Assert.ThrowsAsync<Win32Exception>(
             () => source.CaptureAsync(CancellationToken.None));
 
         Assert.Same(original, exception);
+        Assert.Equal(1, first.DisposeCount);
+        Assert.Equal(1, failing.DisposeCount);
+        Assert.Equal(1, unvisited.DisposeCount);
     }
 
     /// <summary>验证生产窗口读取器按 PID 归属并解释 visible、owner、tool 与 cloaked 字段。</summary>
@@ -256,6 +264,7 @@ public sealed class WindowsResidentProcessSnapshotSourceTests
         Func<ResidentFileVersionInfo?> versionInfo,
         bool hasExited = false) : IResidentProcess
     {
+        internal int DisposeCount { get; private set; }
         /// <summary>返回测试指定的进程是否已退出。</summary>
         public bool HasExited => hasExited;
 
@@ -274,6 +283,7 @@ public sealed class WindowsResidentProcessSnapshotSourceTests
         /// <summary>fake 不拥有系统句柄，因此释放为空操作。</summary>
         public void Dispose()
         {
+            DisposeCount++;
         }
     }
 }

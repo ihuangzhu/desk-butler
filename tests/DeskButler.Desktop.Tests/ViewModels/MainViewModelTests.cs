@@ -69,7 +69,7 @@ public sealed class MainViewModelTests
         await vm.SaveNowAsync();
 
         Assert.Equal("new-find", Assert.Single(vm.ResidentCandidates).CandidateId);
-        Assert.Equal(0, events);
+        Assert.Equal(1, events);
     }
 
     /// <summary>混合选择中只要有已选空入口，确认命令与方法都必须拒绝发送。</summary>
@@ -146,7 +146,7 @@ public sealed class MainViewModelTests
 
     /// <summary>独立查找只发送查找命令，不能把它误接到保存现场的工作流或托盘事件。</summary>
     [Fact]
-    public async Task FindResidentCandidatesAsyncDoesNotSaveSceneOrRaiseManualEvent()
+    public async Task FindResidentCandidatesAsyncDoesNotSaveSceneAndRaisesNavigationEvent()
     {
         var commands = new ResidentCommandBus(
             findResult: new ResidentDiscoveryBatch(43, [CreateCandidate("candidate-find")], false));
@@ -158,7 +158,7 @@ public sealed class MainViewModelTests
 
         Assert.DoesNotContain(commands.SentCommands, command => command is SaveSceneNowCommand);
         Assert.Contains(commands.SentCommands, command => command is FindResidentCandidatesCommand);
-        Assert.Equal(0, events);
+        Assert.Equal(1, events);
         Assert.Single(vm.ResidentCandidates);
     }
 

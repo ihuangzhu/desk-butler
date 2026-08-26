@@ -646,6 +646,42 @@ public sealed class ResidentCandidateCoordinatorTests
         ResidentCandidateKind.NewApplication,
         null);
 
+    [Fact]
+    public async Task Confirm只持久化策略正规化路径且拒绝不安全路径时保留候选()
+    {
+        var candidate = Candidate("secure", "Secure", @"C:\Apps\Secure\app.exe");
+        var store = new InMemorySettingsStore(ButlerSettings.Default);
+        using var settings = new SettingsCoordinator(store);
+        var policy = new RecordingPolicy(path => path.StartsWith(@"C:\Apps", StringComparison.OrdinalIgnoreCase)
+            ? new(true, @"C:\Apps\Secure\normalized.exe", ResidentExecutableRejection.None)
+            : new(false, null, ResidentExecutableRejection.NetworkPath));
+        var coordinator = new ResidentCandidateCoordinator(new StaticDiscovery(candidate), store, settings, policy);
+        var batch = await coordinator.DiscoverAsync(Paths(), CancellationToken.None);
+
+        var rejected = await coordinator.ConfirmAsync(
+            batch.Generation,
+            [new(candidate.CandidateId, @"\\server\share\app.exe", true)],
+            CancellationToken.None);
+        Assert.False(rejected);
+        Assert.Single(coordinator.Current.Candidates);
+        Assert.Empty((await store.LoadAsync(CancellationToken.None)).ResidentApplications);
+
+        var accepted = await coordinator.ConfirmAsync(
+            batch.Generation,
+            [new(candidate.CandidateId, @"C:\Apps\Secure\app.exe", true)],
+            CancellationToken.None);
+        Assert.True(accepted);
+        Assert.Equal(@"C:\Apps\Secure\normalized.exe",
+            Assert.Single((await store.LoadAsync(CancellationToken.None)).ResidentApplications).LaunchPath);
+    }
+
+    private static HashSet<string> Paths(params string[] paths) => new(paths, StringComparer.OrdinalIgnoreCase);
+
+    private sealed class RecordingPolicy(Func<string, ResidentExecutableValidation> validate) : IResidentExecutablePolicy
+    {
+        public ResidentExecutableValidation Validate(string executablePath) => validate(executablePath);
+    }
+
     /// <summary>构造手动保存测试使用的普通窗口候选。</summary>
     private static WindowCandidate ManualCandidate(string executablePath) => new(
         (nint)1,

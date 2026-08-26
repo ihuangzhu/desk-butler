@@ -226,8 +226,9 @@ public sealed class ResidentLaunchCoordinatorTests
         coordinator.Start();
         await clock.AdvanceUntilCompletedAsync(coordinator.Completion);
 
-        Assert.Equal(3, runtime.CheckedKnownPaths.Count);
+        Assert.Equal(4, runtime.CheckedKnownPaths.Count);
         Assert.Equal(2, runtime.CheckedKnownPaths[2].Count);
+        Assert.Equal(2, runtime.CheckedKnownPaths[3].Count);
         Assert.Equal([ready.LaunchPath], policy.ValidatedPaths);
         Assert.Equal(ready.LaunchPath, Assert.Single(runtime.StartedPaths));
         Assert.All(sessions.Current!.Plan, item => Assert.True(item.Attempted));
@@ -431,7 +432,7 @@ public sealed class ResidentLaunchCoordinatorTests
         Assert.DoesNotContain("late secret", string.Join('|', failure.Properties.Values));
     }
 
-    /// <summary>自动与手动批次并发时也必须共享实际 Start 边界的全局一秒节流。</summary>
+    /// <summary>自动与手动批次并发处理同一身份时，运行检查到启动必须 single-flight。</summary>
     [Fact]
     public async Task AutomaticAndManualStartAttemptsAreGloballySpaced()
     {
@@ -455,8 +456,9 @@ public sealed class ResidentLaunchCoordinatorTests
                     return releaseAutomaticCheck.Task;
                 }
 
-                return Task.FromResult(
-                    new ResidentRunningCheck(ResidentRunningState.NotRunning, null));
+                return Task.FromResult(checkCount < 3
+                    ? new ResidentRunningCheck(ResidentRunningState.NotRunning, null)
+                    : new ResidentRunningCheck(ResidentRunningState.Running, app.LaunchPath));
             }
         };
         await using var coordinator = Create(settings, sessions, clock, runtime, "LUID-A");
@@ -464,19 +466,13 @@ public sealed class ResidentLaunchCoordinatorTests
         await clock.AdvanceUntilAsync(automaticCheckStarted.Task);
 
         var manual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
-        await runtime.FirstStart.Task;
         releaseAutomaticCheck.TrySetResult(
             new ResidentRunningCheck(ResidentRunningState.NotRunning, null));
-        var pacingDelay = clock.WaitForDelayAsync(TimeSpan.FromSeconds(1));
-        var boundary = await Task.WhenAny(coordinator.Completion, pacingDelay);
-
-        Assert.Same(pacingDelay, boundary);
-        Assert.Single(runtime.StartAttemptTimes);
-        await clock.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await runtime.FirstStart.Task;
         await Task.WhenAll(coordinator.Completion, manual);
 
-        Assert.Equal(2, runtime.StartAttemptTimes.Count);
-        Assert.True(runtime.StartAttemptTimes[1] - runtime.StartAttemptTimes[0] >= TimeSpan.FromSeconds(1));
+        Assert.Single(runtime.StartAttemptTimes);
+        Assert.Single(runtime.StartedPaths);
     }
 
     private static ResidentLaunchCoordinator Create(

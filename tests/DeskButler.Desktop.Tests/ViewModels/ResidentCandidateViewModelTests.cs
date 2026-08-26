@@ -134,6 +134,39 @@ public sealed class ResidentCandidateViewModelTests
         Assert.False(vm.CanConfirm);
     }
 
+    [Theory]
+    [InlineData(@"\\server\share\app.exe")]
+    [InlineData(@"relative\app.exe")]
+    [InlineData(@"C:\Windows\System32\app.exe")]
+    public void RejectedCandidatePathNeverReachesIconProvider(string rejectedPath)
+    {
+        var icons = new RecordingIconProvider();
+
+        _ = new ResidentCandidateViewModel(
+            CreateCandidate(ResidentCandidateConfidence.Low, ResidentCandidateKind.NewApplication, rejectedPath),
+            30,
+            new FakeExecutablePicker(),
+            icons,
+            validateExecutable: _ => new(false, null, ResidentExecutableRejection.ProhibitedDirectory));
+
+        Assert.Empty(icons.Paths);
+    }
+
+    [Fact]
+    public void AcceptedCandidateIconReceivesOnlyNormalizedPath()
+    {
+        var icons = new RecordingIconProvider();
+
+        _ = new ResidentCandidateViewModel(
+            CreateCandidate(ResidentCandidateConfidence.Low, ResidentCandidateKind.NewApplication, @"C:\Apps\.\Agent.exe"),
+            31,
+            new FakeExecutablePicker(),
+            icons,
+            validateExecutable: _ => new(true, @"C:\Apps\Agent.exe", ResidentExecutableRejection.None));
+
+        Assert.Equal([@"C:\Apps\Agent.exe"], icons.Paths);
+    }
+
     /// <summary>条目状态仅投影路径验证结果；拒绝或无法访问时仍允许替换和删除。</summary>
     [Fact]
     public void RejectedApplicationCannotEnableButCanStillBeReplacedOrRemoved()
@@ -195,5 +228,16 @@ public sealed class ResidentCandidateViewModelTests
     private sealed class FakeExecutableIconProvider : IExecutableIconProvider
     {
         public ImageSource? GetIcon(string? executablePath) => null;
+    }
+
+    private sealed class RecordingIconProvider : IExecutableIconProvider
+    {
+        internal List<string?> Paths { get; } = [];
+
+        public ImageSource? GetIcon(string? executablePath)
+        {
+            Paths.Add(executablePath);
+            return null;
+        }
     }
 }

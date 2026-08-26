@@ -11,6 +11,9 @@ internal sealed record ResidentWindowTraits(
     bool HasToolWindow,
     bool HasCloakedWindow)
 {
+    /// <summary>至少存在一个可见、无 owner、非 tool 且非 cloaked 的普通主窗口。</summary>
+    internal bool HasOrdinaryVisibleTopLevelWindow { get; init; }
+
     /// <summary>创建未观察到顶层窗口的分类。</summary>
     internal static ResidentWindowTraits None { get; } = new(false, false, false, false, false);
 
@@ -20,7 +23,11 @@ internal sealed record ResidentWindowTraits(
         HasHiddenTopLevelWindow || !window.IsVisible,
         HasOwnedTopLevelWindow || window.IsOwned,
         HasToolWindow || window.IsToolWindow,
-        HasCloakedWindow || window.IsCloaked);
+        HasCloakedWindow || window.IsCloaked)
+    {
+        HasOrdinaryVisibleTopLevelWindow = HasOrdinaryVisibleTopLevelWindow ||
+            (window.IsVisible && !window.IsOwned && !window.IsToolWindow && !window.IsCloaked)
+    };
 }
 
 /// <summary>保存可安全供后续候选发现使用的单进程公开观察信息。</summary>

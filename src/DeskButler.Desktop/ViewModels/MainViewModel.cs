@@ -305,7 +305,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var result = await commands.SendAsync(new SaveSceneNowCommand(), CancellationToken.None);
         var publishedCurrentGeneration = PublishResidentCandidates(result.Discovery);
         StatusText = FormatManualSaveStatus(result);
-        // 只有手动保存的当前代非空候选可以请求托盘引导；后台 SceneSaved 和 Find 都不能触发。
+        // 只有显式用户操作的当前代非空候选可以请求窗口导航；后台 SceneSaved 不能触发。
         if (publishedCurrentGeneration && !result.Discovery.DiscoveryFailed &&
             result.Discovery.Candidates.Count > 0 && residentCandidateGeneration == result.Discovery.Generation)
         {
@@ -326,8 +326,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task FindResidentCandidatesAsync()
     {
         var batch = await commands.SendAsync(new FindResidentCandidatesCommand(), CancellationToken.None);
-        PublishResidentCandidates(batch);
-        StatusText = batch.DiscoveryFailed ? "常驻应用发现失败" : "已完成常驻应用查找";
+        var published = PublishResidentCandidates(batch);
+        StatusText = batch.DiscoveryFailed
+            ? "常驻应用发现失败"
+            : batch.Candidates.Count == 0
+                ? "未发现新的常驻应用候选"
+                : $"发现 {batch.Candidates.Count} 个可能需要常驻的应用";
+        if (published && !batch.DiscoveryFailed && batch.Candidates.Count > 0 &&
+            residentCandidateGeneration == batch.Generation)
+        {
+            ResidentCandidatesAvailable?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     /// <summary>确认当前 UI 代次；成功仅清空同代候选并重新加载设置。</summary>
@@ -602,7 +611,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     batch.Generation,
                     residentDependencies.Picker,
                     residentDependencies.IconProvider,
-                    OnResidentCandidateChanged));
+                    OnResidentCandidateChanged,
+                    residentDependencies.ValidateExecutable));
             }
         }
 

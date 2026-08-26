@@ -322,6 +322,7 @@ public sealed class CompositionRoot : IAsyncDisposable
                 resident.Discovery,
                 settingsStore,
                 settingsCoordinator,
+                resident.ExecutablePolicy,
                 residentDiagnostics.ReportDiscovery);
             var residentCommands = ResidentAppCommandHandlerSet.Create(
                 residentCandidates,
