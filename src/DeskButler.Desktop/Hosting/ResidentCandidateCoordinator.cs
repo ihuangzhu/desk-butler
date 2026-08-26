@@ -44,6 +44,9 @@ public sealed class ResidentCandidateCoordinator
         this.settings = settings ?? throw new ArgumentNullException(nameof(settings));
     }
 
+    /// <summary>供组合根验证候选确认和列表编辑共用同一个设置事务协调器。</summary>
+    internal SettingsCoordinator SettingsCoordinator => settings;
+
     /// <summary>获取当前已发布候选批次的不可变快照。</summary>
     public ResidentDiscoveryBatch Current
     {

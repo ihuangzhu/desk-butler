@@ -265,6 +265,10 @@ public sealed class CompositionRoot : IAsyncDisposable
                 WindowsResidentAppDiscovery.CreateDefault(),
                 settingsStore,
                 settingsCoordinator);
+            var residentCommands = ResidentAppCommandHandlerSet.Create(
+                residentCandidates,
+                settingsCoordinator,
+                new WindowsResidentExecutablePolicy());
             var scheduler = ownership.Own(
                 "scheduler",
                 new SnapshotScheduler(clock, captureCoordinator.SaveNowAsync),
@@ -312,9 +316,7 @@ public sealed class CompositionRoot : IAsyncDisposable
             var commandBus = new InProcessCommandBus();
             commandBus.Register(new SaveSceneNowCommandHandler(
                 captureInventory, captureCoordinator, residentCandidates, diagnosticLog, clock));
-            commandBus.Register(new FindResidentCandidatesCommandHandler(residentCandidates));
-            commandBus.Register(new ConfirmResidentCandidatesCommandHandler(residentCandidates));
-            commandBus.Register(new DismissResidentCandidatesCommandHandler(residentCandidates));
+            residentCommands.Register(commandBus);
             commandBus.Register(new RestoreSceneCommandHandler(
                 rawInventory,
                 new RestorePlanner(),

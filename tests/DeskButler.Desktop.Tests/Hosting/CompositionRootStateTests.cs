@@ -1,7 +1,9 @@
 using DeskButler.Application.Events;
 using DeskButler.Application.Modules;
+using DeskButler.Application.Commands;
 using DeskButler.Core.Capture;
 using DeskButler.Core.Diagnostics;
+using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Scenes;
 using DeskButler.Core.Time;
 using DeskButler.Core.Settings;
@@ -17,6 +19,46 @@ namespace DeskButler.Desktop.Tests.Hosting;
 
 public sealed class CompositionRootStateTests
 {
+    /// <summary>生产常驻命令注册集必须让候选确认和所有列表编辑共享唯一设置协调器。</summary>
+    [Fact]
+    public async Task ResidentCommandRegistrationSharesCoordinatorAndRegistersEveryMutation()
+    {
+        var store = new InMemorySettingsStore(ButlerSettings.Default);
+        using var settings = new SettingsCoordinator(store);
+        var candidates = new ResidentCandidateCoordinator(new EmptyResidentDiscovery(), store, settings);
+        var handlers = ResidentAppCommandHandlerSet.Create(candidates, settings, new AllowingResidentExecutablePolicy());
+        var commandBus = new InProcessCommandBus();
+
+        handlers.Register(commandBus);
+        var result = await commandBus.SendAsync(
+            new SetResidentApplicationsEnabledCommand(false), CancellationToken.None);
+        var added = await commandBus.SendAsync(
+            new AddResidentApplicationCommand(@"C:\Apps\chat.exe", "Chat"), CancellationToken.None);
+        var setEntry = await commandBus.SendAsync(
+            new SetResidentApplicationEnabledCommand(@"C:\Apps\chat.exe", false), CancellationToken.None);
+        var moved = await commandBus.SendAsync(
+            new MoveResidentApplicationCommand(@"C:\Apps\chat.exe", -1), CancellationToken.None);
+        var replaced = await commandBus.SendAsync(
+            new ReplaceResidentApplicationPathCommand(@"C:\Apps\chat.exe", @"C:\Apps\chat-new.exe"), CancellationToken.None);
+        var removed = await commandBus.SendAsync(
+            new RemoveResidentApplicationCommand(@"C:\Apps\chat-new.exe"), CancellationToken.None);
+
+        Assert.Same(settings, handlers.Confirm.SettingsCoordinator);
+        Assert.Same(settings, handlers.SetApplicationsEnabled.SettingsCoordinator);
+        Assert.Same(settings, handlers.SetApplicationEnabled.SettingsCoordinator);
+        Assert.Same(settings, handlers.Remove.SettingsCoordinator);
+        Assert.Same(settings, handlers.Move.SettingsCoordinator);
+        Assert.Same(settings, handlers.Add.SettingsCoordinator);
+        Assert.Same(settings, handlers.Replace.SettingsCoordinator);
+        Assert.True(result.Changed);
+        Assert.False(result.ResidentApplicationsEnabled);
+        Assert.True(added.Changed);
+        Assert.True(setEntry.Changed);
+        Assert.False(moved.Changed);
+        Assert.True(replaced.Changed);
+        Assert.True(removed.Changed);
+    }
+
     /// <summary>构造中途失败时必须把已取得的资源按逆构造顺序各释放一次。</summary>
     [Fact]
     public async Task ConstructionFailureDisposesOwnedResourcesOnceInReverseOrder()
@@ -1388,6 +1430,23 @@ public sealed class CompositionRootStateTests
             source.TrySetException(exception);
             return reference;
         }
+    }
+
+    /// <summary>为空候选场景提供真实协调器所需的最小发现边界。</summary>
+    private sealed class EmptyResidentDiscovery : IResidentAppDiscovery
+    {
+        public Task<ResidentDiscoveryResult> DiscoverAsync(
+            IReadOnlySet<string> ordinaryWindowPaths,
+            IReadOnlyList<ResidentApplication> existing,
+            CancellationToken cancellationToken) =>
+            Task.FromResult(new ResidentDiscoveryResult([], []));
+    }
+
+    /// <summary>测试中只验证命令对象图，不触碰文件系统或真实第三方应用。</summary>
+    private sealed class AllowingResidentExecutablePolicy : IResidentExecutablePolicy
+    {
+        public ResidentExecutableValidation Validate(string path) =>
+            new(true, Path.GetFullPath(path), ResidentExecutableRejection.None);
     }
 
     private sealed class FixedClock(DateTimeOffset utcNow) : IClock
