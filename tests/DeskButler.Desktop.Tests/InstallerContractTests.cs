@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 namespace DeskButler.Desktop.Tests;
@@ -92,14 +93,51 @@ public sealed class InstallerContractTests
     {
         var fixture = ReadUninstallFixture();
 
-        Assert.Contains("residentSettingsMarker", fixture, StringComparison.Ordinal);
-        Assert.Contains("'settings.json'", fixture, StringComparison.Ordinal);
-        Assert.Contains("residentLaunchSessionMarker", fixture, StringComparison.Ordinal);
-        Assert.Contains("'resident-launch-session.json'", fixture, StringComparison.Ordinal);
-        Assert.Contains("Default uninstall did not preserve resident settings.", fixture, StringComparison.Ordinal);
-        Assert.Contains("Default uninstall did not preserve the resident launch session.", fixture, StringComparison.Ordinal);
-        Assert.Contains("Delete-data uninstall left resident settings behind.", fixture, StringComparison.Ordinal);
-        Assert.Contains("Delete-data uninstall left the resident launch session behind.", fixture, StringComparison.Ordinal);
+        var defaultArguments = ReadPowerShellStringArray(fixture, "defaultUninstallArguments");
+        Assert.Equal(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"], defaultArguments);
+        Assert.DoesNotContain("/DELETEUSERDATA=1", defaultArguments, StringComparer.OrdinalIgnoreCase);
+
+        var deleteDataArguments = ReadPowerShellStringArray(fixture, "deleteDataUninstallArguments");
+        Assert.Equal(
+            ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DELETEUSERDATA=1"],
+            deleteDataArguments);
+        Assert.Single(deleteDataArguments, argument =>
+            string.Equals(argument, "/DELETEUSERDATA=1", StringComparison.OrdinalIgnoreCase));
+
+        var lifecycle = ReadPowerShellFunctionBody(fixture, "Invoke-UninstallContractFixture");
+        var scenarioCalls = lifecycle
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => line is
+                "Verify-DefaultUninstallPreservesUserData" or
+                "Verify-DeleteDataUninstallRemovesUserData")
+            .ToArray();
+        Assert.Equal(
+            ["Verify-DefaultUninstallPreservesUserData", "Verify-DeleteDataUninstallRemovesUserData"],
+            scenarioCalls);
+        Assert.Single(Regex.Matches(
+            fixture,
+            @"(?m)^\s*Invoke-UninstallContractFixture\s*$",
+            RegexOptions.CultureInvariant));
+
+        var defaultScenario = ReadPowerShellFunctionBody(fixture, "Verify-DefaultUninstallPreservesUserData");
+        Assert.Contains("Uninstall-Fixture -Arguments $defaultUninstallArguments", defaultScenario, StringComparison.Ordinal);
+        Assert.Contains("Assert-DefaultUserDataPreserved", defaultScenario, StringComparison.Ordinal);
+        Assert.DoesNotContain("$deleteDataUninstallArguments", defaultScenario, StringComparison.Ordinal);
+
+        var preserveAssertions = ReadPowerShellFunctionBody(fixture, "Assert-DefaultUserDataPreserved");
+        Assert.Contains("if (-not (Test-Path -LiteralPath $dataRoot))", preserveAssertions, StringComparison.Ordinal);
+        Assert.Contains("if (-not (Test-Path -LiteralPath $residentSettingsMarker))", preserveAssertions, StringComparison.Ordinal);
+        Assert.Contains("if (-not (Test-Path -LiteralPath $residentLaunchSessionMarker))", preserveAssertions, StringComparison.Ordinal);
+
+        var deleteScenario = ReadPowerShellFunctionBody(fixture, "Verify-DeleteDataUninstallRemovesUserData");
+        Assert.Contains("Uninstall-Fixture -Arguments $deleteDataUninstallArguments", deleteScenario, StringComparison.Ordinal);
+        Assert.Contains("Assert-DeletedUserDataRoot", deleteScenario, StringComparison.Ordinal);
+        Assert.DoesNotContain("$defaultUninstallArguments", deleteScenario, StringComparison.Ordinal);
+
+        var deleteAssertions = ReadPowerShellFunctionBody(fixture, "Assert-DeletedUserDataRoot");
+        Assert.Contains("if (Test-Path -LiteralPath $dataRoot)", deleteAssertions, StringComparison.Ordinal);
+        Assert.Contains("throw 'Delete-data uninstall left the DeskButler user-data root behind.'",
+            deleteAssertions, StringComparison.Ordinal);
     }
 
     /// <summary>验证静默卸载准备失败只记录并中止，不创建任何阻塞消息框。</summary>
@@ -166,5 +204,49 @@ public sealed class InstallerContractTests
     /// <summary>读取发布卸载夹具供数据根行为契约测试使用。</summary>
     private static string ReadUninstallFixture() =>
         File.ReadAllText(Path.Combine(RepositoryRoot, "tests", "installer", "verify-uninstall.ps1"));
+
+    /// <summary>读取单行 PowerShell 单引号字符串数组，稳定验证卸载参数集合。</summary>
+    private static string[] ReadPowerShellStringArray(string script, string variableName)
+    {
+        var assignment = Regex.Match(
+            script,
+            $@"(?m)^\${Regex.Escape(variableName)}\s*=\s*@\((?<values>[^)]*)\)\s*$",
+            RegexOptions.CultureInvariant);
+        Assert.True(assignment.Success, $"PowerShell array was not found: ${variableName}");
+
+        return Regex.Matches(
+                assignment.Groups["values"].Value,
+                "'(?<value>[^']*)'",
+                RegexOptions.CultureInvariant)
+            .Select(match => match.Groups["value"].Value)
+            .ToArray();
+    }
+
+    /// <summary>按配对花括号读取 PowerShell 函数体，避免断言命中其他场景的相同文本。</summary>
+    private static string ReadPowerShellFunctionBody(string script, string functionName)
+    {
+        var declaration = $"function {functionName}";
+        var declarationIndex = script.IndexOf(declaration, StringComparison.Ordinal);
+        Assert.True(declarationIndex >= 0, $"PowerShell function was not found: {functionName}");
+        var openingBrace = script.IndexOf('{', declarationIndex + declaration.Length);
+        Assert.True(openingBrace >= 0, $"PowerShell function has no body: {functionName}");
+
+        var depth = 0;
+        for (var index = openingBrace; index < script.Length; index++)
+        {
+            depth += script[index] switch
+            {
+                '{' => 1,
+                '}' => -1,
+                _ => 0
+            };
+            if (depth == 0)
+            {
+                return script[(openingBrace + 1)..index];
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"PowerShell function body was not closed: {functionName}");
+    }
 
 }

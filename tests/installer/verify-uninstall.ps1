@@ -7,16 +7,18 @@ $ErrorActionPreference = 'Stop'
 $installer = (Resolve-Path -LiteralPath $InstallerPath).Path
 $fixtureId = [Guid]::NewGuid().ToString('N')
 $installDirectory = Join-Path $env:TEMP "DeskButler-Uninstall-$fixtureId"
-$dataDirectory = Join-Path $env:LOCALAPPDATA 'DeskButler'
+$dataRoot = Join-Path $env:LOCALAPPDATA 'DeskButler'
 $defaultInstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\DeskButler'
 $shortcutDirectory = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\DeskButler'
 $uninstallKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\DeskButler_is1'
 $runKeyPath = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $unrelatedName = "DeskButlerUninstallFixture_$fixtureId"
 $unrelatedValue = "unrelated-$fixtureId"
-$dataMarker = Join-Path $dataDirectory "installer-fixture-$fixtureId.marker"
-$residentSettingsMarker = Join-Path $dataDirectory 'settings.json'
-$residentLaunchSessionMarker = Join-Path $dataDirectory 'resident-launch-session.json'
+$dataMarker = Join-Path $dataRoot "installer-fixture-$fixtureId.marker"
+$residentSettingsMarker = Join-Path $dataRoot 'settings.json'
+$residentLaunchSessionMarker = Join-Path $dataRoot 'resident-launch-session.json'
+$defaultUninstallArguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+$deleteDataUninstallArguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DELETEUSERDATA=1')
 $registryBase = $null
 $runKey = $null
 $installed = $false
@@ -36,12 +38,71 @@ function Install-Fixture {
     $script:installed = $true
 }
 
+# 使用调用方明确选择的参数卸载夹具；绝不发现或终止第三方进程。
+function Uninstall-Fixture {
+    param([string[]]$Arguments)
+    Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') $Arguments
+    $script:installed = $false
+}
+
+# 默认卸载后，精确数据根及常驻设置、会话证据必须全部保留。
+function Assert-DefaultUserDataPreserved {
+    if (-not (Test-Path -LiteralPath $dataRoot)) {
+        throw 'Default uninstall did not preserve the DeskButler user-data root.'
+    }
+    if (-not (Test-Path -LiteralPath $dataMarker)) {
+        throw 'Silent uninstall did not preserve user data by default.'
+    }
+    if (-not (Test-Path -LiteralPath $residentSettingsMarker)) {
+        throw 'Default uninstall did not preserve resident settings.'
+    }
+    if (-not (Test-Path -LiteralPath $residentLaunchSessionMarker)) {
+        throw 'Default uninstall did not preserve the resident launch session.'
+    }
+}
+
+# 显式删除数据后，只接受精确 DeskButler 数据根完全不存在。
+function Assert-DeletedUserDataRoot {
+    if (Test-Path -LiteralPath $dataRoot) {
+        throw 'Delete-data uninstall left the DeskButler user-data root behind.'
+    }
+}
+
+function Verify-DefaultUninstallPreservesUserData {
+    Uninstall-Fixture -Arguments $defaultUninstallArguments
+    Assert-DefaultUserDataPreserved
+}
+
+function Verify-DeleteDataUninstallRemovesUserData {
+    Uninstall-Fixture -Arguments $deleteDataUninstallArguments
+    Assert-DeletedUserDataRoot
+}
+
+# 固定场景顺序：先验证默认保留，再重新安装并验证显式删除精确数据根。
+function Invoke-UninstallContractFixture {
+    Install-Fixture
+    New-Item -ItemType Directory -Path $dataRoot | Out-Null
+    Set-Content -LiteralPath $dataMarker -Value 'preserve-delete-fixture' -NoNewline
+    Set-Content -LiteralPath $residentSettingsMarker -Value "resident-settings-$fixtureId" -NoNewline
+    Set-Content -LiteralPath $residentLaunchSessionMarker -Value "resident-session-$fixtureId" -NoNewline
+    Verify-DefaultUninstallPreservesUserData
+
+    Install-Fixture
+    Assert-DefaultUserDataPreserved
+    Verify-DeleteDataUninstallRemovesUserData
+
+    if ((Test-Path -LiteralPath $installDirectory) -or
+        (Test-Path -LiteralPath $shortcutDirectory)) {
+        throw 'Program files or shortcut remained after delete-data uninstall.'
+    }
+}
+
 try {
     $registryBase = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
         [Microsoft.Win32.RegistryHive]::CurrentUser,
         [Microsoft.Win32.RegistryView]::Registry64)
     if ((Test-Path -LiteralPath $defaultInstallDirectory) -or
-        (Test-Path -LiteralPath $dataDirectory) -or
+        (Test-Path -LiteralPath $dataRoot) -or
         (Test-Path -LiteralPath $shortcutDirectory)) {
         throw 'Safety gate: an existing DeskButler installation or user-data directory was detected.'
     }
@@ -54,43 +115,7 @@ try {
     $runKey = $registryBase.CreateSubKey($runKeyPath, $true)
     $runKey.SetValue($unrelatedName, $unrelatedValue, [Microsoft.Win32.RegistryValueKind]::String)
 
-    Install-Fixture
-    New-Item -ItemType Directory -Path $dataDirectory | Out-Null
-    Set-Content -LiteralPath $dataMarker -Value 'preserve-delete-fixture' -NoNewline
-    Set-Content -LiteralPath $residentSettingsMarker -Value "resident-settings-$fixtureId" -NoNewline
-    Set-Content -LiteralPath $residentLaunchSessionMarker -Value "resident-session-$fixtureId" -NoNewline
-    Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
-    $installed = $false
-    if (-not (Test-Path -LiteralPath $dataMarker)) {
-        throw 'Silent uninstall did not preserve user data by default.'
-    }
-    if (-not (Test-Path -LiteralPath $residentSettingsMarker)) {
-        throw 'Default uninstall did not preserve resident settings.'
-    }
-    if (-not (Test-Path -LiteralPath $residentLaunchSessionMarker)) {
-        throw 'Default uninstall did not preserve the resident launch session.'
-    }
-
-    Install-Fixture
-    if ((-not (Test-Path -LiteralPath $dataMarker)) -or
-        (-not (Test-Path -LiteralPath $residentSettingsMarker)) -or
-        (-not (Test-Path -LiteralPath $residentLaunchSessionMarker))) {
-        throw 'Reinstall could not see preserved user data.'
-    }
-    Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/DELETEUSERDATA=1')
-    $installed = $false
-
-    if (Test-Path -LiteralPath $residentSettingsMarker) {
-        throw 'Delete-data uninstall left resident settings behind.'
-    }
-    if (Test-Path -LiteralPath $residentLaunchSessionMarker) {
-        throw 'Delete-data uninstall left the resident launch session behind.'
-    }
-    if ((Test-Path -LiteralPath $installDirectory) -or
-        (Test-Path -LiteralPath $shortcutDirectory) -or
-        (Test-Path -LiteralPath $dataDirectory)) {
-        throw 'Program files, shortcut, or DeskButler user data remained after delete-data uninstall.'
-    }
+    Invoke-UninstallContractFixture
     if ($runKey.GetValue('DeskButler')) {
         throw 'DeskButler HKCU Run value remained after uninstall.'
     }
@@ -100,7 +125,7 @@ try {
 } finally {
     if ($installed -and (Test-Path -LiteralPath (Join-Path $installDirectory 'unins000.exe'))) {
         try {
-            Invoke-CheckedProcess (Join-Path $installDirectory 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+            Uninstall-Fixture -Arguments $defaultUninstallArguments
         } catch {
             Write-Warning $_
         }
