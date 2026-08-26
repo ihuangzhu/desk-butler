@@ -130,7 +130,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ToggleStartupCommand = new AsyncCommand(ToggleStartupAsync, () => IsStartupToggleEnabled);
         ConfirmResidentCandidatesCommand = new AsyncCommand(
             ConfirmResidentCandidatesAsync,
-            () => ResidentCandidates.Any(candidate => candidate.CanConfirm));
+            CanConfirmResidentCandidates);
         DismissResidentCandidatesCommand = new AsyncCommand(DismissResidentCandidatesAsync, () => HasResidentCandidates);
         FindResidentCandidatesCommand = new AsyncCommand(FindResidentCandidatesAsync);
         AddResidentApplicationCommand = new AsyncCommand(AddResidentApplicationAsync);
@@ -300,7 +300,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task SaveNowAsync()
     {
         var result = await commands.SendAsync(new SaveSceneNowCommand(), CancellationToken.None);
-        await LoadAsync();
         var publishedCurrentGeneration = PublishResidentCandidates(result.Discovery);
         StatusText = FormatManualSaveStatus(result);
         // 只有手动保存的当前代非空候选可以请求托盘引导；后台 SceneSaved 和 Find 都不能触发。
@@ -323,7 +322,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public Task ConfirmResidentCandidatesAsync() =>
         ConfirmResidentCandidatesAsync(
             residentCandidateGeneration,
-            ResidentCandidates.Select(candidate => candidate.ToSelection()).ToArray());
+            ResidentCandidates
+                .Where(candidate => candidate.IsSelected)
+                .Select(candidate => candidate.ToSelection())
+                .ToArray());
 
     /// <summary>确认指定代次的选择快照，迟到结果不能污染已经发布的新代候选。</summary>
     public async Task ConfirmResidentCandidatesAsync(
@@ -336,6 +338,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // ICommand 以外的直接调用也必须遵守同一确认契约，不能向 handler 发送空入口选择。
+        if (!CanConfirmResidentCandidates() || !AreConfirmSelectionsValid(selections))
+        {
+            return;
+        }
+
         var confirmed = await commands.SendAsync(
             new ConfirmResidentCandidatesCommand(generation, selections),
             CancellationToken.None);
@@ -344,8 +352,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        await ReloadResidentSettingsAsync();
+        if (generation != residentCandidateGeneration)
+        {
+            return;
+        }
+
         ClearResidentCandidates();
-        await LoadAsync();
         StatusText = "已保存常驻应用设置";
     }
 
@@ -481,6 +494,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>只读取并投影常驻设置，避免候选确认和手动保存依赖场景仓库。</summary>
+    private async Task ReloadResidentSettingsAsync()
+    {
+        var settings = await settingsStore.LoadAsync(CancellationToken.None);
+        ApplyResidentSettings(settings);
+    }
+
     /// <summary>以命令处理器返回的完整快照刷新列表，避免条目 setter 绕开设置事务。</summary>
     private void ApplyResidentMutation(ResidentSettingsMutationResult result)
     {
@@ -580,6 +600,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>候选勾选或入口草稿变化时刷新确认命令状态。</summary>
     private void OnResidentCandidateChanged() => ConfirmResidentCandidatesCommand.RaiseCanExecuteChanged();
+
+    /// <summary>确认需至少选择一项，且每个已选候选都具备非空启动入口。</summary>
+    private bool CanConfirmResidentCandidates()
+    {
+        var selected = ResidentCandidates.Where(candidate => candidate.IsSelected).ToArray();
+        return selected.Length > 0 && selected.All(candidate => candidate.CanConfirm);
+    }
+
+    /// <summary>防御性验证准备发送给命令处理器的快照，只允许已选且入口完整的项目。</summary>
+    private static bool AreConfirmSelectionsValid(IReadOnlyList<ResidentCandidateSelection> selections) =>
+        selections.Count > 0 && selections.All(selection =>
+            selection.IsSelected && !string.IsNullOrWhiteSpace(selection.FinalLaunchPath));
 
     /// <summary>精确映射手动保存与发现工作流的五种用户可见结果。</summary>
     private static string FormatManualSaveStatus(ManualSaveResult result)

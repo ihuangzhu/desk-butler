@@ -59,6 +59,29 @@ public sealed class ResidentCandidateViewModelTests
         Assert.Equal(19, vm.Generation);
     }
 
+    /// <summary>路径替换浏览后必须通知绑定层刷新旧、新入口说明。</summary>
+    [Fact]
+    public async Task BrowsingPathReplacementRaisesPathReplacementTextChanged()
+    {
+        var candidate = CreateCandidate(
+            ResidentCandidateConfidence.High,
+            ResidentCandidateKind.PathReplacement,
+            @"C:\New\Agent.exe") with { ReplacesLaunchPath = @"C:\Old\Agent.exe" };
+        var vm = new ResidentCandidateViewModel(
+            candidate,
+            21,
+            new FakeExecutablePicker(@"C:\Chosen\Agent.exe"),
+            new FakeExecutableIconProvider());
+        var changedProperties = new List<string?>();
+        vm.PropertyChanged += (_, eventArgs) => changedProperties.Add(eventArgs.PropertyName);
+
+        await vm.BrowsePathAsync();
+
+        Assert.Contains(nameof(ResidentCandidateViewModel.PathReplacementText), changedProperties);
+        Assert.Contains(@"C:\Old\Agent.exe", vm.PathReplacementText, StringComparison.Ordinal);
+        Assert.Contains(@"C:\Chosen\Agent.exe", vm.PathReplacementText, StringComparison.Ordinal);
+    }
+
     /// <summary>浏览取消不能改写候选入口、选择状态或确认能力。</summary>
     [Fact]
     public async Task BrowseCancellationLeavesCandidateUntouched()

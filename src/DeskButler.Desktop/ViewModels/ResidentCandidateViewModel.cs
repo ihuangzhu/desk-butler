@@ -62,6 +62,7 @@ public sealed class ResidentCandidateViewModel : ObservableObject
             {
                 Icon = iconProvider.GetIcon(value);
                 OnPropertyChanged(nameof(CanConfirm));
+                OnPropertyChanged(nameof(PathReplacementText));
                 stateChanged();
             }
         }

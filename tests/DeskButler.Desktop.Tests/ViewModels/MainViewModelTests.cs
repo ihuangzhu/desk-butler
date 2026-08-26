@@ -3,6 +3,8 @@ using DeskButler.Desktop.ViewModels;
 using DeskButler.Application.Commands;
 using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Restore;
+using DeskButler.Core.Persistence;
+using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
 using DeskButler.Infrastructure.Windows.Startup;
 using DeskButler.Modules.WorkspaceRecovery.Capture;
@@ -70,6 +72,56 @@ public sealed class MainViewModelTests
         Assert.Equal(0, events);
     }
 
+    /// <summary>混合选择中只要有已选空入口，确认命令与方法都必须拒绝发送。</summary>
+    [Fact]
+    public async Task ConfirmResidentCandidatesRequiresEverySelectedCandidateToHavePath()
+    {
+        var valid = CreateCandidate("valid");
+        var pathless = valid with { CandidateId = "pathless", LaunchPath = null };
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(49, [valid, pathless], false),
+            confirmResult: false);
+        var vm = CreateResidentViewModel(commands);
+        await vm.FindResidentCandidatesAsync();
+        var emptyPath = vm.ResidentCandidates.Single(candidate => candidate.CandidateId == "pathless");
+        emptyPath.IsSelected = true;
+
+        Assert.False(vm.ConfirmResidentCandidatesCommand.CanExecute(null));
+        await vm.ConfirmResidentCandidatesAsync();
+        Assert.DoesNotContain(commands.SentCommands, command => command is ConfirmResidentCandidatesCommand);
+
+        emptyPath.IsSelected = false;
+        Assert.True(vm.ConfirmResidentCandidatesCommand.CanExecute(null));
+        await vm.ConfirmResidentCandidatesAsync();
+
+        var confirm = Assert.IsType<ConfirmResidentCandidatesCommand>(
+            Assert.Single(commands.SentCommands, command => command is ConfirmResidentCandidatesCommand));
+        var selection = Assert.Single(confirm.Selections);
+        Assert.Equal("valid", selection.CandidateId);
+        Assert.True(selection.IsSelected);
+        Assert.False(string.IsNullOrWhiteSpace(selection.FinalLaunchPath));
+    }
+
+    /// <summary>现场仓库刷新失败不能阻止手动保存结果中的候选、文案和事件投影。</summary>
+    [Fact]
+    public async Task SaveNowAsyncPublishesResidentResultWhenSceneRefreshFails()
+    {
+        var commands = new ResidentCommandBus(new ManualSaveResult(
+            new CaptureOutcome(true, CaptureSkipReason.None, new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
+            new ResidentDiscoveryBatch(50, [CreateCandidate("save-without-scenes")], false)));
+        var repository = new ThrowingSceneRepository();
+        var vm = CreateResidentViewModel(commands, sceneRepository: repository);
+        var eventCount = 0;
+        vm.ResidentCandidatesAvailable += (_, _) => eventCount++;
+
+        await vm.SaveNowAsync();
+
+        Assert.Single(vm.ResidentCandidates);
+        Assert.Equal("现场已保存", vm.StatusText);
+        Assert.Equal(1, eventCount);
+        Assert.Equal(0, repository.GetRecentCallCount);
+    }
+
     /// <summary>独立查找只发送查找命令，不能把它误接到保存现场的工作流或托盘事件。</summary>
     [Fact]
     public async Task FindResidentCandidatesAsyncDoesNotSaveSceneOrRaiseManualEvent()
@@ -126,6 +178,42 @@ public sealed class MainViewModelTests
         Assert.Empty(vm.ResidentCandidates);
         Assert.Single(vm.ResidentApplications);
         Assert.Equal(1, settings.LoadCount);
+    }
+
+    /// <summary>确认成功仅重载 resident settings，不应访问场景仓库。</summary>
+    [Fact]
+    public async Task ConfirmResidentCandidatesAsyncReloadsSettingsWithoutReadingScenes()
+    {
+        var application = new ResidentApplication(@"C:\Apps\SettingsOnly.exe", new HashSet<string>(), "SettingsOnly", true, 0);
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(51, [CreateCandidate("settings-only")], false),
+            confirmResult: true);
+        var settings = new CountingSettingsStore(ButlerSettings.Default with { ResidentApplications = [application] });
+        var repository = new ThrowingSceneRepository();
+        var vm = CreateResidentViewModel(commands, settingsStore: settings, sceneRepository: repository);
+        await vm.FindResidentCandidatesAsync();
+
+        await vm.ConfirmResidentCandidatesAsync();
+
+        Assert.Empty(vm.ResidentCandidates);
+        Assert.Single(vm.ResidentApplications);
+        Assert.Equal(1, settings.LoadCount);
+        Assert.Equal(0, repository.GetRecentCallCount);
+    }
+
+    /// <summary>确认后的 resident settings 重载失败时，当前代候选必须保留供用户重试。</summary>
+    [Fact]
+    public async Task ConfirmResidentCandidatesAsyncKeepsCandidatesWhenResidentSettingsReloadFails()
+    {
+        var commands = new ResidentCommandBus(
+            findResult: new ResidentDiscoveryBatch(52, [CreateCandidate("reload-failure")], false),
+            confirmResult: true);
+        var vm = CreateResidentViewModel(commands, settingsStore: new ThrowingSettingsStore());
+        await vm.FindResidentCandidatesAsync();
+
+        await Assert.ThrowsAsync<IOException>(vm.ConfirmResidentCandidatesAsync);
+
+        Assert.Equal("reload-failure", Assert.Single(vm.ResidentCandidates).CandidateId);
     }
 
     /// <summary>立即启动只委托给任务八的手动启动边界，不发送其他命令。</summary>
@@ -688,9 +776,10 @@ public sealed class MainViewModelTests
         ButlerSettings? settings = null,
         IExecutablePicker? picker = null,
         Func<CancellationToken, Task>? launch = null,
-        CountingSettingsStore? settingsStore = null) =>
+        ISettingsStore? settingsStore = null,
+        ISceneRepository? sceneRepository = null) =>
         new(
-            new InMemorySceneRepository(),
+            sceneRepository ?? new InMemorySceneRepository(),
             commands,
             settingsStore ?? new CountingSettingsStore(settings ?? ButlerSettings.Default),
             new InlineUiDispatcher(),
@@ -735,6 +824,29 @@ public sealed class MainViewModelTests
             current = settings;
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class ThrowingSettingsStore : ISettingsStore
+    {
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken) =>
+            Task.FromException<ButlerSettings>(new IOException("常驻设置重新加载失败"));
+
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class ThrowingSceneRepository : ISceneRepository
+    {
+        internal int GetRecentCallCount { get; private set; }
+
+        public Task SaveAsync(SceneSnapshot snapshot, CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<SceneSnapshot>> GetRecentAsync(int maximumCount, CancellationToken cancellationToken)
+        {
+            GetRecentCallCount++;
+            return Task.FromException<IReadOnlyList<SceneSnapshot>>(new IOException("场景仓库不可用"));
+        }
+
+        public Task MarkInvalidAsync(Guid snapshotId, string reason, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
     private sealed class ResidentCommandBus(
