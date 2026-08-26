@@ -140,6 +140,18 @@ public sealed class InstallerContractTests
             ["exit 0"],
             ReadExplicitPowerShellTerminations("Write-Output x; exit 0"));
         Assert.Equal(
+            ["return"],
+            ReadExplicitPowerShellTerminations("Write-Output x#harmless; return"));
+        Assert.Equal(
+            ["return"],
+            ReadExplicitPowerShellTerminations("Write-Output x<#plain; return"));
+        Assert.Equal(
+            ["return"],
+            ReadExplicitPowerShellTerminations("<# outer <# inner #>; return"));
+        Assert.Equal(
+            ["exit 0"],
+            ReadExplicitPowerShellTerminations("Write-Output x#harmless; exit 0"));
+        Assert.Equal(
             ["throw 'fixture stopped'", "break", "continue"],
             ReadExplicitPowerShellTerminations(
                 "Write-Output x; throw 'fixture stopped'; break; continue"));
@@ -161,6 +173,19 @@ public sealed class InstallerContractTests
             """;
         Assert.Empty(ReadExplicitPowerShellTerminations(
             ReadPowerShellTopLevelText(harmlessNestedTerminations)));
+
+        const string harmlessHereStrings =
+            """
+            $doubleQuotedHereString = @"
+            "; return
+              "@; exit 0
+            "@
+            $singleQuotedHereString = @'
+            '; exit 0
+              '@; return
+            '@
+            """;
+        Assert.Empty(ReadExplicitPowerShellTerminations(harmlessHereStrings));
 
         var topLevelTail = NormalizePowerShellStatements(
             ReadPowerShellTail(fixture, topLevelMarker));
@@ -321,10 +346,13 @@ public sealed class InstallerContractTests
         var parenthesisDepth = 0;
         var braceDepth = 0;
         var bracketDepth = 0;
-        var blockCommentDepth = 0;
+        var inBlockComment = false;
         var inSingleQuotedString = false;
         var inDoubleQuotedString = false;
         var inLineComment = false;
+        var hereStringQuote = '\0';
+        var atHereStringLineStart = false;
+        var canStartComment = true;
 
         // 提交去除首尾空白的语句，忽略注释留下的纯空白片段。
         void CompleteStatement()
@@ -336,6 +364,7 @@ public sealed class InstallerContractTests
             }
 
             statement.Clear();
+            canStartComment = true;
         }
 
         // 顶层换行是语句边界；嵌套结构中的换行只是普通空白。
@@ -348,6 +377,7 @@ public sealed class InstallerContractTests
                 position++;
             }
 
+            canStartComment = true;
             if (parenthesisDepth == 0 && braceDepth == 0 && bracketDepth == 0)
             {
                 CompleteStatement();
@@ -375,10 +405,70 @@ public sealed class InstallerContractTests
             }
         }
 
+        // Here-string header 允许 @" / @' 后有水平空白，但必须随即换行。
+        bool TryReadHereStringHeader(int position, out char quote, out int lineBreakPosition)
+        {
+            quote = '\0';
+            lineBreakPosition = -1;
+            if (source[position] != '@' || position + 1 >= source.Length ||
+                source[position + 1] is not ('"' or '\''))
+            {
+                return false;
+            }
+
+            var cursor = position + 2;
+            while (cursor < source.Length &&
+                   source[cursor] is not ('\r' or '\n') &&
+                   char.IsWhiteSpace(source[cursor]))
+            {
+                cursor++;
+            }
+
+            if (cursor >= source.Length || source[cursor] is not ('\r' or '\n'))
+            {
+                return false;
+            }
+
+            quote = source[position + 1];
+            lineBreakPosition = cursor;
+            return true;
+        }
+
         for (var index = 0; index < source.Length; index++)
         {
             var current = source[index];
             var next = index + 1 < source.Length ? source[index + 1] : '\0';
+
+            if (hereStringQuote != '\0')
+            {
+                if (atHereStringLineStart && current == hereStringQuote && next == '@')
+                {
+                    statement.Append(current);
+                    statement.Append(next);
+                    index++;
+                    hereStringQuote = '\0';
+                    atHereStringLineStart = false;
+                    canStartComment = true;
+                }
+                else if (current is '\r' or '\n')
+                {
+                    statement.Append(current);
+                    if (current == '\r' && next == '\n')
+                    {
+                        statement.Append(next);
+                        index++;
+                    }
+
+                    atHereStringLineStart = true;
+                }
+                else
+                {
+                    statement.Append(current);
+                    atHereStringLineStart = false;
+                }
+
+                continue;
+            }
 
             if (inLineComment)
             {
@@ -391,16 +481,12 @@ public sealed class InstallerContractTests
                 continue;
             }
 
-            if (blockCommentDepth > 0)
+            if (inBlockComment)
             {
-                if (current == '<' && next == '#')
+                if (current == '#' && next == '>')
                 {
-                    blockCommentDepth++;
-                    index++;
-                }
-                else if (current == '#' && next == '>')
-                {
-                    blockCommentDepth--;
+                    inBlockComment = false;
+                    canStartComment = true;
                     index++;
                 }
 
@@ -418,6 +504,7 @@ public sealed class InstallerContractTests
                 else if (current == '\'')
                 {
                     inSingleQuotedString = false;
+                    canStartComment = true;
                 }
 
                 continue;
@@ -438,6 +525,7 @@ public sealed class InstallerContractTests
                 else if (current == '"')
                 {
                     inDoubleQuotedString = false;
+                    canStartComment = true;
                 }
 
                 continue;
@@ -447,18 +535,29 @@ public sealed class InstallerContractTests
             {
                 statement.Append(current);
                 AppendEscapedCharacter(ref index);
+                canStartComment = false;
                 continue;
             }
 
-            if (current == '#')
+            if (TryReadHereStringHeader(index, out var openingQuote, out var lineBreakPosition))
+            {
+                statement.Append(source, index, lineBreakPosition - index);
+                index = lineBreakPosition - 1;
+                hereStringQuote = openingQuote;
+                atHereStringLineStart = false;
+                canStartComment = false;
+                continue;
+            }
+
+            if (canStartComment && current == '#')
             {
                 inLineComment = true;
                 continue;
             }
 
-            if (current == '<' && next == '#')
+            if (canStartComment && current == '<' && next == '#')
             {
-                blockCommentDepth = 1;
+                inBlockComment = true;
                 statement.Append(' ');
                 index++;
                 continue;
@@ -512,6 +611,9 @@ public sealed class InstallerContractTests
                     bracketDepth--;
                     break;
             }
+
+            canStartComment = char.IsWhiteSpace(current) ||
+                current is '(' or ')' or '{' or '}' or '[' or ']' or ';' or ',' or '|' or '&';
         }
 
         CompleteStatement();
