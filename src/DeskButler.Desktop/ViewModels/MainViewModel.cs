@@ -308,6 +308,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             ResidentCandidatesAvailable?.Invoke(this, EventArgs.Empty);
         }
+
+        try
+        {
+            await ReloadRecentScenesAsync();
+        }
+        catch (Exception)
+        {
+            // 最近现场刷新是保存后的尽力补偿；不得覆盖已经发布的常驻结果、文案或事件。
+        }
     }
 
     /// <summary>不保存当前现场，直接请求一轮常驻候选发现。</summary>
@@ -499,6 +508,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         var settings = await settingsStore.LoadAsync(CancellationToken.None);
         ApplyResidentSettings(settings);
+    }
+
+    /// <summary>只读取并更新最近现场列表，供不发 SceneSaved 通知的手动保存结果补偿刷新。</summary>
+    private async Task ReloadRecentScenesAsync()
+    {
+        var scenes = await repository.GetRecentAsync(3, CancellationToken.None);
+        RecentScenes.Clear();
+        foreach (var scene in scenes)
+        {
+            RecentScenes.Add(new SceneSummaryViewModel(scene));
+        }
     }
 
     /// <summary>以命令处理器返回的完整快照刷新列表，避免条目 setter 绕开设置事务。</summary>

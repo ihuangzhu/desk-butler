@@ -119,7 +119,29 @@ public sealed class MainViewModelTests
         Assert.Single(vm.ResidentCandidates);
         Assert.Equal("现场已保存", vm.StatusText);
         Assert.Equal(1, eventCount);
-        Assert.Equal(0, repository.GetRecentCallCount);
+        Assert.Equal(1, repository.GetRecentCallCount);
+    }
+
+    /// <summary>没有 SceneSaved 通知时，手动保存后仍须主动刷新最近现场列表。</summary>
+    [Fact]
+    public async Task SaveNowAsyncRefreshesRecentScenesWithoutRepositoryNotification()
+    {
+        var oldScene = SceneFactory.Create(
+            "00000000-0000-0000-0000-000000000071", DateTimeOffset.UtcNow.AddMinutes(-1), @"C:\Apps\Old.exe");
+        var savedScene = SceneFactory.Create(
+            "00000000-0000-0000-0000-000000000072", DateTimeOffset.UtcNow, @"C:\Apps\Saved.exe");
+        var repository = new InMemorySceneRepository(oldScene);
+        var commands = new ResidentCommandBus(
+            manualSaveResult: new ManualSaveResult(
+                new CaptureOutcome(true, CaptureSkipReason.None, new HashSet<string>(StringComparer.OrdinalIgnoreCase)),
+                new ResidentDiscoveryBatch(53, [], false)),
+            saveSideEffect: () => repository.SaveAsync(savedScene, CancellationToken.None));
+        var vm = CreateResidentViewModel(commands, sceneRepository: repository);
+        await vm.LoadAsync();
+
+        await vm.SaveNowAsync();
+
+        Assert.Equal(savedScene.Id, vm.RecentScenes[0].Scene.Id);
     }
 
     /// <summary>独立查找只发送查找命令，不能把它误接到保存现场的工作流或托盘事件。</summary>
@@ -853,15 +875,20 @@ public sealed class MainViewModelTests
         ManualSaveResult? manualSaveResult = null,
         ResidentDiscoveryBatch? findResult = null,
         bool confirmResult = false,
-        ResidentSettingsMutationResult? mutationResult = null) : ICommandBus
+        ResidentSettingsMutationResult? mutationResult = null,
+        Func<Task>? saveSideEffect = null) : ICommandBus
     {
         internal List<object> SentCommands { get; } = [];
 
         internal ResidentDiscoveryBatch? FindResult { get; set; } = findResult;
 
-        public Task<TResponse> SendAsync<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken)
+        public async Task<TResponse> SendAsync<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken)
         {
             SentCommands.Add(command);
+            if (command is SaveSceneNowCommand && saveSideEffect is not null)
+            {
+                await saveSideEffect();
+            }
             object? response = command switch
             {
                 SaveSceneNowCommand => manualSaveResult,
@@ -873,7 +900,7 @@ public sealed class MainViewModelTests
                     AddResidentApplicationCommand or ReplaceResidentApplicationPathCommand => mutationResult,
                 _ => throw new InvalidOperationException($"未预期的命令类型：{command.GetType().Name}")
             };
-            return Task.FromResult((TResponse)response!);
+            return (TResponse)response!;
         }
     }
 }
