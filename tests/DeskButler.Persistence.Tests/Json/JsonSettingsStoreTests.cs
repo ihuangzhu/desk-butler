@@ -23,7 +23,7 @@ public sealed class JsonSettingsStoreTests
     public async Task SaveAsyncRoundTripsSettingsWithCaseInsensitiveExcludedPaths()
     {
         await using var fixture = new SettingsFixture();
-        var expected = new ButlerSettings(
+        var expected = ButlerSettings.CreateLegacy(
             false,
             false,
             45,

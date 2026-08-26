@@ -141,7 +141,7 @@ public sealed class JsonSettingsStore : ISettingsStore
         /// <returns>恢复后的领域设置。</returns>
         public ButlerSettings ToSettings()
         {
-            return new ButlerSettings(
+            return ButlerSettings.CreateLegacy(
                 CaptureEnabled,
                 StartupEnabled,
                 RecoveryCardDismissSeconds,
