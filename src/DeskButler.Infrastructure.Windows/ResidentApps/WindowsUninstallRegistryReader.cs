@@ -12,6 +12,16 @@ internal interface IUninstallRegistryReader
     UninstallRegistrySnapshot Read(CancellationToken cancellationToken);
 }
 
+/// <summary>定义卸载目录 reader 实际需要的最小注册表值读取边界。</summary>
+internal interface IUninstallRegistryNativeApi
+{
+    /// <summary>读取指定 hive/view 下 Uninstall 的子键名。</summary>
+    IReadOnlyList<string> GetSubKeyNames(RegistryHive hive, RegistryView view);
+
+    /// <summary>读取指定卸载子键的一个非展开字符串值。</summary>
+    string? ReadString(RegistryHive hive, RegistryView view, string keyName, string valueName);
+}
+
 /// <summary>保存单一卸载注册表项允许读取的字段。</summary>
 internal sealed record UninstallRegistryEntry(
     string? DisplayName,
@@ -27,7 +37,19 @@ internal sealed record UninstallRegistrySnapshot(
 /// <summary>只读 HKCU/HKLM 32/64 位 Uninstall 注册表项，不读取卸载命令。</summary>
 internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
 {
-    private const string UninstallSubKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+    private readonly IUninstallRegistryNativeApi native;
+
+    /// <summary>创建使用真实只读注册表边界的读取器。</summary>
+    internal WindowsUninstallRegistryReader()
+        : this(new WindowsUninstallRegistryNativeApi())
+    {
+    }
+
+    /// <summary>创建使用可控最小注册表边界的读取器，供测试验证四视图和逐键隔离。</summary>
+    internal WindowsUninstallRegistryReader(IUninstallRegistryNativeApi native)
+    {
+        this.native = native;
+    }
 
     /// <summary>读取四个卸载注册表视图；单个 key 的访问失败不会阻止其它 key。</summary>
     public UninstallRegistrySnapshot Read(CancellationToken cancellationToken)
@@ -37,7 +59,7 @@ internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
         foreach (var (hive, view) in Views)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ReadView(hive, view, entries, diagnostics, cancellationToken);
+            ReadView(native, hive, view, entries, diagnostics, cancellationToken);
         }
 
         return new UninstallRegistrySnapshot(entries.ToImmutable(), diagnostics.ToImmutable());
@@ -45,6 +67,7 @@ internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
 
     /// <summary>逐个打开子项并隔离访问拒绝，避免一个损坏安装项丢弃完整目录。</summary>
     private static void ReadView(
+        IUninstallRegistryNativeApi native,
         RegistryHive hive,
         RegistryView view,
         ImmutableArray<UninstallRegistryEntry>.Builder entries,
@@ -53,29 +76,16 @@ internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
     {
         try
         {
-            using var baseKey = RegistryKey.OpenBaseKey(hive, view);
-            using var uninstallKey = baseKey.OpenSubKey(UninstallSubKey, writable: false);
-            if (uninstallKey is null)
-            {
-                return;
-            }
-
-            foreach (var keyName in uninstallKey.GetSubKeyNames())
+            foreach (var keyName in native.GetSubKeyNames(hive, view))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    using var applicationKey = uninstallKey.OpenSubKey(keyName, writable: false);
-                    if (applicationKey is null)
-                    {
-                        continue;
-                    }
-
                     entries.Add(new UninstallRegistryEntry(
-                        ReadString(applicationKey, "DisplayName"),
-                        ReadString(applicationKey, "Publisher"),
-                        ReadString(applicationKey, "InstallLocation"),
-                        ReadString(applicationKey, "DisplayIcon")));
+                        native.ReadString(hive, view, keyName, "DisplayName"),
+                        native.ReadString(hive, view, keyName, "Publisher"),
+                        native.ReadString(hive, view, keyName, "InstallLocation"),
+                        native.ReadString(hive, view, keyName, "DisplayIcon")));
                 }
                 catch (Exception exception) when (IsAccessDenied(exception))
                 {
@@ -98,10 +108,6 @@ internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
         }
     }
 
-    /// <summary>读取字符串值且禁止环境变量展开，不读取或解释 UninstallString。</summary>
-    private static string? ReadString(RegistryKey key, string valueName) =>
-        key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
-
     /// <summary>判断注册表访问拒绝这一可预期的单键失败。</summary>
     private static bool IsAccessDenied(Exception exception) =>
         exception is UnauthorizedAccessException or SecurityException;
@@ -117,4 +123,27 @@ internal sealed class WindowsUninstallRegistryReader : IUninstallRegistryReader
         (RegistryHive.LocalMachine, RegistryView.Registry32),
         (RegistryHive.LocalMachine, RegistryView.Registry64)
     ];
+}
+
+/// <summary>通过 Windows 注册表 API 实现只读卸载目录的最小值读取边界。</summary>
+internal sealed class WindowsUninstallRegistryNativeApi : IUninstallRegistryNativeApi
+{
+    private const string UninstallSubKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    /// <summary>只读打开指定视图的 Uninstall 根并返回子键名。</summary>
+    public IReadOnlyList<string> GetSubKeyNames(RegistryHive hive, RegistryView view)
+    {
+        using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+        using var uninstallKey = baseKey.OpenSubKey(UninstallSubKey, writable: false);
+        return uninstallKey?.GetSubKeyNames() ?? [];
+    }
+
+    /// <summary>只读取调用方指定的公开字符串值，禁止环境变量展开且不接触卸载命令。</summary>
+    public string? ReadString(RegistryHive hive, RegistryView view, string keyName, string valueName)
+    {
+        using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+        using var uninstallKey = baseKey.OpenSubKey(UninstallSubKey, writable: false);
+        using var applicationKey = uninstallKey?.OpenSubKey(keyName, writable: false);
+        return applicationKey?.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+    }
 }

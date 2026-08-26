@@ -49,6 +49,76 @@ internal interface IResidentWindowReader
     IReadOnlyList<ResidentTopLevelWindow> Read(CancellationToken cancellationToken);
 }
 
+/// <summary>定义进程观察实际需要的最小 Win32 窗口分类调用边界。</summary>
+internal interface IResidentWindowNativeApi
+{
+    /// <summary>枚举当前桌面顶层 HWND，callback 返回 false 时停止。</summary>
+    bool EnumerateWindows(NativeMethods.EnumWindowsProc callback);
+
+    /// <summary>读取 EnumWindows 失败时保存的 Win32 错误码。</summary>
+    int GetLastError();
+
+    /// <summary>读取窗口所属 PID；窗口已失效时返回 false。</summary>
+    bool TryGetProcessId(nint windowHandle, out int processId);
+
+    /// <summary>读取窗口可见分类。</summary>
+    bool IsWindowVisible(nint windowHandle);
+
+    /// <summary>读取 owner 分类，并消解零返回歧义。</summary>
+    bool TryGetOwner(nint windowHandle, out nint owner);
+
+    /// <summary>读取扩展样式，并消解零返回歧义。</summary>
+    bool TryGetExtendedStyle(nint windowHandle, out nint extendedStyle);
+
+    /// <summary>读取 DWM cloaked 分类；API 失败时返回 false。</summary>
+    bool IsCloaked(nint windowHandle);
+}
+
+/// <summary>使用 Task 3 的 P/Invoke 与零返回消歧约定实现最小窗口分类边界。</summary>
+internal sealed class WindowsResidentWindowNativeApi : IResidentWindowNativeApi
+{
+    private readonly NativeWindowPropertyReader windowProperties = new();
+    private readonly WindowEnumerationNativeApi windowEnumeration = new();
+
+    /// <summary>调用 Win32 EnumWindows；callback 生命周期由调用方保持到返回后。</summary>
+    public bool EnumerateWindows(NativeMethods.EnumWindowsProc callback) =>
+        windowEnumeration.EnumerateWindows(callback);
+
+    /// <summary>读取最近 P/Invoke 保存的 Win32 错误码。</summary>
+    public int GetLastError() => windowEnumeration.GetLastError();
+
+    /// <summary>读取 HWND 所属 PID，零值表示窗口已失效或没有可用进程归属。</summary>
+    public bool TryGetProcessId(nint windowHandle, out int processId)
+    {
+        processId = 0;
+        if (NativeMethods.GetWindowThreadProcessId(windowHandle, out var nativeProcessId) == 0 || nativeProcessId == 0)
+        {
+            return false;
+        }
+
+        processId = unchecked((int)nativeProcessId);
+        return processId > 0;
+    }
+
+    /// <summary>读取窗口可见样式，不读取窗口标题或内容。</summary>
+    public bool IsWindowVisible(nint windowHandle) => NativeMethods.IsWindowVisible(windowHandle);
+
+    /// <summary>通过既有 reader 读取 owner，保持借用句柄和零返回规则。</summary>
+    public bool TryGetOwner(nint windowHandle, out nint owner) => windowProperties.TryGetOwner(windowHandle, out owner);
+
+    /// <summary>通过既有 reader 读取扩展样式，保持零返回规则。</summary>
+    public bool TryGetExtendedStyle(nint windowHandle, out nint extendedStyle) =>
+        windowProperties.TryGetExtendedStyle(windowHandle, out extendedStyle);
+
+    /// <summary>读取 DWM cloaked 标记；失败时保守地不把窗口标记为 cloaked。</summary>
+    public bool IsCloaked(nint windowHandle) =>
+        NativeMethods.DwmGetWindowAttribute(
+            windowHandle,
+            NativeMethods.DwmwaCloaked,
+            out var cloaked,
+            sizeof(int)) == 0 && cloaked != 0;
+}
+
 internal sealed class WindowsResidentProcessReader : IResidentProcessReader
 {
     /// <summary>短暂持有当前 Process 包装以读取当前 Windows Session。</summary>
@@ -94,22 +164,18 @@ internal sealed class WindowsResidentProcess(Process process) : IResidentProcess
 
 internal sealed class WindowsResidentWindowReader : IResidentWindowReader
 {
-    private readonly NativeWindowPropertyReader windowProperties;
-    private readonly IWindowEnumerationNativeApi windowEnumeration;
+    private readonly IResidentWindowNativeApi native;
 
     /// <summary>创建使用真实 Win32 顶层窗口枚举的读取器。</summary>
     internal WindowsResidentWindowReader()
-        : this(new NativeWindowPropertyReader(), new WindowEnumerationNativeApi())
+        : this(new WindowsResidentWindowNativeApi())
     {
     }
 
-    /// <summary>创建使用可控原生边界的读取器，供测试隔离窗口枚举。</summary>
-    internal WindowsResidentWindowReader(
-        NativeWindowPropertyReader windowProperties,
-        IWindowEnumerationNativeApi windowEnumeration)
+    /// <summary>创建使用可控最小原生边界的读取器，供测试验证窗口分类映射。</summary>
+    internal WindowsResidentWindowReader(IResidentWindowNativeApi native)
     {
-        this.windowProperties = windowProperties;
-        this.windowEnumeration = windowEnumeration;
+        this.native = native;
     }
 
     /// <summary>枚举顶层窗口并只保留进程关联与可见、owner、tool、cloaked 分类。</summary>
@@ -134,13 +200,13 @@ internal sealed class WindowsResidentWindowReader : IResidentWindowReader
             return boundary.Visit(windowHandle);
         });
 
-        var completed = windowEnumeration.EnumerateWindows(callback);
+        var completed = native.EnumerateWindows(callback);
         GC.KeepAlive(callback);
         cancellationToken.ThrowIfCancellationRequested();
         boundary.ThrowIfCaptured();
         if (!completed)
         {
-            throw new Win32Exception(windowEnumeration.GetLastError(), "枚举顶层窗口失败。");
+            throw new Win32Exception(native.GetLastError(), "枚举顶层窗口失败。");
         }
 
         return windows;
@@ -150,23 +216,19 @@ internal sealed class WindowsResidentWindowReader : IResidentWindowReader
     private bool TryRead(nint windowHandle, out ResidentTopLevelWindow window)
     {
         window = default!;
-        if (NativeMethods.GetWindowThreadProcessId(windowHandle, out var processId) == 0 || processId == 0 ||
-            !windowProperties.TryGetOwner(windowHandle, out var owner) ||
-            !windowProperties.TryGetExtendedStyle(windowHandle, out var extendedStyle))
+        if (!native.TryGetProcessId(windowHandle, out var processId) ||
+            !native.TryGetOwner(windowHandle, out var owner) ||
+            !native.TryGetExtendedStyle(windowHandle, out var extendedStyle))
         {
             return false;
         }
 
         window = new ResidentTopLevelWindow(
             (int)processId,
-            NativeMethods.IsWindowVisible(windowHandle),
+            native.IsWindowVisible(windowHandle),
             owner != 0,
             ((long)extendedStyle & NativeMethods.WsExToolWindow) != 0,
-            NativeMethods.DwmGetWindowAttribute(
-                windowHandle,
-                NativeMethods.DwmwaCloaked,
-                out var cloaked,
-                sizeof(int)) == 0 && cloaked != 0);
+            native.IsCloaked(windowHandle));
         return true;
     }
 }
@@ -349,11 +411,16 @@ internal sealed class WindowsResidentProcessSnapshotSource : IResidentProcessSna
 
     /// <summary>判断访问拒绝这一可预期的单进程隔离边界。</summary>
     private static bool IsAccessDenied(Exception exception) =>
-        exception is UnauthorizedAccessException or Win32Exception;
+        exception is UnauthorizedAccessException or Win32Exception { NativeErrorCode: 5 };
 
     /// <summary>把 Process 竞态映射为退出诊断，不让其污染其他进程。</summary>
     private static bool IsExited(Exception exception, IResidentProcess process)
     {
+        if (exception is Win32Exception { NativeErrorCode: 6 })
+        {
+            return true;
+        }
+
         if (exception is not InvalidOperationException and not ArgumentException)
         {
             return false;
@@ -363,9 +430,14 @@ internal sealed class WindowsResidentProcessSnapshotSource : IResidentProcessSna
         {
             return process.HasExited;
         }
-        catch (Exception probeException) when (probeException is InvalidOperationException or Win32Exception)
+        catch (InvalidOperationException)
         {
             return true;
+        }
+        catch (Win32Exception probeException)
+        {
+            // 仅 ERROR_INVALID_HANDLE 明确表示进程包装已无效；其它 Win32 失败必须由原调用传播。
+            return probeException.NativeErrorCode == 6;
         }
     }
 

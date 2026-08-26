@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Collections.Immutable;
 using DeskButler.Core.ResidentApps;
+using DeskButler.Infrastructure.Windows.Native;
 using DeskButler.Infrastructure.Windows.ResidentApps;
 
 namespace DeskButler.Infrastructure.Windows.Tests.ResidentApps;
@@ -87,6 +88,42 @@ public sealed class WindowsResidentProcessSnapshotSourceTests
         Assert.Equal(cancellation.Token, exception.CancellationToken);
     }
 
+    /// <summary>验证非访问拒绝的 Win32 进程错误必须传播，而不能静默降级为诊断。</summary>
+    [Fact]
+    public async Task CaptureAsync非访问拒绝Win32错误必须传播()
+    {
+        var original = new Win32Exception(87, "测试用无效参数错误。");
+        var source = CreateSource(
+            7,
+            [],
+            new FakeResidentProcess(1, 7, () => throw original, () => null));
+
+        var exception = await Assert.ThrowsAsync<Win32Exception>(
+            () => source.CaptureAsync(CancellationToken.None));
+
+        Assert.Same(original, exception);
+    }
+
+    /// <summary>验证生产窗口读取器按 PID 归属并解释 visible、owner、tool 与 cloaked 字段。</summary>
+    [Fact]
+    public void WindowsResidentWindowReader读取最小窗口分类()
+    {
+        var native = new FakeResidentWindowNativeApi(
+            new ResidentWindowNativeSample(1, 20, IsVisible: true, IsOwned: false, IsToolWindow: false, IsCloaked: false),
+            new ResidentWindowNativeSample(2, 20, IsVisible: false, IsOwned: true, IsToolWindow: true, IsCloaked: true),
+            new ResidentWindowNativeSample(3, 0, IsVisible: true, IsOwned: false, IsToolWindow: false, IsCloaked: false));
+        var reader = new WindowsResidentWindowReader(native);
+
+        var windows = reader.Read(CancellationToken.None);
+
+        Assert.Equal(2, windows.Count);
+        Assert.Equal(new ResidentTopLevelWindow(20, true, false, false, false), windows[0]);
+        Assert.Equal(new ResidentTopLevelWindow(20, false, true, true, true), windows[1]);
+        Assert.Equal([(nint)1, (nint)2, (nint)3], native.EnumeratedHandles);
+        Assert.Equal([(nint)1, (nint)2, (nint)3], native.ProcessIdReadHandles);
+        Assert.Equal([(nint)1, (nint)2], native.VisibleReadHandles);
+    }
+
     /// <summary>验证观察模型不暴露窗口标题、命令行或账号字段。</summary>
     [Fact]
     public void ResidentProcessObservation不暴露敏感字段()
@@ -138,6 +175,78 @@ public sealed class WindowsResidentProcessSnapshotSourceTests
             cancellationToken.ThrowIfCancellationRequested();
             return windows;
         }
+    }
+
+    private sealed record ResidentWindowNativeSample(
+        nint Handle,
+        int ProcessId,
+        bool IsVisible,
+        bool IsOwned,
+        bool IsToolWindow,
+        bool IsCloaked);
+
+    private sealed class FakeResidentWindowNativeApi(params ResidentWindowNativeSample[] windows) : IResidentWindowNativeApi
+    {
+        private readonly Dictionary<nint, ResidentWindowNativeSample> byHandle = windows.ToDictionary(window => window.Handle);
+        private readonly List<nint> enumeratedHandles = [];
+        private readonly List<nint> processIdReadHandles = [];
+        private readonly List<nint> visibleReadHandles = [];
+
+        internal IReadOnlyList<nint> EnumeratedHandles => enumeratedHandles;
+
+        internal IReadOnlyList<nint> ProcessIdReadHandles => processIdReadHandles;
+
+        internal IReadOnlyList<nint> VisibleReadHandles => visibleReadHandles;
+
+        /// <summary>依次调用生产 callback，并遵循其停止信号。</summary>
+        public bool EnumerateWindows(NativeMethods.EnumWindowsProc callback)
+        {
+            foreach (var window in windows)
+            {
+                enumeratedHandles.Add(window.Handle);
+                if (!callback(window.Handle, 0))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>fake 枚举正常完成时没有 Win32 错误。</summary>
+        public int GetLastError() => 0;
+
+        /// <summary>读取受控 HWND 的所属 PID；零 PID 模拟失效窗口。</summary>
+        public bool TryGetProcessId(nint windowHandle, out int processId)
+        {
+            processIdReadHandles.Add(windowHandle);
+            processId = byHandle[windowHandle].ProcessId;
+            return processId != 0;
+        }
+
+        /// <summary>读取受控可见分类。</summary>
+        public bool IsWindowVisible(nint windowHandle)
+        {
+            visibleReadHandles.Add(windowHandle);
+            return byHandle[windowHandle].IsVisible;
+        }
+
+        /// <summary>读取受控 owner 分类。</summary>
+        public bool TryGetOwner(nint windowHandle, out nint owner)
+        {
+            owner = byHandle[windowHandle].IsOwned ? 1 : 0;
+            return true;
+        }
+
+        /// <summary>读取受控工具窗口扩展样式。</summary>
+        public bool TryGetExtendedStyle(nint windowHandle, out nint extendedStyle)
+        {
+            extendedStyle = byHandle[windowHandle].IsToolWindow ? (nint)NativeMethods.WsExToolWindow : 0;
+            return true;
+        }
+
+        /// <summary>读取受控 DWM cloaked 分类。</summary>
+        public bool IsCloaked(nint windowHandle) => byHandle[windowHandle].IsCloaked;
     }
 
     private sealed class FakeResidentProcess(

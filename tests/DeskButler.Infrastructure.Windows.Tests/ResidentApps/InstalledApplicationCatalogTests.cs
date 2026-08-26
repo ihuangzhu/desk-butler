@@ -1,11 +1,14 @@
 using System.Collections.Immutable;
 using DeskButler.Core.ResidentApps;
 using DeskButler.Infrastructure.Windows.ResidentApps;
+using Microsoft.Win32;
 
 namespace DeskButler.Infrastructure.Windows.Tests.ResidentApps;
 
 public sealed class InstalledApplicationCatalogTests
 {
+    private static readonly string[] AllowedValueNames = ["DisplayName", "Publisher", "InstallLocation", "DisplayIcon"];
+
     /// <summary>验证目录保留重复产品、正规化允许字段并稳定排序。</summary>
     [Fact]
     public async Task ReadAsync保留重复产品并安全正规化DisplayIcon()
@@ -78,6 +81,31 @@ public sealed class InstalledApplicationCatalogTests
         Assert.Equal(cancellation.Token, exception.CancellationToken);
     }
 
+    /// <summary>验证生产注册表读取器访问四个视图，且单键拒绝不阻断其它项或请求卸载命令。</summary>
+    [Fact]
+    public void WindowsUninstallRegistryReader读取四视图并隔离单键拒绝()
+    {
+        var native = new FakeUninstallRegistryNativeApi();
+        var reader = new WindowsUninstallRegistryReader(native);
+
+        var snapshot = reader.Read(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                (RegistryHive.CurrentUser, RegistryView.Registry32),
+                (RegistryHive.CurrentUser, RegistryView.Registry64),
+                (RegistryHive.LocalMachine, RegistryView.Registry32),
+                (RegistryHive.LocalMachine, RegistryView.Registry64)
+            ],
+            native.EnumeratedViews);
+        Assert.Equal(4, snapshot.Entries.Length);
+        Assert.Equal([ResidentDiscoveryIssue.RegistryAccessDenied], snapshot.Diagnostics.Select(item => item.Kind));
+        Assert.All(
+            native.RequestedValueNames,
+            valueName => Assert.Contains(valueName, AllowedValueNames));
+        Assert.DoesNotContain("UninstallString", native.RequestedValueNames, StringComparer.Ordinal);
+    }
+
     private sealed class FakeUninstallRegistryReader(
         IReadOnlyList<UninstallRegistryEntry> entries,
         IReadOnlyList<ResidentDiscoveryDiagnostic>? diagnostics = null) : IUninstallRegistryReader
@@ -89,6 +117,44 @@ public sealed class InstalledApplicationCatalogTests
             return new UninstallRegistrySnapshot(
                 entries.ToImmutableArray(),
                 (diagnostics ?? []).ToImmutableArray());
+        }
+    }
+
+    private sealed class FakeUninstallRegistryNativeApi : IUninstallRegistryNativeApi
+    {
+        private readonly List<(RegistryHive Hive, RegistryView View)> enumeratedViews = [];
+        private readonly List<string> requestedValueNames = [];
+
+        internal IReadOnlyList<(RegistryHive Hive, RegistryView View)> EnumeratedViews => enumeratedViews;
+
+        internal IReadOnlyList<string> RequestedValueNames => requestedValueNames;
+
+        /// <summary>为每个视图返回一个可读项；HKCU 32 位额外返回一个拒绝项。</summary>
+        public IReadOnlyList<string> GetSubKeyNames(RegistryHive hive, RegistryView view)
+        {
+            enumeratedViews.Add((hive, view));
+            return hive == RegistryHive.CurrentUser && view == RegistryView.Registry32
+                ? ["Denied", "CurrentUser32"]
+                : [$"{hive}{view}"];
+        }
+
+        /// <summary>记录 production 请求的值名，并只在受控单键上模拟访问拒绝。</summary>
+        public string? ReadString(RegistryHive hive, RegistryView view, string keyName, string valueName)
+        {
+            if (keyName == "Denied")
+            {
+                throw new UnauthorizedAccessException();
+            }
+
+            requestedValueNames.Add(valueName);
+            return valueName switch
+            {
+                "DisplayName" => keyName,
+                "Publisher" => "Publisher",
+                "InstallLocation" => @"C:\Apps",
+                "DisplayIcon" => @"C:\Apps\App.exe,0",
+                _ => throw new InvalidOperationException("production reader 请求了未允许的注册表值。")
+            };
         }
     }
 }
