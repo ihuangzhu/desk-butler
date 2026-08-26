@@ -16,3 +16,4 @@ TestResults/
 *.log
 /diagnostics/
 user-data/
+/.worktrees/
