@@ -88,19 +88,85 @@
                         <TextBlock Text="最近 3 次现场" FontSize="18" FontWeight="SemiBold" />
                         <Button DockPanel.Dock="Right" Content="刷新" Command="{Binding RefreshCommand}" Padding="12,4" />
                     </DockPanel>
-                    <ListBox Grid.Row="2" ItemsSource="{Binding RecentScenes}" BorderThickness="0">
+                    <ListBox x:Name="SceneList" Grid.Row="2" ItemsSource="{Binding RecentScenes}" BorderThickness="0"
+                             HorizontalContentAlignment="Stretch">
                         <ListBox.ItemTemplate>
                             <DataTemplate>
                                 <Border BorderBrush="#FFE4E4E7" BorderThickness="1" CornerRadius="8" Padding="12" Margin="0,0,0,8">
-                                    <DockPanel>
-                                        <Button DockPanel.Dock="Right" Content="恢复" Padding="14,6"
-                                                Command="{Binding DataContext.RestoreSceneCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                CommandParameter="{Binding}" />
-                                        <StackPanel>
-                                            <TextBlock Text="{Binding CapturedAtText}" FontWeight="SemiBold" />
-                                            <TextBlock Text="{Binding ItemCountText}" Foreground="#FF71717A" Margin="0,4,0,0" />
-                                        </StackPanel>
-                                    </DockPanel>
+                                    <StackPanel>
+                                        <DockPanel>
+                                            <Button DockPanel.Dock="Right" Content="恢复所选" Padding="14,6"
+                                                    IsEnabled="{Binding HasSelectedItems}"
+                                                    Command="{Binding DataContext.RestoreSceneCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}" />
+                                            <StackPanel>
+                                                <TextBlock Text="{Binding CapturedAtText}" FontWeight="SemiBold" />
+                                                <TextBlock Text="{Binding ItemCountText}" Foreground="#FF71717A" Margin="0,4,0,0" />
+                                            </StackPanel>
+                                        </DockPanel>
+                                        <Expander IsExpanded="{Binding IsExpanded, Mode=TwoWay}"
+                                                  Header="{Binding SelectedItemCountText}" Margin="0,10,0,0">
+                                            <StackPanel Margin="0,8,0,0">
+                                                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                                                    <Button Content="全选" Command="{Binding SelectAllCommand}" Padding="10,3" Margin="0,0,8,0" />
+                                                    <Button Content="全不选" Command="{Binding SelectNoneCommand}" Padding="10,3" />
+                                                </StackPanel>
+                                                <ItemsControl ItemsSource="{Binding Items}">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <Border BorderBrush="#FFF0F0F2" BorderThickness="1" CornerRadius="6"
+                                                                    Padding="10" Margin="0,0,0,6">
+                                                                <Grid>
+                                                                    <Grid.ColumnDefinitions>
+                                                                        <ColumnDefinition Width="Auto" />
+                                                                        <ColumnDefinition Width="10" />
+                                                                        <ColumnDefinition Width="*" />
+                                                                    </Grid.ColumnDefinitions>
+                                                                    <CheckBox Grid.Column="0" IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                                                              VerticalAlignment="Top" Margin="0,3,0,0"
+                                                                              AutomationProperties.Name="{Binding DisplayName}" />
+                                                                    <StackPanel Grid.Column="2">
+                                                                        <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                                        <WrapPanel Margin="0,3,0,0">
+                                                                            <TextBlock Text="程序：" Foreground="#FF71717A" />
+                                                                            <TextBlock Text="{Binding ApplicationName}" Foreground="#FF71717A" />
+                                                                            <TextBlock Text="管理员权限" Foreground="#FFB45309" Margin="10,0,0,0">
+                                                                                <TextBlock.Style>
+                                                                                    <Style TargetType="TextBlock">
+                                                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                                                        <Style.Triggers>
+                                                                                            <DataTrigger Binding="{Binding IsElevated}" Value="True">
+                                                                                                <Setter Property="Visibility" Value="Visible" />
+                                                                                            </DataTrigger>
+                                                                                        </Style.Triggers>
+                                                                                    </Style>
+                                                                                </TextBlock.Style>
+                                                                            </TextBlock>
+                                                                        </WrapPanel>
+                                                                        <TextBlock Text="{Binding ExplorerPath}" Foreground="#FF52525B" Margin="0,3,0,0"
+                                                                                   TextWrapping="Wrap">
+                                                                            <TextBlock.Style>
+                                                                                <Style TargetType="TextBlock">
+                                                                                    <Setter Property="Visibility" Value="Visible" />
+                                                                                    <Style.Triggers>
+                                                                                        <DataTrigger Binding="{Binding ExplorerPath}" Value="{x:Null}">
+                                                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                                                        </DataTrigger>
+                                                                                    </Style.Triggers>
+                                                                                </Style>
+                                                                            </TextBlock.Style>
+                                                                        </TextBlock>
+                                                                        <TextBlock Text="{Binding ExecutablePath}" Foreground="#FFA1A1AA" Margin="0,3,0,0"
+                                                                                   TextTrimming="CharacterEllipsis" ToolTip="{Binding ExecutablePath}" />
+                                                                    </StackPanel>
+                                                                </Grid>
+                                                            </Border>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                        </Expander>
+                                    </StackPanel>
                                 </Border>
                             </DataTemplate>
                         </ListBox.ItemTemplate>

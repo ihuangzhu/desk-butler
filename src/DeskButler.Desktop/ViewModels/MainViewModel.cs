@@ -5,7 +5,6 @@ using DeskButler.Core.Scenes;
 using DeskButler.Core.Settings;
 using DeskButler.Core.Restore;
 using DeskButler.Desktop.Hosting;
-using System.Globalization;
 using DeskButler.Infrastructure.Windows.Startup;
 using DeskButler.Application.Events;
 using DeskButler.Application.Modules;
@@ -15,19 +14,6 @@ using DeskButler.Modules.WorkspaceRecovery;
 using System.IO;
 
 namespace DeskButler.Desktop.ViewModels;
-
-/// <summary>表示主窗口最近现场列表中的一行。</summary>
-public sealed class SceneSummaryViewModel(SceneSnapshot scene)
-{
-    /// <summary>获取原始不可变现场。</summary>
-    public SceneSnapshot Scene { get; } = scene ?? throw new ArgumentNullException(nameof(scene));
-
-    /// <summary>获取本地时间显示文本。</summary>
-    public string CapturedAtText => Scene.CapturedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.CurrentCulture);
-
-    /// <summary>获取窗口数量摘要。</summary>
-    public string ItemCountText => $"{Scene.Items.Count} 个窗口";
-}
 
 /// <summary>汇总常驻页面的可替换桌面依赖，保持旧 MainViewModel 构造调用兼容。</summary>
 public sealed class ResidentViewModelDependencies(
@@ -292,11 +278,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         ApplyResidentSettings(settings);
 
-        RecentScenes.Clear();
-        foreach (var scene in scenes)
-        {
-            RecentScenes.Add(new SceneSummaryViewModel(scene));
-        }
+        ApplyRecentScenes(scenes);
     }
 
     /// <summary>要求捕获协调器立即保存现场并刷新历史。</summary>
@@ -434,8 +416,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task RestoreSceneAsync(SceneSummaryViewModel scene, bool safeMode = false)
     {
         ArgumentNullException.ThrowIfNull(scene);
+        var selectedItemIds = scene.SelectedItemIds;
+        if (selectedItemIds.Count == 0)
+        {
+            StatusText = "请至少选择一个窗口";
+            return;
+        }
+
         var result = await commands.SendAsync(
-            new RestoreSceneCommand(scene.Scene, scene.Scene.Items.Select(item => item.Id).ToArray(), safeMode),
+            new RestoreSceneCommand(scene.Scene, selectedItemIds, safeMode),
             CancellationToken.None);
         StatusText = RestoreResultSummary.Format(result ?? new RestoreResult([]));
     }
@@ -526,10 +515,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task ReloadRecentScenesAsync()
     {
         var scenes = await repository.GetRecentAsync(3, CancellationToken.None);
+        ApplyRecentScenes(scenes);
+    }
+
+    /// <summary>以最新优先顺序替换现场卡片，并只默认展开第一份。</summary>
+    private void ApplyRecentScenes(IReadOnlyList<SceneSnapshot> scenes)
+    {
         RecentScenes.Clear();
-        foreach (var scene in scenes)
+        for (var index = 0; index < scenes.Count; index++)
         {
-            RecentScenes.Add(new SceneSummaryViewModel(scene));
+            RecentScenes.Add(new SceneSummaryViewModel(scenes[index], isExpanded: index == 0));
         }
     }
 

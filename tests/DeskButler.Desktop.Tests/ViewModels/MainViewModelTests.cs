@@ -752,6 +752,62 @@ public sealed class MainViewModelTests
         Assert.Equal(older.Items.Select(item => item.Id), command.SelectedItemIds);
     }
 
+    /// <summary>历史现场恢复只发送用户在该卡片中保留勾选的窗口。</summary>
+    [Fact]
+    public async Task RestoreSceneAsyncSendsOnlySelectedWindowIds()
+    {
+        var scene = SceneFactory.Create(
+            "00000000-0000-0000-0000-000000000092", DateTimeOffset.UtcNow,
+            @"C:\Apps\Editor.exe", @"C:\Apps\Browser.exe");
+        var commands = new RecordingCommandBus();
+        var vm = new MainViewModel(new InMemorySceneRepository(scene), commands,
+            new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default));
+        var summary = new SceneSummaryViewModel(scene);
+        summary.Items[1].IsSelected = false;
+
+        await vm.RestoreSceneAsync(summary);
+
+        var command = Assert.IsType<RestoreSceneCommand>(Assert.Single(commands.SentCommands));
+        Assert.Equal([scene.Items[0].Id], command.SelectedItemIds);
+    }
+
+    /// <summary>没有勾选窗口时不能向恢复处理器发送空恢复请求。</summary>
+    [Fact]
+    public async Task RestoreSceneAsyncRejectsEmptyWindowSelection()
+    {
+        var scene = SceneFactory.Create(
+            "00000000-0000-0000-0000-000000000093", DateTimeOffset.UtcNow, @"C:\Apps\Editor.exe");
+        var commands = new RecordingCommandBus();
+        var vm = new MainViewModel(new InMemorySceneRepository(scene), commands,
+            new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default));
+        var summary = new SceneSummaryViewModel(scene);
+        summary.Items[0].IsSelected = false;
+
+        await vm.RestoreSceneAsync(summary);
+
+        Assert.Empty(commands.SentCommands);
+        Assert.Equal("请至少选择一个窗口", vm.StatusText);
+    }
+
+    /// <summary>最近现场刷新只默认展开最新一份，避免三份明细同时撑满页面。</summary>
+    [Fact]
+    public async Task LoadAsyncExpandsOnlyNewestScene()
+    {
+        var scenes = Enumerable.Range(1, 3)
+            .Select(index => SceneFactory.Create(
+                $"00000000-0000-0000-0000-00000000009{index}",
+                DateTimeOffset.UtcNow.AddMinutes(-index), @"C:\Apps\Editor.exe"))
+            .ToArray();
+        var vm = new MainViewModel(new InMemorySceneRepository(scenes), new RecordingCommandBus(),
+            new InMemorySettingsStore(DeskButler.Core.Settings.ButlerSettings.Default));
+
+        await vm.LoadAsync();
+
+        Assert.True(vm.RecentScenes[0].IsExpanded);
+        Assert.False(vm.RecentScenes[1].IsExpanded);
+        Assert.False(vm.RecentScenes[2].IsExpanded);
+    }
+
     /// <summary>暂停捕获必须持久化并更新可观察状态，供托盘菜单切换为“继续”。</summary>
     [Fact]
     public async Task ToggleCaptureAsyncPersistsPausedState()
