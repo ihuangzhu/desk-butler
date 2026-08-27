@@ -13,6 +13,7 @@ public sealed class TrayIconService : IDisposable
     private readonly Action openMainWindow;
     private readonly Action requestExit;
     private readonly NotifyIcon notifyIcon;
+    private readonly Icon? brandIcon;
     private readonly ToolStripMenuItem recentScenesItem;
     private readonly ToolStripMenuItem captureToggleItem;
     private readonly ToolStripMenuItem focusRecoveryCardItem;
@@ -44,10 +45,11 @@ public sealed class TrayIconService : IDisposable
         menu.Items.Add(CreateActionItem("打开管家", (_, _) => openMainWindow()));
         menu.Items.Add(CreateActionItem("退出", (_, _) => requestExit()));
 
+        BrandIconLoader.TryLoad(out brandIcon);
         notifyIcon = new NotifyIcon
         {
             Text = "DeskButler 本地工作现场管家",
-            Icon = SystemIcons.Application,
+            Icon = brandIcon ?? SystemIcons.Application,
             ContextMenuStrip = menu,
             Visible = true
         };
@@ -72,6 +74,7 @@ public sealed class TrayIconService : IDisposable
         notifyIcon.Visible = false;
         notifyIcon.ContextMenuStrip?.Dispose();
         notifyIcon.Dispose();
+        brandIcon?.Dispose();
     }
 
     /// <summary>创建绑定单一动作的托盘菜单项。</summary>

@@ -24,6 +24,7 @@ RestartApplications=no
 RestartIfNeededByRun=no
 UninstallDisplayIcon={app}\DeskButler.Desktop.exe
 WizardStyle=modern
+SetupIconFile=..\src\DeskButler.Desktop\Assets\DeskButler.ico
 
 [InstallDelete]
 ; 覆盖升级只登记已废弃的精确程序路径；禁止通配符、用户数据路径和 unins* 文件。
