@@ -492,6 +492,135 @@ public sealed class ResidentLaunchCoordinatorTests
         Assert.Equal([app.LaunchPath, app.LaunchPath], runtime.StartedPaths);
     }
 
+    /// <summary>自动 attempted 持久化较慢时，手动调用必须等待该前置条件并共享唯一启动结果。</summary>
+    [Fact]
+    public async Task SlowAutomaticAttemptPersistenceBlocksManualSideEffectAndSharesLaunchOutcome()
+    {
+        var app = App("Shared", @"C:\Apps\shared.exe", true, 0);
+        var settings = new OverlappingSettingsStore(Settings(app));
+        var sessions = new BlockingAttemptedSessionStore();
+        var clock = new ManualClock(InitialTime);
+        var runtime = new RecordingRuntime
+        {
+            Now = () => clock.UtcNow,
+            CheckBehavior = _ => Task.FromResult(
+                new ResidentRunningCheck(ResidentRunningState.NotRunning, null))
+        };
+        await using var coordinator = Create(settings, sessions, clock, runtime, "LUID-A");
+        coordinator.Start();
+        await clock.AdvanceUntilAsync(sessions.AttemptedSaveStarted.Task);
+
+        var manual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
+        await settings.ManualLoadStarted.Task;
+        settings.ReleaseManualLoad();
+        var startCountBeforeAttemptedSaveRelease = runtime.StartedPaths.Count;
+
+        sessions.ReleaseAttemptedSave();
+        var completion = Task.WhenAll(coordinator.Completion, manual);
+        var pacingDelay = clock.WaitForDelayAsync(TimeSpan.FromSeconds(1));
+        if (ReferenceEquals(await Task.WhenAny(completion, pacingDelay), pacingDelay))
+        {
+            await clock.AdvanceAsync(TimeSpan.FromSeconds(1));
+        }
+
+        await completion;
+
+        Assert.Equal(
+            (StartsBeforeAttemptedSaveRelease: 0, TotalStarts: 1),
+            (StartsBeforeAttemptedSaveRelease: startCountBeforeAttemptedSaveRelease,
+                TotalStarts: runtime.StartedPaths.Count));
+        Assert.Single(runtime.StartAttemptTimes);
+    }
+
+    /// <summary>自动 attempted 保存失败必须 fail-closed，并释放等待同一 flight 的手动调用。</summary>
+    [Fact]
+    public async Task FailedAutomaticAttemptPersistencePreventsSharedManualLaunch()
+    {
+        var app = App("Shared", @"C:\Apps\shared.exe", true, 0);
+        var settings = new OverlappingSettingsStore(Settings(app));
+        var sessions = new BlockingAttemptedSessionStore();
+        var clock = new ManualClock(InitialTime);
+        var runtime = new RecordingRuntime();
+        var diagnostics = new RecordingDiagnosticLog();
+        await using var coordinator = Create(
+            settings,
+            sessions,
+            clock,
+            runtime,
+            "LUID-A",
+            diagnosticLog: diagnostics);
+        coordinator.Start();
+        await clock.AdvanceUntilAsync(sessions.AttemptedSaveStarted.Task);
+
+        var manual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
+        await settings.ManualLoadStarted.Task;
+        settings.ReleaseManualLoad();
+        Assert.False(manual.IsCompleted);
+
+        sessions.FailAttemptedSave(new IOException("attempt secret"));
+        await Task.WhenAll(coordinator.Completion, manual);
+
+        Assert.Empty(runtime.StartedPaths);
+        var failure = Assert.Single(diagnostics.Events, item =>
+            Equals(item.Properties?["result"], "batch-failed"));
+        Assert.Equal(typeof(IOException).FullName, failure.Properties!["exceptionType"]);
+        Assert.DoesNotContain("attempt secret", string.Join('|', failure.Properties.Values));
+    }
+
+    /// <summary>手动 caller 取消只释放自身等待，不得取消尚待 attempted 的自动 flight。</summary>
+    [Fact]
+    public async Task CanceledManualWaiterDoesNotCancelPendingAutomaticFlight()
+    {
+        var app = App("Shared", @"C:\Apps\shared.exe", true, 0);
+        var settings = new OverlappingSettingsStore(Settings(app));
+        var sessions = new BlockingAttemptedSessionStore();
+        var clock = new ManualClock(InitialTime);
+        var runtime = new RecordingRuntime();
+        await using var coordinator = Create(settings, sessions, clock, runtime, "LUID-A");
+        coordinator.Start();
+        await clock.AdvanceUntilAsync(sessions.AttemptedSaveStarted.Task);
+
+        using var callerCancellation = new CancellationTokenSource();
+        var manual = coordinator.LaunchEnabledNowAsync(callerCancellation.Token);
+        await settings.ManualLoadStarted.Task;
+        settings.ReleaseManualLoad();
+        Assert.False(manual.IsCompleted);
+
+        callerCancellation.Cancel();
+        await manual;
+        Assert.Empty(runtime.StartedPaths);
+
+        sessions.ReleaseAttemptedSave();
+        await coordinator.Completion;
+
+        Assert.Single(runtime.StartedPaths);
+    }
+
+    /// <summary>协调器 lifetime 取消必须终止 pending prerequisite 与共享等待，不触发外部启动。</summary>
+    [Fact]
+    public async Task DisposeDuringPendingAutomaticPrerequisiteCancelsSharedFlightWithoutLaunch()
+    {
+        var app = App("Shared", @"C:\Apps\shared.exe", true, 0);
+        var settings = new OverlappingSettingsStore(Settings(app));
+        var sessions = new BlockingAttemptedSessionStore();
+        var clock = new ManualClock(InitialTime);
+        var runtime = new RecordingRuntime();
+        var coordinator = Create(settings, sessions, clock, runtime, "LUID-A");
+        coordinator.Start();
+        await clock.AdvanceUntilAsync(sessions.AttemptedSaveStarted.Task);
+
+        var manual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
+        await settings.ManualLoadStarted.Task;
+        settings.ReleaseManualLoad();
+        Assert.False(manual.IsCompleted);
+
+        var dispose = coordinator.DisposeAsync().AsTask();
+        await Task.WhenAll(dispose, manual);
+
+        Assert.Empty(runtime.StartedPaths);
+        Assert.True(coordinator.Completion.IsCompleted);
+    }
+
     private static ResidentLaunchCoordinator Create(
         ISettingsStore settings,
         IResidentLaunchSessionStore sessions,
@@ -609,6 +738,49 @@ public sealed class ResidentLaunchCoordinatorTests
             cancellationToken.ThrowIfCancellationRequested();
             Current = settings;
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>只阻塞固定计划的第二次保存，即自动单项 attempted 持久化边界。</summary>
+    private sealed class BlockingAttemptedSessionStore : IResidentLaunchSessionStore
+    {
+        private readonly TaskCompletionSource releaseAttemptedSave =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int saveCount;
+
+        internal TaskCompletionSource AttemptedSaveStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal ResidentLaunchSession? Current { get; private set; }
+
+        internal void ReleaseAttemptedSave() => releaseAttemptedSave.TrySetResult();
+
+        internal void FailAttemptedSave(Exception exception) =>
+            releaseAttemptedSave.TrySetException(exception);
+
+        public Task<ResidentLaunchSession?> LoadAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(Current);
+        }
+
+        public async Task SaveAsync(ResidentLaunchSession session, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref saveCount) == 2)
+            {
+                AttemptedSaveStarted.TrySetResult();
+                await releaseAttemptedSave.Task.WaitAsync(cancellationToken);
+            }
+
+            Current = session with { Plan = session.Plan.ToArray() };
+        }
+
+        public Task<ResidentLaunchRecoveryResult> RecoverCorruptAsync(
+            string currentLogonSessionId,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(ResidentLaunchRecoveryResult.RecoveredWithEmptyPlan);
         }
     }
 

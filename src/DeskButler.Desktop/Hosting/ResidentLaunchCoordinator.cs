@@ -234,6 +234,7 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
                             planItem,
                             cancellationToken).ConfigureAwait(false);
                     },
+                    requiresAttemptPersistence: true,
                     cancellationToken).ConfigureAwait(false);
                 session = currentSession;
             }
@@ -272,6 +273,7 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
                 await ProcessApplicationAsync(
                     applications[index],
                     static () => Task.CompletedTask,
+                    requiresAttemptPersistence: false,
                     cancellationToken).ConfigureAwait(false);
             }
         }
@@ -307,44 +309,111 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         return updated;
     }
 
-    /// <summary>共享单项的运行检查、策略重验和启动协议；自动调用方注入先登记边界。</summary>
+    /// <summary>先登记共享消费者，并在协议启动前聚合所有已经登记的自动 attempted 前置条件。</summary>
     private async Task ProcessApplicationAsync(
         ResidentApplication application,
         Func<Task> markAttemptedAsync,
+        bool requiresAttemptPersistence,
         CancellationToken cancellationToken)
     {
-        // 自动批次必须先落盘 attempted；加入已有手动 flight 时也不能依赖领跑者代写会话状态。
-        await markAttemptedAsync().ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-
         var launchIdentity = CreateLaunchIdentity(application.LaunchPath);
         ApplicationLaunchFlight flight;
-        var ownsProtocol = false;
+        var automaticPrerequisiteRegistered = false;
         lock (applicationFlightsSync)
         {
             if (!applicationFlights.TryGetValue(launchIdentity, out flight!))
             {
                 flight = new ApplicationLaunchFlight();
                 applicationFlights.Add(launchIdentity, flight);
-                ownsProtocol = true;
             }
 
             flight.ConsumerCount++;
-        }
-
-        if (ownsProtocol)
-        {
-            _ = CompleteApplicationFlightAsync(launchIdentity, flight, application);
+            if (requiresAttemptPersistence &&
+                !flight.ProtocolStarted &&
+                !flight.Completion.Task.IsCompleted)
+            {
+                flight.PendingAutomaticPrerequisites++;
+                automaticPrerequisiteRegistered = true;
+            }
         }
 
         try
         {
+            try
+            {
+                // 自动消费者只有完成自身原子 attempted 保存，才可解除它对共享副作用的门禁。
+                await markAttemptedAsync().ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            catch
+            {
+                if (automaticPrerequisiteRegistered)
+                {
+                    FailApplicationFlightPrerequisite(flight);
+                    automaticPrerequisiteRegistered = false;
+                }
+
+                throw;
+            }
+
+            if (ResolveApplicationFlightPrerequisiteAndTryStart(
+                    flight,
+                    automaticPrerequisiteRegistered))
+            {
+                _ = CompleteApplicationFlightAsync(launchIdentity, flight, application);
+            }
+            automaticPrerequisiteRegistered = false;
+
             // 调用方取消只结束自己的等待；共享协议由协调器生命周期统一取消，避免一个等待者拖走其余调用。
             await flight.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             ReleaseApplicationFlight(launchIdentity, flight);
+        }
+    }
+
+    /// <summary>解除当前自动前置条件；仅在所有已登记门禁完成且协议未启动时选出唯一领跑者。</summary>
+    private bool ResolveApplicationFlightPrerequisiteAndTryStart(
+        ApplicationLaunchFlight flight,
+        bool automaticPrerequisiteRegistered)
+    {
+        lock (applicationFlightsSync)
+        {
+            if (automaticPrerequisiteRegistered)
+            {
+                flight.PendingAutomaticPrerequisites--;
+            }
+
+            if (flight.PendingAutomaticPrerequisites != 0 ||
+                flight.ProtocolStarted ||
+                flight.Completion.Task.IsCompleted)
+            {
+                return false;
+            }
+
+            flight.ProtocolStarted = true;
+            return true;
+        }
+    }
+
+    /// <summary>自动 attempted 前置条件失败时终止本轮共享结果，禁止其他重叠调用越过该边界。</summary>
+    private void FailApplicationFlightPrerequisite(ApplicationLaunchFlight flight)
+    {
+        lock (applicationFlightsSync)
+        {
+            flight.PendingAutomaticPrerequisites--;
+            if (!flight.ProtocolStarted)
+            {
+                if (lifetime.IsCancellationRequested)
+                {
+                    flight.Completion.TrySetCanceled(lifetime.Token);
+                }
+                else
+                {
+                    flight.Completion.TrySetResult();
+                }
+            }
         }
     }
 
@@ -512,13 +581,14 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
     }
 
-    /// <summary>登记一个消费者已经取得共享终态，并在最后一个重叠消费者离开后移除 flight。</summary>
+    /// <summary>释放消费者；最后一个调用方清理尚未启动或已经完成的短生命周期 flight。</summary>
     private void ReleaseApplicationFlight(string launchIdentity, ApplicationLaunchFlight flight)
     {
         lock (applicationFlightsSync)
         {
             flight.ConsumerCount--;
-            if (flight.ConsumerCount == 0 && flight.Completion.Task.IsCompleted)
+            if (flight.ConsumerCount == 0 &&
+                (!flight.ProtocolStarted || flight.Completion.Task.IsCompleted))
             {
                 RemoveApplicationFlightIfCurrent(launchIdentity, flight);
             }
@@ -666,6 +736,10 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
     {
         internal TaskCompletionSource Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal bool ProtocolStarted { get; set; }
+
+        internal int PendingAutomaticPrerequisites { get; set; }
 
         internal int ConsumerCount { get; set; }
     }

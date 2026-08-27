@@ -14,7 +14,7 @@
 
 `ResidentLaunchCoordinator.applicationFlights` 原为按 launch identity 保存的 `SemaphoreSlim`。它只串行化两次完整协议：首个调用启动成功并释放 semaphore 后，等待调用会重新执行运行检查；当 Windows 进程枚举尚未观察到新进程时，等待调用会再次进入 `StartAsync`。原测试在第 3 次检查人为返回 `Running`，因此只能证明串行，不能证明 single-flight 结果共享。
 
-修复采用短生命周期的按身份共享 Task：重叠消费者共享同一协议终态；协议完成后仍保留到最后一个已加入消费者取得结果，再移除身份项。这样稍后的非重叠手动请求会建立新协议并重新检查，不形成永久缓存。每个调用在加入 flight 前执行自己的 attempted 回调；共享协议只受协调器 lifetime 取消，调用方取消只结束自身等待；Dispose 在释放 gate 前等待残留 flight。
+第 1 轮中间修复采用短生命周期的按身份共享 Task：重叠消费者共享同一协议终态；协议完成后仍保留到最后一个已加入消费者取得结果，再移除身份项。这样稍后的非重叠手动请求会建立新协议并重新检查，不形成永久缓存。但该版仍在加入 flight 前等待自动 attempted 回调；第 2 轮独立复审证明这会留下反向交错窗口，最终修正见下文。
 
 ### RED
 
@@ -80,6 +80,54 @@ dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Re
 PASS: 23/23
 ```
 
+## Important A 第 2 轮：反向交错与 attempted 门禁
+
+### Phase 1/2 根因与最终模式
+
+生产 `JsonResidentLaunchSessionStore.SaveAsync` 在写入临时文件时依次执行异步序列化、`FlushAsync` 和同步 `Flush(flushToDisk: true)`。第 1 轮的 `ProcessApplicationAsync` 在等待该 attempted 保存完成后才注册/计数 flight；因此自动调用可能停在磁盘刷新，手动调用却先建立、完成并移除 flight，自动恢复后再建立第二个 flight。第 1 轮正向测试只把自动调用停在已注册 flight 内的运行检查，无法覆盖该顺序。
+
+最终模式在任何 per-caller 异步 attempted 保存前注册 consumer。协议尚未开始时注册的每个自动 consumer 都增加 `PendingAutomaticPrerequisites`；手动 consumer 不能在 pending 非零时领跑。最后一个自动前置条件成功后才原子设置 `ProtocolStarted` 并建立唯一共享协议。协议已开始或完成后才加入的自动调用不会反向增加 pending，但仍先完成自身 attempted，再等待/消费既有结果。前置保存失败会 fail-closed 完成本轮共享结果；调用方取消只释放自身 consumer，lifetime 取消仍终止共享协议；最后一个 consumer 仅按当前 flight 实例清理未启动或已完成项，避免 identity/ABA 误删。后续非重叠请求仍新建协议。
+
+### RED
+
+测试用第二次 session save 的 `TaskCompletionSource` 精确阻塞自动 attempted 边界；第三次 settings load 的同步 continuation 确保手动调用已推进到同身份协议。所有运行检查始终返回 `NotRunning`，没有真实延迟、时间窗口或伪造 `Running`。
+
+```text
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore -- --filter-method "*SlowAutomaticAttemptPersistenceBlocksManualSideEffectAndSharesLaunchOutcome"
+FAIL: 0 passed, 1 failed, 0 skipped
+Failure: ResidentLaunchCoordinatorTests.SlowAutomaticAttemptPersistenceBlocksManualSideEffectAndSharesLaunchOutcome
+Reason: Assert.Equal；期望（attempted 保存释放前 0 次启动，总计 1 次），实际（释放前 1 次启动，总计 2 次）。
+```
+
+### GREEN 与提交前回归
+
+```text
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore -- --filter-method "*SlowAutomaticAttemptPersistenceBlocksManualSideEffectAndSharesLaunchOutcome"
+PASS: 1/1
+
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore -- --filter-method "*OverlappingAutomaticAndManualCallsShareTransientLaunchOutcomeWhenRunningChecksLag"
+PASS: 1/1
+
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore -- --filter-class "*ResidentLaunchCoordinatorTests"
+PASS: 19/19
+
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Release --no-restore -- --filter-class "*ResidentLaunchCoordinatorTests"
+PASS: 19/19
+
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore
+PASS: 274/274
+
+dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Release --no-restore
+PASS: 272/272
+
+dotnet test DeskButler.slnx -c Debug --no-restore
+PASS: 655 total, 652 passed, 3 explicitly gated skips, 0 failed
+```
+
+同一 barrier 还覆盖三条状态分支：`FailedAutomaticAttemptPersistencePreventsSharedManualLaunch` 验证 attempted 保存异常 fail-closed 并释放手动等待者；`CanceledManualWaiterDoesNotCancelPendingAutomaticFlight` 验证 caller 取消隔离；`DisposeDuringPendingAutomaticPrerequisiteCancelsSharedFlightWithoutLaunch` 验证 lifetime 取消不会挂起或越过副作用门禁。
+
+Important B 在本轮保持关闭，相关生产代码与测试均未修改；parked minors 未处理。
+
 ## 修复提交前回归
 
 ```text
@@ -103,7 +151,7 @@ PASS: no output
 
 三个 Debug skip 仍是既有外部门禁：两个需要显式启用的交互式真实窗口 E2E，以及一个需要显式启用的 30 分钟资源采样。
 
-## Fresh Release/安装器证据
+## 第 1 轮 Fresh Release/安装器证据（已作废）
 
 - 代码修复提交：`5aa27bf fix: share resident launch outcomes safely`
 - 唯一一次 fresh 命令：`scripts\verify-release.cmd`
@@ -111,4 +159,8 @@ PASS: no output
 - 路径：`artifacts\installer\DeskButler-Setup-0.1.0.exe`
 - 大小：`64,575,904` 字节
 - SHA-256：`E754E70172A07AF74C37683C38773E390D62BD8577F1085BA4403E0221D4B2AB`
-- `Get-FileHash -Algorithm SHA256` 与验证脚本输出一致。此后未再次重建安装器。
+- `Get-FileHash -Algorithm SHA256` 与验证脚本输出一致。第 2 轮再次修改产品代码后，该 artifact 已作废，不再作为最终发布证据。
+
+## 第 2 轮 Fresh Release/安装器证据
+
+待第 2 轮代码修复提交后执行且只执行一次 `scripts\verify-release.cmd`。完成后在此记录新 Release 统计、build、publish、Inno、installer bytes 与 SHA-256，并同步刷新 README、compatibility、最终报告与人工检查清单；此后不再重建安装器。
