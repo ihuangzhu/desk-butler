@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.IO;
-using System.Collections.Concurrent;
 using DeskButler.Core.Diagnostics;
 using DeskButler.Core.ResidentApps;
 using DeskButler.Core.Settings;
@@ -16,6 +15,7 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
     private static readonly TimeSpan ItemDelay = TimeSpan.FromSeconds(1);
 
     private readonly object syncRoot = new();
+    private readonly object applicationFlightsSync = new();
     private readonly ISettingsStore settingsStore;
     private readonly IResidentLaunchSessionStore sessionStore;
     private readonly ILogonSessionIdentityProvider logonSessionIdentityProvider;
@@ -25,7 +25,7 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
     private readonly IDiagnosticLog diagnosticLog;
     private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim startAttemptGate = new(1, 1);
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> applicationFlights = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ApplicationLaunchFlight> applicationFlights = new(StringComparer.Ordinal);
     private Task? automaticCompletion;
     private Task? manualCompletion;
     private Task? disposeCompletion;
@@ -313,25 +313,73 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         Func<Task> markAttemptedAsync,
         CancellationToken cancellationToken)
     {
-        var flight = applicationFlights.GetOrAdd(
-            CreateLaunchIdentity(application.LaunchPath),
-            static _ => new SemaphoreSlim(1, 1));
-        await flight.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // 自动批次必须先落盘 attempted；加入已有手动 flight 时也不能依赖领跑者代写会话状态。
+        await markAttemptedAsync().ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var launchIdentity = CreateLaunchIdentity(application.LaunchPath);
+        ApplicationLaunchFlight flight;
+        var ownsProtocol = false;
+        lock (applicationFlightsSync)
+        {
+            if (!applicationFlights.TryGetValue(launchIdentity, out flight!))
+            {
+                flight = new ApplicationLaunchFlight();
+                applicationFlights.Add(launchIdentity, flight);
+                ownsProtocol = true;
+            }
+
+            flight.ConsumerCount++;
+        }
+
+        if (ownsProtocol)
+        {
+            _ = CompleteApplicationFlightAsync(launchIdentity, flight, application);
+        }
+
         try
         {
-            await ProcessApplicationWithinFlightAsync(application, markAttemptedAsync, cancellationToken)
-                .ConfigureAwait(false);
+            // 调用方取消只结束自己的等待；共享协议由协调器生命周期统一取消，避免一个等待者拖走其余调用。
+            await flight.Completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            flight.Release();
+            ReleaseApplicationFlight(launchIdentity, flight);
         }
     }
 
-    /// <summary>在同一应用身份的 single-flight 内完成检查、验证、登记、复查与启动。</summary>
+    /// <summary>作为唯一领跑者完成协议并发布终态；没有消费者时清理短生命周期缓存。</summary>
+    private async Task CompleteApplicationFlightAsync(
+        string launchIdentity,
+        ApplicationLaunchFlight flight,
+        ResidentApplication application)
+    {
+        try
+        {
+            await ProcessApplicationWithinFlightAsync(application, lifetime.Token).ConfigureAwait(false);
+            flight.Completion.TrySetResult();
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+            flight.Completion.TrySetCanceled(lifetime.Token);
+        }
+        catch (Exception exception)
+        {
+            await ReportBatchResultAsync(
+                "application-flight-failed",
+                exception,
+                CancellationToken.None).ConfigureAwait(false);
+            flight.Completion.TrySetResult();
+        }
+        finally
+        {
+            RemoveApplicationFlightIfUnused(launchIdentity, flight);
+        }
+    }
+
+    /// <summary>在同一应用身份的共享 flight 内完成检查、验证、复查与启动。</summary>
     private async Task ProcessApplicationWithinFlightAsync(
         ResidentApplication application,
-        Func<Task> markAttemptedAsync,
         CancellationToken cancellationToken)
     {
         var knownPaths = new HashSet<string>(
@@ -351,7 +399,6 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         }
         catch (Exception checkFailure)
         {
-            await markAttemptedAsync().ConfigureAwait(false);
             await ReportApplicationResultAsync(
                 application,
                 "running-check-failed",
@@ -362,7 +409,6 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
 
         if (running.State != ResidentRunningState.NotRunning)
         {
-            await markAttemptedAsync().ConfigureAwait(false);
             await ReportApplicationResultAsync(
                 application,
                 running.State == ResidentRunningState.Running ? "already-running" : "running-unknown",
@@ -378,7 +424,6 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
         }
         catch (Exception policyFailure)
         {
-            await markAttemptedAsync().ConfigureAwait(false);
             await ReportApplicationResultAsync(
                 application,
                 "policy-failed",
@@ -389,7 +434,6 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
 
         if (!validation.IsAllowed || string.IsNullOrWhiteSpace(validation.NormalizedPath))
         {
-            await markAttemptedAsync().ConfigureAwait(false);
             await ReportApplicationResultAsync(
                 application,
                 $"policy-rejected-{validation.Reason}",
@@ -398,8 +442,6 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
             return;
         }
 
-        // 启动意图先持久化；即使随后的外部边界崩溃，同一 LUID 也不会重复处理。
-        await markAttemptedAsync().ConfigureAwait(false);
         try
         {
             var finalRunning = await runtime.CheckRunningAsync(knownPaths, cancellationToken).ConfigureAwait(false);
@@ -468,6 +510,40 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
     {
         var normalized = Path.GetFullPath(launchPath).ToUpperInvariant();
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+    }
+
+    /// <summary>登记一个消费者已经取得共享终态，并在最后一个重叠消费者离开后移除 flight。</summary>
+    private void ReleaseApplicationFlight(string launchIdentity, ApplicationLaunchFlight flight)
+    {
+        lock (applicationFlightsSync)
+        {
+            flight.ConsumerCount--;
+            if (flight.ConsumerCount == 0 && flight.Completion.Task.IsCompleted)
+            {
+                RemoveApplicationFlightIfCurrent(launchIdentity, flight);
+            }
+        }
+    }
+
+    /// <summary>协议先于全部消费者结束时，仅在没有尚待消费结果的调用方时移除 flight。</summary>
+    private void RemoveApplicationFlightIfUnused(string launchIdentity, ApplicationLaunchFlight flight)
+    {
+        lock (applicationFlightsSync)
+        {
+            if (flight.ConsumerCount == 0)
+            {
+                RemoveApplicationFlightIfCurrent(launchIdentity, flight);
+            }
+        }
+    }
+
+    /// <summary>只删除仍指向给定实例的身份项，避免误删随后建立的新一轮协议。</summary>
+    private void RemoveApplicationFlightIfCurrent(string launchIdentity, ApplicationLaunchFlight flight)
+    {
+        if (applicationFlights.TryGetValue(launchIdentity, out var current) && ReferenceEquals(current, flight))
+        {
+            applicationFlights.Remove(launchIdentity);
+        }
     }
 
     /// <summary>诊断失败不得反向污染自动批次，并且不写异常消息或会话身份。</summary>
@@ -562,11 +638,35 @@ internal sealed class ResidentLaunchCoordinator : IAsyncDisposable
             await Task.WhenAll(pending).ConfigureAwait(false);
         }
 
-        startAttemptGate.Dispose();
-        foreach (var flight in applicationFlights.Values)
+        Task[] flights;
+        lock (applicationFlightsSync)
         {
-            flight.Dispose();
+            flights = applicationFlights.Values
+                .Select(flight => flight.Completion.Task)
+                .ToArray();
         }
+        if (flights.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(flights).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+            {
+                // 生命周期取消是 flight 的正常终止路径；Dispose 仍需等所有共享任务离开资源边界。
+            }
+        }
+
+        startAttemptGate.Dispose();
         lifetime.Dispose();
+    }
+
+    /// <summary>保存单个启动身份的共享协议终态及尚未消费该终态的重叠调用数。</summary>
+    private sealed class ApplicationLaunchFlight
+    {
+        internal TaskCompletionSource Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal int ConsumerCount { get; set; }
     }
 }

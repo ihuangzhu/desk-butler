@@ -37,7 +37,10 @@ public sealed class ResidentApplicationViewModel : ObservableObject
         this.moveAsync = moveAsync ?? throw new ArgumentNullException(nameof(moveAsync));
         this.replacePathAsync = replacePathAsync ?? throw new ArgumentNullException(nameof(replacePathAsync));
         validation = this.validateExecutable(Application.LaunchPath);
-        icon = iconProvider.GetIcon(Application.LaunchPath);
+        // 图标提取是同步文件/Shell I/O，只允许策略接受后的正规化路径越过该边界。
+        icon = validation.IsAllowed && !string.IsNullOrWhiteSpace(validation.NormalizedPath)
+            ? iconProvider.GetIcon(validation.NormalizedPath)
+            : null;
         EnableCommand = new AsyncCommand(
             parameter => TryGetEnabledState(parameter, out var enabled) ? SetEnabledAsync(enabled) : Task.CompletedTask,
             parameter => TryGetEnabledState(parameter, out var enabled) && (enabled ? CanEnable : IsEnabled));

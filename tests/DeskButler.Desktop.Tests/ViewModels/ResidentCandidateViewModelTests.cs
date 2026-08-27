@@ -189,6 +189,53 @@ public sealed class ResidentCandidateViewModelTests
         Assert.False(vm.EnableCommand.CanExecute(true));
     }
 
+    /// <summary>已保存条目的 UNC、禁止、相对和无效路径被策略拒绝后，绝不能触发图标 I/O。</summary>
+    [Theory]
+    [InlineData(@"\\server\share\agent.exe", ResidentExecutableRejection.NetworkPath)]
+    [InlineData(@"C:\Windows\System32\agent.exe", ResidentExecutableRejection.ProhibitedDirectory)]
+    [InlineData(@"relative\agent.exe", ResidentExecutableRejection.NotAbsolutePath)]
+    [InlineData("invalid\0agent.exe", ResidentExecutableRejection.InvalidPath)]
+    public void RejectedSavedApplicationPathNeverReachesIconProvider(
+        string rejectedPath,
+        ResidentExecutableRejection rejection)
+    {
+        var icons = new RecordingIconProvider();
+
+        _ = new ResidentApplicationViewModel(
+            new ResidentApplication(rejectedPath, new HashSet<string>(), "Agent", false, 0),
+            new FakeExecutablePicker(),
+            icons,
+            _ => new ResidentExecutableValidation(false, null, rejection),
+            (_, _) => Task.CompletedTask,
+            _ => Task.CompletedTask,
+            (_, _) => Task.CompletedTask,
+            (_, _) => Task.CompletedTask);
+
+        Assert.Empty(icons.Paths);
+    }
+
+    /// <summary>已保存条目的允许路径只提取一次图标，且副作用边界只接收策略正规化路径。</summary>
+    [Fact]
+    public void AcceptedSavedApplicationIconReceivesNormalizedPathExactlyOnce()
+    {
+        var icons = new RecordingIconProvider();
+
+        _ = new ResidentApplicationViewModel(
+            new ResidentApplication(@"C:\Apps\.\Agent.exe", new HashSet<string>(), "Agent", true, 0),
+            new FakeExecutablePicker(),
+            icons,
+            _ => new ResidentExecutableValidation(
+                true,
+                @"C:\Apps\Agent.exe",
+                ResidentExecutableRejection.None),
+            (_, _) => Task.CompletedTask,
+            _ => Task.CompletedTask,
+            (_, _) => Task.CompletedTask,
+            (_, _) => Task.CompletedTask);
+
+        Assert.Equal([@"C:\Apps\Agent.exe"], icons.Paths);
+    }
+
     /// <summary>WPF XAML 字符串命令参数必须被解析为布尔值，否则“启用”按钮无法执行。</summary>
     [Fact]
     public void ApplicationEnableCommandAcceptsWpfBooleanCommandParameter()

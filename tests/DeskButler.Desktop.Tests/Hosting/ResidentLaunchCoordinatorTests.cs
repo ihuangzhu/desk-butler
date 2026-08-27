@@ -432,12 +432,12 @@ public sealed class ResidentLaunchCoordinatorTests
         Assert.DoesNotContain("late secret", string.Join('|', failure.Properties.Values));
     }
 
-    /// <summary>自动与手动批次并发处理同一身份时，运行检查到启动必须 single-flight。</summary>
+    /// <summary>自动与手动调用重叠时，即使进程枚举持续滞后，也必须共享同一启动结果。</summary>
     [Fact]
-    public async Task AutomaticAndManualStartAttemptsAreGloballySpaced()
+    public async Task OverlappingAutomaticAndManualCallsShareTransientLaunchOutcomeWhenRunningChecksLag()
     {
         var app = App("Shared", @"C:\Apps\shared.exe", true, 0);
-        var settings = new MutableSettingsStore(Settings(app));
+        var settings = new OverlappingSettingsStore(Settings(app));
         var sessions = new RecordingSessionStore();
         var clock = new ManualClock(InitialTime);
         var releaseAutomaticCheck = new TaskCompletionSource<ResidentRunningCheck>(
@@ -456,9 +456,8 @@ public sealed class ResidentLaunchCoordinatorTests
                     return releaseAutomaticCheck.Task;
                 }
 
-                return Task.FromResult(checkCount < 3
-                    ? new ResidentRunningCheck(ResidentRunningState.NotRunning, null)
-                    : new ResidentRunningCheck(ResidentRunningState.Running, app.LaunchPath));
+                return Task.FromResult(
+                    new ResidentRunningCheck(ResidentRunningState.NotRunning, null));
             }
         };
         await using var coordinator = Create(settings, sessions, clock, runtime, "LUID-A");
@@ -466,13 +465,31 @@ public sealed class ResidentLaunchCoordinatorTests
         await clock.AdvanceUntilAsync(automaticCheckStarted.Task);
 
         var manual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
+        await settings.ManualLoadStarted.Task;
+        // 此 release 使用同步 continuation；返回时手动调用已进入同身份 flight 的等待队列。
+        settings.ReleaseManualLoad();
         releaseAutomaticCheck.TrySetResult(
             new ResidentRunningCheck(ResidentRunningState.NotRunning, null));
         await runtime.FirstStart.Task;
+        var pacingDelay = clock.WaitForDelayAsync(TimeSpan.FromSeconds(1));
+        if (ReferenceEquals(await Task.WhenAny(manual, pacingDelay), pacingDelay))
+        {
+            await clock.AdvanceAsync(TimeSpan.FromSeconds(1));
+        }
+
         await Task.WhenAll(coordinator.Completion, manual);
 
         Assert.Single(runtime.StartAttemptTimes);
         Assert.Single(runtime.StartedPaths);
+
+        var laterManual = coordinator.LaunchEnabledNowAsync(CancellationToken.None);
+        var laterPacingDelay = clock.WaitForDelayAsync(TimeSpan.FromSeconds(1));
+        Assert.Same(laterPacingDelay, await Task.WhenAny(laterManual, laterPacingDelay));
+        await clock.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await laterManual;
+
+        Assert.Equal(2, runtime.StartAttemptTimes.Count);
+        Assert.Equal([app.LaunchPath, app.LaunchPath], runtime.StartedPaths);
     }
 
     private static ResidentLaunchCoordinator Create(
@@ -551,6 +568,40 @@ public sealed class ResidentLaunchCoordinatorTests
             }
 
             return Current;
+        }
+
+        public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Current = settings;
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>让第三次设置读取停在可控边界，确定性证明手动调用与自动单项协议重叠。</summary>
+    private sealed class OverlappingSettingsStore(ButlerSettings current) : ISettingsStore
+    {
+        // 不使用 RunContinuationsAsynchronously：ReleaseManualLoad 返回前，等待方会同步推进到 flight await。
+        private readonly TaskCompletionSource<ButlerSettings> releaseManualLoad = new();
+        private int loadCount;
+
+        internal TaskCompletionSource ManualLoadStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal ButlerSettings Current { get; set; } = current;
+
+        internal void ReleaseManualLoad() => releaseManualLoad.TrySetResult(Current);
+
+        public Task<ButlerSettings> LoadAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.Increment(ref loadCount) == 3)
+            {
+                ManualLoadStarted.TrySetResult();
+                return releaseManualLoad.Task;
+            }
+
+            return Task.FromResult(Current);
         }
 
         public Task SaveAsync(ButlerSettings settings, CancellationToken cancellationToken)
