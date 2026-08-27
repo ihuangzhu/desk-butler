@@ -4,7 +4,7 @@
 
 | 范围 | 状态 | 截至 2026-08-27 的证据 |
 |---|---|---|
-| Windows 10 x64 19045 自动快速测试 | PASS | 本轮最终 `verify-release.cmd`：649 总计、646 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误，publish 与 Inno Setup 7.1.0 成功。最终安装器 64,575,904 字节，SHA-256 `E754E70172A07AF74C37683C38773E390D62BD8577F1085BA4403E0221D4B2AB`。 |
+| Windows 10 x64 19045 自动快速测试 | PASS | 本轮最终 `verify-release.cmd`：653 总计、650 通过、3 个显式门禁跳过、0 失败；Release build 为 0 警告、0 错误，publish 与 Inno Setup 7.1.0 成功。最终安装器 64,531,942 字节，SHA-256 `893CDAAA1B467B690B27B4DCB9C433C9606C55968045D5D5C8E1D90CA193FD17`。 |
 | Windows 10 受控短交互 | PASS | Debug/Release 的两个受控窗口、Explorer 往返和 150% DPI 定位通过，窗口四边误差门槛 8 物理像素。 |
 | Windows 10 常驻应用专用 VM 链 | PENDING | 本轮未启动真实 QQ、微信或富途，也未执行缩托盘发现、顺序、去重、主动退出、立即启动例外或第三方卸载存活验证。 |
 | 本构建 30 分钟资源验证 | PENDING | Release 套件按显式 `DESKBUTLER_RUN_LONG_E2E=1` 门禁跳过；旧构建证据不能替代本轮含常驻功能的 30 分钟实测。 |

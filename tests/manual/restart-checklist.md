@@ -5,7 +5,7 @@
 ## 重启前准备
 
 - [ ] 记录 OS edition/version/build、DPI、显示器布局、测试账户、当前时间。
-- [ ] 记录安装器文件名、版本、大小 `64,575,904` 字节和 SHA-256 `E754E70172A07AF74C37683C38773E390D62BD8577F1085BA4403E0221D4B2AB`；记录 DeskButler 与 TestWindow fixture 版本/hash。
+- [ ] 记录安装器文件名、版本、大小 `64,531,942` 字节和 SHA-256 `893CDAAA1B467B690B27B4DCB9C433C9606C55968045D5D5C8E1D90CA193FD17`；记录 DeskButler 与 TestWindow fixture 版本/hash。
 - [ ] 确认在专用测试账户；运行 clean-account 门禁及安装/升级链，没有任何 `BLOCK`。
 - [ ] 打开两个受控 TestWindow 和唯一临时 Explorer 目录；记录 PID、HWND、路径及物理像素矩形。
 - [ ] 等待快照，记录 snapshot id/时间；确认数据库仅 3 份有效快照。

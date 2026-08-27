@@ -163,4 +163,11 @@ PASS: no output
 
 ## 第 2 轮 Fresh Release/安装器证据
 
-待第 2 轮代码修复提交后执行且只执行一次 `scripts\verify-release.cmd`。完成后在此记录新 Release 统计、build、publish、Inno、installer bytes 与 SHA-256，并同步刷新 README、compatibility、最终报告与人工检查清单；此后不再重建安装器。
+- 第 2 轮代码修复提交：`b20f674 fix: gate shared resident launches on attempts`
+- 首次 `scripts\verify-release.cmd`：Release build 0 warning / 0 error；Release tests 653 total、649 passed、3 explicitly gated skips、1 failed。失败为既有 `WindowsResidentProcessRuntimeTests.CheckRunningAsyncFindsOwnedFixtureInCurrentSession` 清理唯一项目 fixture 目录时，`Directory.Delete` 对 `DeskButler.ResidentFixture.exe` 抛出 `UnauthorizedAccessException`。脚本在 tests 阶段 exit 1，未执行 publish/Inno，未生成新的第 2 轮 artifact。
+- 系统化诊断：本次 diff 未修改该测试或 Infrastructure resident runtime；相关测试文件最后修改于 `50601ab`。tasklist 无残留 fixture 进程；精确用例 1/1、所属类 9/9、Infrastructure Release 138/138、全 Release 653 total/650 passed/3 skips/0 failed。证据支持既有 fixture 退出后文件释放与目录删除之间的瞬态，而非本次产品变更；未修改越界测试或加入重试/延迟。
+- 经条件授权执行第二次且最后一次完整 `scripts\verify-release.cmd`：exit 0；Release build 0 warning / 0 error；Release tests 653 total、650 passed、3 explicitly gated skips、0 failed；self-contained win-x64 publish PASS；Inno Setup 7.1.0 PASS。首次失败未生成 artifact，本轮最终 artifact 仅生成一次。
+- 路径：`artifacts\installer\DeskButler-Setup-0.1.0.exe`
+- 大小：`64,531,942` 字节
+- SHA-256：`893CDAAA1B467B690B27B4DCB9C433C9606C55968045D5D5C8E1D90CA193FD17`
+- `Get-FileHash -Algorithm SHA256` 与最终验证脚本输出一致。此后不再重建安装器。
