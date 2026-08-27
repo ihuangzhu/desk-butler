@@ -25,6 +25,7 @@
   </Folder>
   <Folder Name="/tests/DeskButler.Infrastructure.Windows.Tests/" />
   <Folder Name="/tests/DeskButler.Infrastructure.Windows.Tests/TestApps/">
+    <Project Path="tests/DeskButler.Infrastructure.Windows.Tests/TestApps/DeskButler.ResidentFixture/DeskButler.ResidentFixture.csproj" />
     <Project Path="tests/DeskButler.Infrastructure.Windows.Tests/TestApps/DeskButler.TestWindow/DeskButler.TestWindow.csproj" />
   </Folder>
 </Solution>

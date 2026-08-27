@@ -25,6 +25,10 @@ RestartIfNeededByRun=no
 UninstallDisplayIcon={app}\DeskButler.Desktop.exe
 WizardStyle=modern
 
+[InstallDelete]
+; 覆盖升级只登记已废弃的精确程序路径；禁止通配符、用户数据路径和 unins* 文件。
+Type: files; Name: "{app}\installed-version.txt"
+
 [Files]
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
 

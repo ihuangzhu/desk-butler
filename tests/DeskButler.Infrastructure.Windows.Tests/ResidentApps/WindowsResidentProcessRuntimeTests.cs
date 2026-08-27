@@ -170,9 +170,9 @@ public sealed class WindowsResidentProcessRuntimeTests
         var runtime = new WindowsResidentProcessRuntime(new WindowsResidentExecutablePolicy());
 
         await runtime.StartAsync(fixture.ExecutablePath, CancellationToken.None);
-        await fixture.WaitForMarkerAsync();
+        var markerContent = await fixture.WaitForMarkerAsync();
 
-        Assert.Equal("started", File.ReadAllText(Path.Combine(fixture.DirectoryPath, MarkerFileName)));
+        Assert.Equal("started", markerContent);
     }
 
     /// <summary>轮询真实枚举，避免用固定睡眠猜测 fixture 启动时序。</summary>
@@ -340,12 +340,28 @@ public sealed class WindowsResidentProcessRuntimeTests
         }
 
         /// <summary>轮询固定 marker，避免固定睡眠并给启动失败设置上限。</summary>
-        internal async Task WaitForMarkerAsync()
+        internal async Task<string> WaitForMarkerAsync()
         {
             var marker = Path.Combine(DirectoryPath, MarkerFileName);
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            while (!File.Exists(marker))
+            while (true)
             {
+                try
+                {
+                    if (File.Exists(marker))
+                    {
+                        var content = await File.ReadAllTextAsync(marker, timeout.Token);
+                        if (string.Equals(content, "started", StringComparison.Ordinal))
+                        {
+                            return content;
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    // 文件已经出现但写入句柄尚未释放；继续等待可读取的完整标记。
+                }
+
                 await Task.Delay(25, timeout.Token);
             }
         }

@@ -233,6 +233,35 @@ public sealed class InstallerContractTests
         Assert.Contains("Excludes: \"*.pdb\"", script, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>验证覆盖升级只清理安装目录中显式登记的旧文件。</summary>
+    [Fact]
+    public void 升级清理项仅允许精确程序文件路径()
+    {
+        var script = ReadInstallerScript();
+        var entries = ReadInstallerSectionEntries(script, "InstallDelete");
+
+        Assert.NotEmpty(entries);
+        Assert.All(entries, entry =>
+        {
+            var name = Regex.Match(
+                entry,
+                "(?:^|;)\\s*Name:\\s*\"(?<value>[^\"]+)\"",
+                RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+            Assert.True(name.Success, $"升级清理项缺少固定 Name：{entry}");
+            var path = name.Groups["value"].Value;
+            Assert.StartsWith("{app}\\", path, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain('*', path);
+            Assert.DoesNotContain('?', path);
+            Assert.DoesNotContain("..", path, StringComparison.Ordinal);
+            Assert.DoesNotContain("{localappdata}", path, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("unins", path, StringComparison.OrdinalIgnoreCase);
+        });
+
+        Assert.Contains(entries, entry =>
+            entry.Contains("Name: \"{app}\\installed-version.txt\"", StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>验证卸载初始化重入时复用首次数据保留决定。</summary>
     [Fact]
     public void 卸载数据选择只决定一次()
@@ -273,6 +302,21 @@ public sealed class InstallerContractTests
     /// <summary>读取安装脚本供声明式安全契约测试使用。</summary>
     private static string ReadInstallerScript() =>
         File.ReadAllText(Path.Combine(RepositoryRoot, "installer", "DeskButler.iss"));
+
+    /// <summary>读取 Inno Setup 指定区段中的有效配置项。</summary>
+    private static string[] ReadInstallerSectionEntries(string script, string sectionName)
+    {
+        var section = Regex.Match(
+            script,
+            $@"(?ms)^\[{Regex.Escape(sectionName)}\]\s*\r?\n(?<body>.*?)(?=^\[|\z)",
+            RegexOptions.CultureInvariant);
+        Assert.True(section.Success, $"安装脚本区段不存在：[{sectionName}]");
+
+        return section.Groups["body"].Value
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => !line.StartsWith(';') && !line.StartsWith("//", StringComparison.Ordinal))
+            .ToArray();
+    }
 
     /// <summary>读取发布卸载夹具供数据根行为契约测试使用。</summary>
     private static string ReadUninstallFixture() =>
@@ -654,7 +698,7 @@ public sealed class InstallerContractTests
     /// <summary>忽略空行、注释与缩进后比较规范 PowerShell 直线控制流。</summary>
     private static string NormalizePowerShellStatements(string source) =>
         string.Join(
-            '\n',
+            Environment.NewLine,
             source.Split('\n', StringSplitOptions.TrimEntries)
                 .Where(line => line.Length > 0 && !line.StartsWith('#')));
 
