@@ -54,14 +54,14 @@ dotnet test tests\DeskButler.Infrastructure.Windows.Tests\DeskButler.Infrastruct
 PASS: 138/138
 
 dotnet test tests\DeskButler.Desktop.Tests\DeskButler.Desktop.Tests.csproj -c Debug --no-restore
-PASS: 265/265
+PASS（后续两个 residual Important 修复后）: 270/270
 
 dotnet test DeskButler.slnx -c Debug --no-restore
-PASS: 646 total, 643 passed, 3 explicitly gated skips, 0 failed
+PASS（后续两个 residual Important 修复后的最终 Debug 回归）: 651 total, 648 passed, 3 explicitly gated skips, 0 failed
 
 scripts\verify-release.cmd
 Release build: 0 warnings, 0 errors
-Release tests: 644 total, 641 passed, 3 explicitly gated skips, 0 failed
+Release tests（后续两个 residual Important 修复后的最终 fresh artifact）: 649 total, 646 passed, 3 explicitly gated skips, 0 failed
 Publish: PASS
 Inno Setup 7.1.0: PASS
 ```
@@ -69,8 +69,8 @@ Inno Setup 7.1.0: PASS
 ## 安装器
 
 - 路径：`artifacts\installer\DeskButler-Setup-0.1.0.exe`
-- 大小：`64,573,986` 字节
-- SHA-256：`EEB7BE5C1228519DAA68A1C029D2F60F8BDBF1D0E4B57561345AE11550F0F736`
+- 大小：`64,575,904` 字节
+- SHA-256：`E754E70172A07AF74C37683C38773E390D62BD8577F1085BA4403E0221D4B2AB`
 - `Get-FileHash -Algorithm SHA256` 与验证脚本结果一致。
 
 ## 尚未关闭的外部门禁/风险

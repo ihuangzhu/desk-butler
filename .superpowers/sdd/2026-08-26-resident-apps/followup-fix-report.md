@@ -105,4 +105,10 @@ PASS: no output
 
 ## Fresh Release/安装器证据
 
-待代码修复提交后执行且只执行一次 `scripts\verify-release.cmd`；完成后在本节记录 Release 测试、build、publish、Inno、安装器 bytes 与 SHA-256，并同步刷新 README/compatibility 发布证据。此后不再重建安装器。
+- 代码修复提交：`5aa27bf fix: share resident launch outcomes safely`
+- 唯一一次 fresh 命令：`scripts\verify-release.cmd`
+- 结果：exit 0；Release build 0 warning / 0 error；Release tests 649 total、646 passed、3 explicitly gated skips、0 failed；self-contained win-x64 publish PASS；Inno Setup 7.1.0 PASS。
+- 路径：`artifacts\installer\DeskButler-Setup-0.1.0.exe`
+- 大小：`64,575,904` 字节
+- SHA-256：`E754E70172A07AF74C37683C38773E390D62BD8577F1085BA4403E0221D4B2AB`
+- `Get-FileHash -Algorithm SHA256` 与验证脚本输出一致。此后未再次重建安装器。
