@@ -77,6 +77,14 @@ scripts\verify-release.cmd
 
 脚本依次 restore、Release build、Release test、自包含 win-x64 publish、编译安装器并输出安装器 SHA-256，任一步失败都会立即退出。`artifacts\` 是本机生成目录，不进入 Git。
 
+## 许可证
+
+除下述品牌素材和第三方组件外，DeskButler 的原创代码与文档采用 [GNU General Public License v3.0 or later](LICENSE)（SPDX：`GPL-3.0-or-later`）授权：你可以使用、研究和修改，但向他人分发原版或修改版时，必须遵守 GPL 并提供相应源代码。
+
+Copyright (C) 2026 ihuangzhu.
+
+黑猫图标不属于 GPL 授权范围，只允许随官方未修改版本下载、安装、运行或用于私人构建与测试。发布分叉或修改版时必须移除或替换这些素材，详见 [品牌素材说明](BRAND_ASSETS.md)。第三方组件继续遵循各自的许可证，不因本项目采用 GPL 而改变。
+
 ## 首版明确不做
 
 不恢复未保存内容，不保证浏览器标签页、IDE 项目或终端会话，不记录完整命令行、屏幕、键盘、鼠标轨迹、剪贴板或文档内容；也不提供远程控制、云同步、AI、语音、动画角色、服务、驱动或 ARM64 支持。
