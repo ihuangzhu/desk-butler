@@ -25,9 +25,22 @@ public sealed class MonitorCatalog : IMonitorCatalog
     /// <summary>读取显示器设备名、工作区和 DPI，并在 DPI 不可用时回退为 96。</summary>
     public MonitorIdentity GetForWindow(nint windowHandle)
     {
+        return ReadCaptureSnapshot(windowHandle).Identity;
+    }
+
+    /// <summary>为窗口捕获提供同一次原生读取中的显示器身份和完整区域。</summary>
+    CaptureMonitorSnapshot IMonitorCatalog.GetCaptureSnapshotForWindow(nint windowHandle)
+    {
+        return ReadCaptureSnapshot(windowHandle);
+    }
+
+    /// <summary>把同一次显示器原生快照映射为捕获上下文，并在 DPI 不可用时回退为 96。</summary>
+    private CaptureMonitorSnapshot ReadCaptureSnapshot(nint windowHandle)
+    {
         var monitor = native.GetMonitorForWindow(windowHandle);
         var dpi = native.TryGetDpiForWindow(windowHandle) ?? (DefaultDpi, DefaultDpi);
-        return new MonitorIdentity(monitor.DeviceName, monitor.WorkArea, dpi.DpiX, dpi.DpiY);
+        var identity = new MonitorIdentity(monitor.DeviceName, monitor.WorkArea, dpi.DpiX, dpi.DpiY);
+        return new CaptureMonitorSnapshot(identity, monitor.MonitorArea, monitor.IsAvailable);
     }
 }
 
@@ -45,10 +58,14 @@ internal sealed class Win32MonitorNativeFacade : IMonitorNativeFacade
 
         if (monitorHandle == 0 || !NativeMethods.GetMonitorInfo(monitorHandle, ref info))
         {
-            return new NativeMonitorSnapshot("UNKNOWN", default);
+            return new NativeMonitorSnapshot("UNKNOWN", default, default, false);
         }
 
-        return new NativeMonitorSnapshot(info.DeviceName, info.WorkArea.ToBounds());
+        return new NativeMonitorSnapshot(
+            info.DeviceName,
+            info.MonitorArea.ToBounds(),
+            info.WorkArea.ToBounds(),
+            true);
     }
 
     /// <summary>尝试读取窗口 DPI；API 缺失或返回零时通知上层采用后备值。</summary>
@@ -68,8 +85,8 @@ internal sealed class Win32MonitorNativeFacade : IMonitorNativeFacade
 
 internal interface IMonitorCatalog
 {
-    /// <summary>获取窗口所在显示器的身份。</summary>
-    MonitorIdentity GetForWindow(nint windowHandle);
+    /// <summary>以一次显示器快照获取捕获所需的身份、完整区域和可用状态。</summary>
+    CaptureMonitorSnapshot GetCaptureSnapshotForWindow(nint windowHandle);
 }
 
 internal interface IMonitorNativeFacade
@@ -81,7 +98,19 @@ internal interface IMonitorNativeFacade
     (uint DpiX, uint DpiY)? TryGetDpiForWindow(nint windowHandle);
 }
 
-/// <summary>保存显示器设备名与工作区的原生快照。</summary>
+/// <summary>保存候选捕获所需的显示器身份和完整区域。</summary>
+internal sealed record CaptureMonitorSnapshot(
+    MonitorIdentity Identity,
+    WindowBounds MonitorArea,
+    bool IsAvailable);
+
+/// <summary>保存显示器设备名、完整区域与工作区的原生快照。</summary>
 /// <param name="DeviceName">稳定设备名。</param>
+/// <param name="MonitorArea">完整显示器区域。</param>
 /// <param name="WorkArea">可用工作区。</param>
-internal sealed record NativeMonitorSnapshot(string DeviceName, WindowBounds WorkArea);
+/// <param name="IsAvailable">本次原生显示器读取是否成功。</param>
+internal sealed record NativeMonitorSnapshot(
+    string DeviceName,
+    WindowBounds MonitorArea,
+    WindowBounds WorkArea,
+    bool IsAvailable);

@@ -10,7 +10,11 @@ public sealed class MonitorCatalogTests
     public void GetForWindow映射显示器身份与Dpi()
     {
         var native = new FakeMonitorNativeFacade(
-            new NativeMonitorSnapshot(@"\\.\DISPLAY2", new WindowBounds(-1920, 0, 1920, 1040)),
+            new NativeMonitorSnapshot(
+                @"\\.\DISPLAY2",
+                new WindowBounds(-1920, 0, 1920, 1080),
+                new WindowBounds(-1920, 0, 1920, 1040),
+                true),
             (144, 120));
 
         var monitor = new MonitorCatalog(native).GetForWindow(42);
@@ -26,7 +30,11 @@ public sealed class MonitorCatalogTests
     public void GetForWindow的Dpi不可用时回退为96()
     {
         var native = new FakeMonitorNativeFacade(
-            new NativeMonitorSnapshot(@"\\.\DISPLAY1", new WindowBounds(0, 0, 1920, 1040)),
+            new NativeMonitorSnapshot(
+                @"\\.\DISPLAY1",
+                new WindowBounds(0, 0, 1920, 1080),
+                new WindowBounds(0, 0, 1920, 1040),
+                true),
             null);
 
         var monitor = new MonitorCatalog(native).GetForWindow(42);

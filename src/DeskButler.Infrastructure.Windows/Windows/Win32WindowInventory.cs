@@ -119,6 +119,14 @@ public sealed class Win32WindowInventory : IWindowInventory
     /// <summary>把原生快照映射为 Core 候选，并仅按 HWND 关联本地 Explorer 目录。</summary>
     private WindowCandidate MapCandidate(NativeWindowSnapshot snapshot)
     {
+        var captureMonitor = monitors.GetCaptureSnapshotForWindow(snapshot.Handle);
+        var bounds = snapshot.RestoredWorkspaceBounds is { } restoredBounds && captureMonitor.IsAvailable
+            ? Win32NativeFacade.ConvertWorkspaceBoundsToScreen(
+                restoredBounds,
+                captureMonitor.MonitorArea,
+                captureMonitor.Identity.WorkArea)
+            : snapshot.Bounds;
+
         return new WindowCandidate(
             snapshot.Handle,
             snapshot.ProcessId,
@@ -126,9 +134,9 @@ public sealed class Win32WindowInventory : IWindowInventory
             snapshot.WindowClass,
             snapshot.Title,
             explorer.TryGetFolderPath(snapshot.Handle),
-            snapshot.Bounds,
+            bounds,
             snapshot.State,
-            monitors.GetForWindow(snapshot.Handle),
+            captureMonitor.Identity,
             true,
             false,
             false,
@@ -169,6 +177,19 @@ internal sealed class Win32NativeFacade : IWindowNativeFacade
         this.windowProperties = windowProperties;
         this.windowEnumeration = windowEnumeration;
     }
+
+    /// <summary>把 WINDOWPLACEMENT 的工作区边界转换为虚拟桌面屏幕边界。</summary>
+    internal static WindowBounds ConvertWorkspaceBoundsToScreen(
+        WindowBounds workspaceBounds,
+        WindowBounds monitorArea,
+        WindowBounds workArea) => workspaceBounds with
+        {
+            Left = ClampToInt((long)workspaceBounds.Left + workArea.Left - monitorArea.Left),
+            Top = ClampToInt((long)workspaceBounds.Top + workArea.Top - monitorArea.Top)
+        };
+
+    /// <summary>把原生坐标计算安全收敛到持久化模型的 Int32 范围。</summary>
+    private static int ClampToInt(long value) => (int)Math.Clamp(value, int.MinValue, int.MaxValue);
 
     /// <summary>枚举 HWND；托管异常在 callback 内暂存，返回托管边界后按原堆栈重新抛出。</summary>
     public void EnumerateTopLevelWindows(Action<nint> visitor, CancellationToken cancellationToken)
@@ -230,16 +251,20 @@ internal sealed class Win32NativeFacade : IWindowNativeFacade
         }
 
         var placement = new WindowPlacement { Length = (uint)Marshal.SizeOf<WindowPlacement>() };
-        var state = NativeMethods.GetWindowPlacement(windowHandle, ref placement)
-            ? MapState(placement.ShowCommand)
-            : SceneWindowState.Normal;
+        var hasPlacement = NativeMethods.GetWindowPlacement(windowHandle, ref placement);
+        var state = hasPlacement ? MapState(placement.ShowCommand) : SceneWindowState.Normal;
         var process = ReadProcess(processId);
         details = new NativeWindowDetails(
             process.ExecutablePath,
             ReadTitleHint(windowHandle),
             rectangle.ToBounds(),
             state,
-            process.WasElevatedOrInaccessible);
+            process.WasElevatedOrInaccessible)
+        {
+            RestoredWorkspaceBounds = hasPlacement && state is SceneWindowState.Minimized or SceneWindowState.Maximized
+                ? placement.NormalPosition.ToBounds()
+                : null
+        };
         return true;
     }
 
@@ -369,7 +394,11 @@ internal sealed record NativeWindowDetails(
     string? Title,
     WindowBounds Bounds,
     SceneWindowState State,
-    bool WasElevatedOrInaccessible);
+    bool WasElevatedOrInaccessible)
+{
+    /// <summary>最小化或最大化窗口由 WINDOWPLACEMENT 提供的工作区还原边界。</summary>
+    internal WindowBounds? RestoredWorkspaceBounds { get; init; }
+}
 
 /// <summary>保存 native 边界在单一时刻可安全读取的窗口字段。</summary>
 /// <param name="Handle">借用的顶层窗口句柄。</param>
@@ -398,6 +427,9 @@ internal sealed record NativeWindowSnapshot(
     bool IsCloaked,
     bool WasElevatedOrInaccessible)
 {
+    /// <summary>最小化或最大化窗口由 WINDOWPLACEMENT 提供的工作区还原边界。</summary>
+    internal WindowBounds? RestoredWorkspaceBounds { get; init; }
+
     /// <summary>把两阶段 native 读取结果组合为仅供 production mapper 使用的快照。</summary>
     internal NativeWindowSnapshot(NativeWindowClassification classification, NativeWindowDetails details)
         : this(
@@ -414,5 +446,6 @@ internal sealed record NativeWindowSnapshot(
             classification.IsCloaked,
             details.WasElevatedOrInaccessible)
     {
+        RestoredWorkspaceBounds = details.RestoredWorkspaceBounds;
     }
 }

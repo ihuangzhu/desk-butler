@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using DeskButler.Core.Capture;
 using DeskButler.Core.Scenes;
 using DeskButler.Infrastructure.Windows.Native;
 using DeskButler.Infrastructure.Windows.Windows;
@@ -28,6 +29,117 @@ public sealed class Win32WindowInventoryTests
         Assert.Equal("DeskButler Capture Probe", window.Title);
         Assert.NotNull(window.ExecutablePath);
         Assert.DoesNotContain("commandLine", JsonSerializer.Serialize(window, SerializerOptions), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>验证最小化窗口保存其可恢复正常尺寸，而不是系统最小化占位矩形。</summary>
+    [WindowsFact]
+    [Trait("Category", "WindowsIntegration")]
+    public async Task CaptureAsync最小化窗口保留最小化前的正常尺寸()
+    {
+        await using var app = await TestWindowProcess.StartAsync("DeskButler Minimized Capture Probe");
+        app.Minimize();
+
+        WindowCandidate? window = null;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!timeout.IsCancellationRequested)
+        {
+            window = (await new Win32WindowInventory().CaptureAsync(CancellationToken.None))
+                .SingleOrDefault(candidate => candidate.ProcessId == app.ProcessId);
+            if (window?.State == SceneWindowState.Minimized)
+            {
+                break;
+            }
+
+            await Task.Delay(50, timeout.Token);
+        }
+
+        Assert.NotNull(window);
+        Assert.Equal(SceneWindowState.Minimized, window.State);
+        Assert.InRange(window.Bounds.Width, 680, 760);
+        Assert.InRange(window.Bounds.Height, 480, 560);
+    }
+
+    /// <summary>验证最大化窗口同样保存其正常还原尺寸，而不是最大化后的整屏边界。</summary>
+    [WindowsFact]
+    [Trait("Category", "WindowsIntegration")]
+    public async Task CaptureAsync最大化窗口保留最大化前的正常尺寸()
+    {
+        await using var app = await TestWindowProcess.StartAsync("DeskButler Maximized Capture Probe");
+        app.Maximize();
+
+        WindowCandidate? window = null;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!timeout.IsCancellationRequested)
+        {
+            window = (await new Win32WindowInventory().CaptureAsync(CancellationToken.None))
+                .SingleOrDefault(candidate => candidate.ProcessId == app.ProcessId);
+            if (window?.State == SceneWindowState.Maximized)
+            {
+                break;
+            }
+
+            await Task.Delay(50, timeout.Token);
+        }
+
+        Assert.NotNull(window);
+        Assert.Equal(SceneWindowState.Maximized, window.State);
+        Assert.InRange(window.Bounds.Width, 680, 760);
+        Assert.InRange(window.Bounds.Height, 480, 560);
+    }
+
+    /// <summary>验证顶部或左侧任务栏造成的工作区原点偏移会转换回屏幕坐标。</summary>
+    [Fact]
+    public void ConvertWorkspaceBoundsToScreen应用显示器工作区偏移()
+    {
+        var workspaceBounds = new WindowBounds(-1800, 60, 720, 520);
+        var monitorArea = new WindowBounds(-1920, 0, 1920, 1080);
+        var workArea = new WindowBounds(-1870, 40, 1870, 1040);
+
+        var screenBounds = Win32NativeFacade.ConvertWorkspaceBoundsToScreen(
+            workspaceBounds,
+            monitorArea,
+            workArea);
+
+        Assert.Equal(new WindowBounds(-1750, 100, 720, 520), screenBounds);
+    }
+
+    /// <summary>验证异常原生坐标不会在偏移计算时发生整数回绕。</summary>
+    [Fact]
+    public void ConvertWorkspaceBoundsToScreen对超出整数范围的坐标执行钳制()
+    {
+        var screenBounds = Win32NativeFacade.ConvertWorkspaceBoundsToScreen(
+            new WindowBounds(int.MaxValue, int.MinValue, 720, 520),
+            new WindowBounds(-100, 100, 1920, 1080),
+            new WindowBounds(100, -100, 1720, 880));
+
+        Assert.Equal(int.MaxValue, screenBounds.Left);
+        Assert.Equal(int.MinValue, screenBounds.Top);
+        Assert.Equal(720, screenBounds.Width);
+        Assert.Equal(520, screenBounds.Height);
+    }
+
+    /// <summary>验证显示器读取失败时沿用 GetWindowRect 屏幕边界，避免混用工作区坐标。</summary>
+    [Fact]
+    public async Task CaptureAsync显示器读取失败时保留当前屏幕边界()
+    {
+        var currentScreenBounds = new WindowBounds(-32000, -32000, 160, 30);
+        var snapshot = 创建快照(42) with
+        {
+            Bounds = currentScreenBounds,
+            State = SceneWindowState.Minimized,
+            RestoredWorkspaceBounds = new WindowBounds(100, 60, 720, 520)
+        };
+        var unavailableMonitor = new MonitorIdentity("UNKNOWN", default, 96, 96);
+        var inventory = new Win32WindowInventory(
+            new FakeWindowNativeFacade(snapshot),
+            new FakeExplorerWindowReader(),
+            new FakeMonitorCatalog(unavailableMonitor, default, false),
+            999);
+
+        var window = Assert.Single(await inventory.CaptureAsync(CancellationToken.None));
+
+        Assert.Equal(currentScreenBounds, window.Bounds);
+        Assert.Equal(unavailableMonitor, window.Monitor);
     }
 
     /// <summary>验证捕获层排除非普通主窗口，避免系统、临时、自身及辅助窗口进入场景。</summary>
@@ -292,7 +404,10 @@ public sealed class Win32WindowInventoryTests
                 window.Title,
                 window.Bounds,
                 window.State,
-                window.WasElevatedOrInaccessible);
+                window.WasElevatedOrInaccessible)
+            {
+                RestoredWorkspaceBounds = window.RestoredWorkspaceBounds
+            };
             return true;
         }
     }
@@ -316,21 +431,28 @@ public sealed class Win32WindowInventoryTests
     private sealed class FakeMonitorCatalog : IMonitorCatalog
     {
         private readonly MonitorIdentity monitor;
+        private readonly WindowBounds monitorArea;
+        private readonly bool isAvailable;
         private readonly List<nint> calls = [];
 
         /// <summary>创建返回指定显示器身份的测试目录。</summary>
-        public FakeMonitorCatalog(MonitorIdentity? monitor = null)
+        public FakeMonitorCatalog(
+            MonitorIdentity? monitor = null,
+            WindowBounds? monitorArea = null,
+            bool isAvailable = true)
         {
             this.monitor = monitor ?? new MonitorIdentity(@"\\.\DISPLAY1", new WindowBounds(0, 0, 1920, 1040), 96, 96);
+            this.monitorArea = monitorArea ?? this.monitor.WorkArea;
+            this.isAvailable = isAvailable;
         }
 
         internal IReadOnlyList<nint> Calls => calls;
 
         /// <summary>为任意测试窗口返回固定显示器身份。</summary>
-        public MonitorIdentity GetForWindow(nint windowHandle)
+        public CaptureMonitorSnapshot GetCaptureSnapshotForWindow(nint windowHandle)
         {
             calls.Add(windowHandle);
-            return monitor;
+            return new CaptureMonitorSnapshot(monitor, monitorArea, isAvailable);
         }
     }
 
@@ -355,11 +477,14 @@ public sealed class Win32WindowInventoryTests
     private sealed class ThrowingMonitorCatalog(nint throwingHandle) : IMonitorCatalog
     {
         /// <summary>为指定句柄模拟 monitor 映射失败，其余句柄返回有效身份。</summary>
-        public MonitorIdentity GetForWindow(nint windowHandle)
+        public CaptureMonitorSnapshot GetCaptureSnapshotForWindow(nint windowHandle)
         {
             return windowHandle == throwingHandle
                 ? throw new Win32Exception(1400, "模拟 monitor 单窗口映射失败。")
-                : new MonitorIdentity(@"\\.\DISPLAY1", new WindowBounds(0, 0, 1920, 1040), 96, 96);
+                : new CaptureMonitorSnapshot(
+                    new MonitorIdentity(@"\\.\DISPLAY1", new WindowBounds(0, 0, 1920, 1040), 96, 96),
+                    new WindowBounds(0, 0, 1920, 1080),
+                    true);
         }
     }
 

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace DeskButler.Infrastructure.Windows.Tests.Windows;
 
@@ -13,6 +14,30 @@ internal sealed class TestWindowProcess : IAsyncDisposable
     }
 
     internal int ProcessId => process.Id;
+
+    /// <summary>把受控主窗口最小化，供真实 Win32 捕获测试验证还原边界。</summary>
+    internal void Minimize()
+    {
+        process.Refresh();
+        if (process.MainWindowHandle == 0)
+        {
+            throw new InvalidOperationException("无法最小化受控测试窗口。");
+        }
+
+        _ = ShowWindow(process.MainWindowHandle, 6);
+    }
+
+    /// <summary>把受控主窗口最大化，供真实 Win32 捕获测试验证还原边界。</summary>
+    internal void Maximize()
+    {
+        process.Refresh();
+        if (process.MainWindowHandle == 0)
+        {
+            throw new InvalidOperationException("无法最大化受控测试窗口。");
+        }
+
+        _ = ShowWindow(process.MainWindowHandle, 3);
+    }
 
     /// <summary>启动测试窗口并等待主 HWND 可供真实 Win32 枚举。</summary>
     internal static async Task<TestWindowProcess> StartAsync(string title)
@@ -143,6 +168,10 @@ internal sealed class TestWindowProcess : IAsyncDisposable
             "net10.0-windows10.0.17763.0",
             "DeskButler.TestWindow.exe");
     }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(nint windowHandle, int command);
 
     private sealed class ProcessLifetime : ITestProcessLifetime
     {
